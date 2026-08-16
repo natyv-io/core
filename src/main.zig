@@ -4,8 +4,10 @@ const Config = @import("Config.zig");
 const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
+const ClayLayout = @import("capabilities/ClayLayout.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
+const DrawBatcher = @import("DrawBatcher.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -74,7 +76,8 @@ pub fn main(init: std.process.Init) !void {
         .textfield = config.value.widgets.textfield,
         .label = config.value.widgets.label,
     };
-    try runtime.loadPlugin(wasm, manifest, widget_kinds);
+    const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
+    try runtime.loadPlugin(wasm, manifest, widget_kinds, clay_enabled);
     runtime.initGuest(io);
 
     var queue = EventQueue.init(allocator);
@@ -94,6 +97,12 @@ pub fn main(init: std.process.Init) !void {
     };
     defer c.SDL_DestroyRenderer(renderer);
 
+    // L4: `null` when ui.backend isn't "clay" -- no arena allocated, no
+    // per-frame Clay calls at all, same "capability you didn't declare
+    // costs you nothing" story as sqlite/network above.
+    var maybe_clay_layout: ?ClayLayout = if (clay_enabled) try ClayLayout.init(allocator, 900, 700) else null;
+    defer if (maybe_clay_layout) |*cl| cl.deinit(allocator);
+
     const arrow_cursor = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT);
     defer if (arrow_cursor) |cur| c.SDL_DestroyCursor(cur);
     const pointer_cursor = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_POINTER);
@@ -106,8 +115,24 @@ pub fn main(init: std.process.Init) !void {
 
     var running = true;
     var widget_snapshot: [max_widgets_on_screen]WidgetHost.Slot = undefined;
+    var draw_batcher: DrawBatcher = .{};
 
     while (running) {
+        var mouse_x: f32 = undefined;
+        var mouse_y: f32 = undefined;
+        const mouse_buttons = c.SDL_GetMouseState(&mouse_x, &mouse_y);
+
+        // Must run before this frame's snapshot below, not after -- so
+        // that if a real Clay recompute happens this frame, the freshly
+        // written-back `rect`s are what the rest of the frame (hit-testing,
+        // hover, drawing) actually sees, not last frame's stale ones.
+        if (maybe_clay_layout) |*clay_layout| {
+            var win_w: c_int = undefined;
+            var win_h: c_int = undefined;
+            _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
+            clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), mouse_x, mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0);
+        }
+
         const widget_count = runtime.widgets.snapshot(io, &widget_snapshot);
 
         var event: c.SDL_Event = undefined;
@@ -130,6 +155,7 @@ pub fn main(init: std.process.Init) !void {
                                     hit_field = slot.id;
                                 },
                                 .label => {},
+                                .container => {},
                             }
                         }
                         focused_textfield = hit_field;
@@ -153,9 +179,6 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        var mouse_x: f32 = undefined;
-        var mouse_y: f32 = undefined;
-        _ = c.SDL_GetMouseState(&mouse_x, &mouse_y);
         var hovering_any = false;
         for (widget_snapshot[0..widget_count]) |slot| {
             switch (slot.widget) {
@@ -166,6 +189,7 @@ pub fn main(init: std.process.Init) !void {
                     hovering_any = true;
                 },
                 .label => {},
+                .container => {},
             }
         }
         if (hovering_any != cursor_is_pointer) {
@@ -176,11 +200,25 @@ pub fn main(init: std.process.Init) !void {
         _ = c.SDL_SetRenderDrawColor(renderer, 24, 24, 28, 255);
         _ = c.SDL_RenderClear(renderer);
 
+        // L4.5: one SDL_RenderFillRects call per distinct fill color across
+        // every widget, instead of each widget filling its own rect one at
+        // a time -- see DrawBatcher.zig. `draw_batcher` is declared outside
+        // the frame loop and reused every frame purely to avoid re-zeroing
+        // its scratch arrays each time; `flush` below resets it for the
+        // next frame regardless.
+        for (widget_snapshot[0..widget_count]) |slot| {
+            if (slot.widget.fillRect()) |fr| draw_batcher.add(fr.color, fr.rect);
+        }
+        draw_batcher.flush(renderer);
+
         for (widget_snapshot[0..widget_count]) |slot| {
             switch (slot.widget) {
-                .button => |b| b.draw(renderer),
-                .textfield => |t| t.draw(renderer),
-                .label => |l| l.draw(renderer),
+                .button => |b| b.drawDecorations(renderer),
+                .textfield => |t| t.drawDecorations(renderer),
+                .label => |l| l.drawDecorations(renderer),
+                // L2: containers are layout-only, nothing to draw -- see
+                // Container.zig's doc comment.
+                .container => {},
             }
         }
 

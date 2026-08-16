@@ -73,10 +73,15 @@ pub fn containsPoint(self: Self, x: f32, y: f32) bool {
         y >= self.rect.y and y < self.rect.y + self.rect.h;
 }
 
-pub fn draw(self: Self, renderer: ?*c.SDL_Renderer) void {
-    _ = c.SDL_SetRenderDrawColor(renderer, if (self.focused) 80 else 45, if (self.focused) 90 else 48, if (self.focused) 110 else 58, 255);
-    _ = c.SDL_RenderFillRect(renderer, &self.rect);
+/// L4.5: see Button.fillColor's doc comment -- same split, same reason.
+pub fn fillColor(self: Self) c.SDL_Color {
+    return if (self.focused)
+        .{ .r = 80, .g = 90, .b = 110, .a = 255 }
+    else
+        .{ .r = 45, .g = 48, .b = 58, .a = 255 };
+}
 
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
     const text_y = self.rect.y + self.rect.h / 2 - 4;
     if (self.len > 0) {
         var buf: [max_len + 1]u8 = undefined;

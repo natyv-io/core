@@ -11,10 +11,24 @@ const timing = @import("timing.zig");
 const Manifest = @import("Manifest.zig");
 const SqliteCapability = @import("capabilities/Sqlite.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
+// L1: Clay's own arena/BeginLayout/EndLayout lifecycle isn't wired into the
+// render loop yet (that's L4) -- a real test below calls its
+// proveTwoGrowChildrenSplitEvenly directly (see that test for why: a
+// merely-imported-but-unreferenced file doesn't get its own `test` blocks
+// discovered under Zig's lazy analysis, confirmed empirically). A file used
+// as its own `addTest` root can't reach up to `../c.zig` (Zig 0.16's
+// module-root boundary is the root file's own directory), so
+// ClayLayout.zig -- like capabilities/Sqlite.zig -- is only ever reached
+// transitively through this file, never as an independent test root.
+const ClayLayout = @import("capabilities/ClayLayout.zig");
+// L2: same reachability story as ClayLayout above -- Container.zig is only
+// ever reached transitively through WidgetHost.zig, and this file's own
+// test below is what actually exercises it (see that test's doc comment).
+const Container = @import("widgets/Container.zig");
 
 const Self = @This();
 
-const max_host_functions = SqliteCapability.host_function_count + WidgetHost.host_function_count;
+const max_host_functions = SqliteCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count;
 
 allocator: std.mem.Allocator,
 /// `null` when conf.natyv.json's `sqlite.enabled` is false -- no connection
@@ -44,11 +58,16 @@ pub fn deinit(self: *Self) void {
 /// itself as user_data, so registration must happen after `self` is at its
 /// final stable address (i.e. after `var runtime = try Runtime.init(...)`),
 /// not during construction of the returned value itself.
-pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, widget_kinds: WidgetHost.EnabledKinds) Error!void {
+///
+/// `clay_enabled` mirrors conf.natyv.json's `ui.backend == "clay"` (see
+/// Config.UiConfig) -- only registers the natyv_clay_* functions when true,
+/// same enforcement story as `widget_kinds` for the plain widget functions.
+pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, widget_kinds: WidgetHost.EnabledKinds, clay_enabled: bool) Error!void {
     var funcs: [max_host_functions]?*const c.ExtismFunction = undefined;
     var n: usize = 0;
     if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
     n += self.widgets.registerInto(funcs[n..], widget_kinds);
+    if (clay_enabled) n += self.widgets.registerClayInto(funcs[n..]);
 
     const manifest_json = manifest.build(self.allocator, wasm) catch {
         std.debug.print("[runtime] failed to build plugin manifest\n", .{});
@@ -111,7 +130,11 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
 
     var runtime = try init(allocator, ":memory:");
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{});
+    // L5: bookstore is now laid out entirely via sdk/go/ui/clay, so its
+    // guest only imports natyv_clay_* (never natyv_create_button/etc) --
+    // needs clay_enabled=true or plugin creation itself fails with an
+    // "unknown import" error before natyv_init ever runs.
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
     // Drive it exactly the way main.zig's real event loop does: locate the
@@ -136,6 +159,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
                 if (std.mem.eql(u8, b.label(), "Add Book")) add_id = slot.id;
             },
             .label => {},
+            .container => {},
         }
     }
 
@@ -185,7 +209,7 @@ test "widget host functions: create/get/set/destroy round trip through a trivial
 
     var runtime = try init(allocator, ":memory:");
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{});
+    try runtime.loadPlugin(wasm, .{}, .{}, false);
     runtime.initGuest(io);
 
     // The trivial counter guest creates exactly one button in natyv_init.
@@ -203,4 +227,165 @@ test "widget host functions: create/get/set/destroy round trip through a trivial
 
     const resp2 = runtime.call(io, "natyv_dispatch", dispatch_payload) orelse return error.CallFailed;
     try std.testing.expect(std.mem.indexOf(u8, resp2, "\"counter\":2") != null);
+}
+
+test "Clay toolchain: two GROW children split a fixed-size parent's width evenly" {
+    const result = try ClayLayout.proveTwoGrowChildrenSplitEvenly(std.testing.allocator);
+    try std.testing.expectApproxEqAbs(@as(f32, 150), result.child_a.width, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 150), result.child_b.width, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), result.child_a.height, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 150), result.child_b.x, 1.0);
+}
+
+test "L2: parent_id and Clay style survive a widget-registry snapshot round trip" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+
+    const parent_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 300, .h = 100 }) }, null, .{}) orelse return error.RegistryFull;
+
+    const child_style: WidgetHost.ClayStyle = .{
+        .sizing = .{
+            .width = .{ .type = c.CLAY__SIZING_TYPE_GROW, .size = .{ .minMax = .{ .min = 0, .max = std.math.floatMax(f32) } } },
+            .height = .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = 40, .max = 40 } } },
+        },
+        .padding = .{ .left = 8, .right = 8, .top = 4, .bottom = 4 },
+        .child_gap = 6,
+        .direction = c.CLAY_TOP_TO_BOTTOM,
+        .child_alignment = .{ .x = c.CLAY_ALIGN_X_CENTER, .y = c.CLAY_ALIGN_Y_TOP },
+    };
+    const child_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }) }, parent_id, child_style) orelse return error.RegistryFull;
+
+    var snap: [4]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    var found_child = false;
+    var found_parent = false;
+    for (snap[0..n]) |slot| {
+        if (slot.id == child_id) {
+            found_child = true;
+            try std.testing.expectEqual(parent_id, slot.parent_id);
+            try std.testing.expectEqual(@as(u16, 8), slot.clay_style.padding.left);
+            try std.testing.expectEqual(@as(u16, 6), slot.clay_style.child_gap);
+            try std.testing.expectEqual(c.CLAY_TOP_TO_BOTTOM, slot.clay_style.direction);
+            try std.testing.expectEqual(c.CLAY__SIZING_TYPE_GROW, slot.clay_style.sizing.width.type);
+        } else if (slot.id == parent_id) {
+            found_parent = true;
+            try std.testing.expectEqual(@as(?u32, null), slot.parent_id);
+        }
+    }
+    try std.testing.expect(found_child);
+    try std.testing.expect(found_parent);
+}
+
+test "L3: natyv_clay_create_container/_button through a real compiled guest, gated by ui.backend" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [4]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    var container_id: ?u32 = null;
+    var button_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        switch (slot.widget) {
+            .container => container_id = slot.id,
+            .button => |b| if (std.mem.eql(u8, b.label(), "Grow Button")) {
+                button_id = slot.id;
+            },
+            else => {},
+        }
+    }
+    const cid = container_id orelse return error.MissingContainer;
+    const bid = button_id orelse return error.MissingButton;
+
+    for (snap[0..n]) |slot| {
+        if (slot.id == cid) {
+            try std.testing.expectEqual(@as(?u32, null), slot.parent_id);
+            try std.testing.expectEqual(c.CLAY__SIZING_TYPE_FIXED, slot.clay_style.sizing.width.type);
+            try std.testing.expectApproxEqAbs(@as(f32, 300), slot.clay_style.sizing.width.size.minMax.max, 0.01);
+            try std.testing.expectEqual(@as(u16, 8), slot.clay_style.padding.left);
+            try std.testing.expectEqual(@as(u16, 6), slot.clay_style.child_gap);
+            try std.testing.expectEqual(c.CLAY_TOP_TO_BOTTOM, slot.clay_style.direction);
+        } else if (slot.id == bid) {
+            try std.testing.expectEqual(@as(?u32, cid), slot.parent_id);
+            try std.testing.expectEqual(c.CLAY__SIZING_TYPE_GROW, slot.clay_style.sizing.width.type);
+            try std.testing.expectEqual(c.CLAY__SIZING_TYPE_FIXED, slot.clay_style.sizing.height.type);
+            try std.testing.expectApproxEqAbs(@as(f32, 40), slot.clay_style.sizing.height.size.minMax.max, 0.01);
+        }
+    }
+}
+
+test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real geometry gets written back" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var clay_layout = try ClayLayout.init(allocator, 300, 100);
+    defer clay_layout.deinit(allocator);
+
+    // First frame: nothing computed yet, so this must run Clay for real.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    var snap: [4]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var button_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button) button_id = slot.id;
+    }
+    const bid = button_id orelse return error.MissingButton;
+
+    // The button is GROW-width inside an 8px-padded 300px container -- it
+    // should have real, non-zero computed geometry now, not the zeroed
+    // rect it was created with in L3.
+    for (snap[0..n]) |slot| {
+        if (slot.id == bid) {
+            try std.testing.expect(slot.widget.button.rect.w > 100);
+            try std.testing.expectApproxEqAbs(@as(f32, 40), slot.widget.button.rect.h, 0.01);
+        }
+    }
+
+    // Second frame: nothing changed since the first -- must skip the real
+    // Clay computation entirely, not just produce the same numbers.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    // Mutating a Clay-managed widget's text bumps layout_generation (see
+    // WidgetHost.setTextHostFn) -- the next frame must recompute for real.
+    // Routed through the guest's own natyv_dispatch export (which calls
+    // natyv_set_text on the button internally), not called directly --
+    // natyv_set_text is a host function the guest imports, not a guest
+    // export the host can call by name.
+    var payload_buf: [64]u8 = undefined;
+    const payload = try std.fmt.bufPrint(&payload_buf, "{{\"widget_id\":{d},\"event_type\":\"Grown\"}}", .{bid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 }

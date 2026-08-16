@@ -35,7 +35,11 @@ fn textZ(self: *const Self) [*:0]const u8 {
     return @ptrCast(&self.buf);
 }
 
-pub fn draw(self: Self, renderer: ?*c.SDL_Renderer) void {
+// L4.5: a Label has no fill of its own (never did) -- renamed to
+// `drawDecorations` purely so main.zig can call the same method name
+// across every drawable widget kind after DrawBatcher.flush, not because
+// anything about what a Label draws changed.
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
     _ = c.SDL_SetRenderDrawColor(renderer, 220, 220, 220, 255);
     _ = c.SDL_RenderDebugText(renderer, self.rect.x, self.rect.y, self.textZ());
 }

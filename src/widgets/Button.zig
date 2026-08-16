@@ -46,15 +46,21 @@ pub fn flash(self: *Self) void {
     self.flash_until_ms = timing.nowMs() + 150;
 }
 
-pub fn draw(self: Self, renderer: ?*c.SDL_Renderer) void {
+/// L4.5: the body fill is no longer drawn here -- main.zig's draw loop
+/// buckets it (via `Widget.fillRect`) into a per-frame `DrawBatcher` and
+/// fills it as part of one batched `SDL_RenderFillRects` call alongside
+/// every other same-color widget, instead of its own
+/// `SDL_SetRenderDrawColor`+`SDL_RenderFillRect` pair. This just picks
+/// which color that fill should use.
+pub fn fillColor(self: Self) c.SDL_Color {
     const flashing = timing.nowMs() < self.flash_until_ms;
-    if (flashing) {
-        _ = c.SDL_SetRenderDrawColor(renderer, 235, 120, 50, 255);
-    } else {
-        _ = c.SDL_SetRenderDrawColor(renderer, 60, 65, 80, 255);
-    }
-    _ = c.SDL_RenderFillRect(renderer, &self.rect);
+    return if (flashing) .{ .r = 235, .g = 120, .b = 50, .a = 255 } else .{ .r = 60, .g = 65, .b = 80, .a = 255 };
+}
 
+/// Everything about a button that *isn't* a plain color fill -- drawn after
+/// `DrawBatcher.flush` has painted every widget's fill for the frame, so
+/// text always lands on top of an already-filled background.
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
     _ = c.SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
     _ = c.SDL_RenderDebugText(renderer, self.rect.x + 10, self.rect.y + self.rect.h / 2 - 4, self.labelZ());
 }
