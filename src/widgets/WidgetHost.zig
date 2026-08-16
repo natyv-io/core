@@ -56,16 +56,44 @@ next_id: u32 = 1,
 /// by construction only ever runs nested inside that same call.
 current_io: ?Io = null,
 
-pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
+pub const EnabledKinds = struct {
+    button: bool = true,
+    textfield: bool = true,
+    label: bool = true,
+};
+
+/// Registers only the create-functions for widget kinds `enabled` declares
+/// (an app's conf.natyv.json) -- a guest that was never granted a kind gets
+/// a normal "unknown import" failure from Extism if it tries to use it,
+/// same class of enforcement as `allowed_hosts` for network access.
+/// `natyv_set_text`/`natyv_get_text`/`natyv_destroy_widget` are generic
+/// utility ops over whatever widgets already exist, so they're always
+/// registered regardless -- there's nothing to gate: a guest can't get a
+/// widget_id to call them with unless it already had permission to create
+/// that widget in the first place.
+pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled: EnabledKinds) usize {
     const in_types = [_]c.ExtismValType{c.ExtismValType_I64};
     const out_types = [_]c.ExtismValType{c.ExtismValType_I64};
-    funcs_out[0] = c.extism_function_new("natyv_create_button", &in_types[0], 1, &out_types[0], 1, createButtonHostFn, self, null);
-    funcs_out[1] = c.extism_function_new("natyv_create_textfield", &in_types[0], 1, &out_types[0], 1, createTextFieldHostFn, self, null);
-    funcs_out[2] = c.extism_function_new("natyv_create_label", &in_types[0], 1, &out_types[0], 1, createLabelHostFn, self, null);
-    funcs_out[3] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, setTextHostFn, self, null);
-    funcs_out[4] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, getTextHostFn, self, null);
-    funcs_out[5] = c.extism_function_new("natyv_destroy_widget", &in_types[0], 1, &out_types[0], 1, destroyWidgetHostFn, self, null);
-    return host_function_count;
+    var n: usize = 0;
+    if (enabled.button) {
+        funcs_out[n] = c.extism_function_new("natyv_create_button", &in_types[0], 1, &out_types[0], 1, createButtonHostFn, self, null);
+        n += 1;
+    }
+    if (enabled.textfield) {
+        funcs_out[n] = c.extism_function_new("natyv_create_textfield", &in_types[0], 1, &out_types[0], 1, createTextFieldHostFn, self, null);
+        n += 1;
+    }
+    if (enabled.label) {
+        funcs_out[n] = c.extism_function_new("natyv_create_label", &in_types[0], 1, &out_types[0], 1, createLabelHostFn, self, null);
+        n += 1;
+    }
+    funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, setTextHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, getTextHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_destroy_widget", &in_types[0], 1, &out_types[0], 1, destroyWidgetHostFn, self, null);
+    n += 1;
+    return n;
 }
 
 fn io(self: *Self) Io {

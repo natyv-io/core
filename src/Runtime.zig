@@ -17,31 +17,38 @@ const Self = @This();
 const max_host_functions = SqliteCapability.host_function_count + WidgetHost.host_function_count;
 
 allocator: std.mem.Allocator,
-sqlite: SqliteCapability,
+/// `null` when conf.natyv.json's `sqlite.enabled` is false -- no connection
+/// is opened at all, and `sqlite_exec`/`sqlite_query` aren't registered, so
+/// a guest that wasn't granted this capability gets a normal "unknown
+/// import" failure if it tries to use it, same enforcement story as
+/// `allowed_hosts` for network and `widgets.*` for widget kinds.
+sqlite: ?SqliteCapability,
 widgets: WidgetHost,
 plugin: ?*c.ExtismPlugin = null,
 
 pub const Error = SqliteCapability.Error || error{PluginLoadFailed};
 
-pub fn init(allocator: std.mem.Allocator, db_path: [:0]const u8) Error!Self {
-    const sqlite = try SqliteCapability.open(allocator, db_path);
+/// `db_path == null` means the app declared no SQLite capability -- see the
+/// `sqlite` field doc comment.
+pub fn init(allocator: std.mem.Allocator, db_path: ?[:0]const u8) Error!Self {
+    const sqlite: ?SqliteCapability = if (db_path) |path| try SqliteCapability.open(allocator, path) else null;
     return .{ .allocator = allocator, .sqlite = sqlite, .widgets = .{ .allocator = allocator } };
 }
 
 pub fn deinit(self: *Self) void {
     if (self.plugin) |p| c.extism_plugin_free(p);
-    self.sqlite.close();
+    if (self.sqlite) |*s| s.close();
 }
 
 /// Two-phase init: each capability's host functions capture the capability
 /// itself as user_data, so registration must happen after `self` is at its
 /// final stable address (i.e. after `var runtime = try Runtime.init(...)`),
 /// not during construction of the returned value itself.
-pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest) Error!void {
+pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, widget_kinds: WidgetHost.EnabledKinds) Error!void {
     var funcs: [max_host_functions]?*const c.ExtismFunction = undefined;
     var n: usize = 0;
-    n += self.sqlite.registerInto(funcs[n..]);
-    n += self.widgets.registerInto(funcs[n..]);
+    if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
+    n += self.widgets.registerInto(funcs[n..], widget_kinds);
 
     const manifest_json = manifest.build(self.allocator, wasm) catch {
         std.debug.print("[runtime] failed to build plugin manifest\n", .{});
@@ -104,7 +111,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
 
     var runtime = try init(allocator, ":memory:");
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{});
+    try runtime.loadPlugin(wasm, .{}, .{});
     runtime.initGuest(io);
 
     // Drive it exactly the way main.zig's real event loop does: locate the
@@ -178,7 +185,7 @@ test "widget host functions: create/get/set/destroy round trip through a trivial
 
     var runtime = try init(allocator, ":memory:");
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{});
+    try runtime.loadPlugin(wasm, .{}, .{});
     runtime.initGuest(io);
 
     // The trivial counter guest creates exactly one button in natyv_init.

@@ -1,45 +1,40 @@
 const std = @import("std");
 const c = @import("c.zig").c;
+const Config = @import("Config.zig");
+const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
-const max_allowed_hosts = 8;
 
-// M5: this file has zero app-specific knowledge -- no schema, no widget
-// layout, no network-host allowlist baked in for a particular app. Every
-// rect on screen exists because the guest called
-// natyv_create_button/natyv_create_textfield/natyv_create_label during
-// natyv_init or a later natyv_dispatch; every click becomes a queued event
-// a worker thread turns into a natyv_dispatch call.
-//
-// `allowed_hosts` is the one thing that can NOT move into the guest --
-// letting a guest declare its own network permissions would defeat the
-// point of a host-enforced security boundary -- so it's a launch-time host
-// argument instead. A real natyv install would read this (and the app path)
-// from a per-app manifest/config file rather than argv; that file format
-// isn't designed yet (see project's "open design threads"), so argv is the
-// placeholder until then.
+// M7: app identity, wasm location, and every capability an app needs
+// (SQLite, network + allowed hosts, which widget kinds) now come from
+// conf.natyv.json instead of CLI arguments -- a real install shouldn't
+// require remembering flags to run someone else's app correctly. The one
+// remaining CLI argument is the config file's own path, defaulting to
+// `conf.natyv.json` in the current directory, purely for dev convenience
+// (pointing at a different example without `cd`ing into it first).
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
     const argv = init.minimal.args.vector;
-    const app_wasm_path: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "examples/counter/guest/counter.wasm";
+    const config_path: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "conf.natyv.json";
 
-    var allowed_hosts_buf: [max_allowed_hosts][]const u8 = undefined;
-    var allowed_hosts: ?[]const []const u8 = null;
-    if (argv.len > 2) {
-        var it = std.mem.splitScalar(u8, std.mem.span(argv[2]), ',');
-        var n: usize = 0;
-        while (it.next()) |host| : (n += 1) {
-            if (n >= max_allowed_hosts) break;
-            allowed_hosts_buf[n] = host;
-        }
-        allowed_hosts = allowed_hosts_buf[0..n];
-    }
+    const config = Config.load(allocator, io, config_path) catch |err| {
+        std.debug.print("[main] failed to load {s}: {}\n", .{ config_path, err });
+        return err;
+    };
+    defer config.deinit();
+
+    const config_dir = std.fs.path.dirname(config_path) orelse ".";
+    const app_wasm_path = try std.fs.path.join(allocator, &.{ config_dir, config.value.app_wasm });
+    defer allocator.free(app_wasm_path);
+
+    const app_name_z = try allocator.dupeZ(u8, config.value.name);
+    defer allocator.free(app_name_z);
 
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
@@ -47,20 +42,22 @@ pub fn main(init: std.process.Init) !void {
     }
     defer c.SDL_Quit();
 
-    const pref_path_c = c.SDL_GetPrefPath("natyv", "host") orelse {
-        std.debug.print("SDL_GetPrefPath failed: {s}\n", .{c.SDL_GetError()});
-        return error.PrefPathFailed;
-    };
-    defer c.SDL_free(pref_path_c);
-    const pref_path = std.mem.span(pref_path_c);
-
     var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = std.fmt.bufPrintZ(&db_path_buf, "{s}data.sqlite3", .{pref_path}) catch {
-        std.debug.print("[main] db path too long\n", .{});
-        return error.PathTooLong;
-    };
+    var db_path: ?[:0]const u8 = null;
+    if (config.value.sqlite.enabled) {
+        const pref_path_c = c.SDL_GetPrefPath("natyv", app_name_z.ptr) orelse {
+            std.debug.print("SDL_GetPrefPath failed: {s}\n", .{c.SDL_GetError()});
+            return error.PrefPathFailed;
+        };
+        defer c.SDL_free(pref_path_c);
+        const pref_path = std.mem.span(pref_path_c);
+        db_path = std.fmt.bufPrintZ(&db_path_buf, "{s}{s}", .{ pref_path, config.value.sqlite.filename }) catch {
+            std.debug.print("[main] db path too long\n", .{});
+            return error.PathTooLong;
+        };
+    }
 
-    std.debug.print("[main] app: {s}\n[main] database: {s}\n", .{ app_wasm_path, db_path });
+    std.debug.print("[main] app: {s} ({s})\n[main] database: {s}\n", .{ config.value.name, app_wasm_path, db_path orelse "(sqlite disabled)" });
 
     const wasm = std.Io.Dir.cwd().readFileAlloc(io, app_wasm_path, allocator, .unlimited) catch |err| {
         std.debug.print("[main] failed to read {s}: {}\n", .{ app_wasm_path, err });
@@ -71,7 +68,13 @@ pub fn main(init: std.process.Init) !void {
     var runtime = try Runtime.init(allocator, db_path);
     defer runtime.deinit();
 
-    try runtime.loadPlugin(wasm, .{ .allowed_hosts = allowed_hosts });
+    const manifest: Manifest = .{ .allowed_hosts = if (config.value.network.enabled) config.value.network.allowed_hosts else &.{} };
+    const widget_kinds: WidgetHost.EnabledKinds = .{
+        .button = config.value.widgets.button,
+        .textfield = config.value.widgets.textfield,
+        .label = config.value.widgets.label,
+    };
+    try runtime.loadPlugin(wasm, manifest, widget_kinds);
     runtime.initGuest(io);
 
     var queue = EventQueue.init(allocator);
@@ -79,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
 
     const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue });
 
-    const window = c.SDL_CreateWindow("natyv", 900, 700, 0) orelse {
+    const window = c.SDL_CreateWindow(app_name_z.ptr, 900, 700, 0) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlWindowFailed;
     };
