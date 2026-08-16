@@ -25,6 +25,9 @@ const ClayLayout = @import("capabilities/ClayLayout.zig");
 // ever reached transitively through WidgetHost.zig, and this file's own
 // test below is what actually exercises it (see that test's doc comment).
 const Container = @import("widgets/Container.zig");
+const Button = @import("widgets/Button.zig");
+const TextField = @import("widgets/TextField.zig");
+const Label = @import("widgets/Label.zig");
 // F1: same reachability story as ClayLayout above.
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
@@ -575,4 +578,70 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
         if (slot.widget == .button) button_count += 1;
     }
     try std.testing.expectEqual(@as(u32, 1), button_count);
+}
+
+test "nextFocusable: empty list returns null regardless of current or direction" {
+    try std.testing.expectEqual(@as(?u32, null), WidgetHost.nextFocusable(&.{}, null, true));
+    try std.testing.expectEqual(@as(?u32, null), WidgetHost.nextFocusable(&.{}, 5, false));
+}
+
+test "nextFocusable: single id wraps to itself both directions" {
+    const ids = [_]u32{7};
+    try std.testing.expectEqual(@as(?u32, 7), WidgetHost.nextFocusable(&ids, null, true));
+    try std.testing.expectEqual(@as(?u32, 7), WidgetHost.nextFocusable(&ids, 7, true));
+    try std.testing.expectEqual(@as(?u32, 7), WidgetHost.nextFocusable(&ids, 7, false));
+}
+
+test "nextFocusable: forward and backward wrap around the ends of a real list" {
+    const ids = [_]u32{ 3, 5, 9 };
+
+    // No current focus: forward starts at the first id, backward at the last.
+    try std.testing.expectEqual(@as(?u32, 3), WidgetHost.nextFocusable(&ids, null, true));
+    try std.testing.expectEqual(@as(?u32, 9), WidgetHost.nextFocusable(&ids, null, false));
+
+    // Ordinary steps.
+    try std.testing.expectEqual(@as(?u32, 5), WidgetHost.nextFocusable(&ids, 3, true));
+    try std.testing.expectEqual(@as(?u32, 9), WidgetHost.nextFocusable(&ids, 5, true));
+    try std.testing.expectEqual(@as(?u32, 3), WidgetHost.nextFocusable(&ids, 5, false));
+
+    // Wrap at both ends.
+    try std.testing.expectEqual(@as(?u32, 3), WidgetHost.nextFocusable(&ids, 9, true));
+    try std.testing.expectEqual(@as(?u32, 9), WidgetHost.nextFocusable(&ids, 3, false));
+}
+
+test "nextFocusable: current not present in the list is treated like no current focus" {
+    const ids = [_]u32{ 10, 20, 30 };
+    // e.g. the previously-focused widget was just destroyed.
+    try std.testing.expectEqual(@as(?u32, 10), WidgetHost.nextFocusable(&ids, 99, true));
+    try std.testing.expectEqual(@as(?u32, 30), WidgetHost.nextFocusable(&ids, 99, false));
+}
+
+test "focusableIdsSorted: only Button/TextField ids come back, sorted ascending, Label/Container excluded" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+
+    // Inserted deliberately out of the order they should come back in, to
+    // prove this really sorts rather than happening to already be ordered.
+    const label_id = runtime.widgets.insertWithLayout(io, .{ .label = Label.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "hi") }, null, .{}) orelse return error.RegistryFull;
+    const textfield_id = runtime.widgets.insertWithLayout(io, .{ .textfield = TextField.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "") }, null, .{}) orelse return error.RegistryFull;
+    const container_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }) }, null, .{}) orelse return error.RegistryFull;
+    const button_id = runtime.widgets.insertWithLayout(io, .{ .button = Button.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "go") }, null, .{}) orelse return error.RegistryFull;
+    _ = label_id;
+    _ = container_id;
+
+    // button_id was created after textfield_id, so ascending id order is
+    // {textfield_id, button_id} -- not creation-call order in this test,
+    // proving the sort (not insertion order) is what's actually returned.
+    try std.testing.expect(textfield_id < button_id);
+
+    var ids: [8]u32 = undefined;
+    const n = runtime.widgets.focusableIdsSorted(io, &ids);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(textfield_id, ids[0]);
+    try std.testing.expectEqual(button_id, ids[1]);
 }

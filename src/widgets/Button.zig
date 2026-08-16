@@ -27,6 +27,12 @@ text_obj_generation: u32 = 0,
 /// assert the dirty-flag skip is real, same role `ClayLayout.recompute_count`
 /// plays for L4.
 sync_count: u32 = 0,
+/// Keyboard interaction model: true when this button has focus (via Tab
+/// navigation or a mouse click) -- driven by `WidgetHost.setFocused`
+/// through `Widget.setFocusedFlag`, mirrors `TextField.focused`. Space or
+/// Enter while a button is focused activates it the same way a mouse click
+/// does (see `main.zig`'s `SDL_EVENT_KEY_DOWN` handling).
+focused: bool = false,
 
 pub fn init(rect: c.SDL_FRect, initial_label: []const u8) Self {
     var self: Self = .{ .rect = rect };
@@ -76,13 +82,23 @@ pub fn fillColor(self: Self) c.SDL_Color {
 /// Doesn't create it here: `drawDecorations` runs against a per-frame
 /// snapshot *copy*, not the live registry, so any state it set here
 /// wouldn't survive to the next frame.
+///
+/// Keyboard interaction model: draws a focus-ring border when `focused` --
+/// same treatment (color, inset) as `TextField.drawDecorations`'s existing
+/// border, so focus reads consistently across widget kinds regardless of
+/// whether it was reached by Tab or by a mouse click.
 pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
-    _ = renderer;
     if (self.text_obj) |obj| {
         var w: c_int = 0;
         var h: c_int = 0;
         _ = c.TTF_GetTextSize(obj, &w, &h);
         _ = c.TTF_DrawRendererText(obj, self.rect.x + 10, self.rect.y + self.rect.h / 2 - @as(f32, @floatFromInt(h)) / 2);
+    }
+
+    if (self.focused) {
+        _ = c.SDL_SetRenderDrawColor(renderer, 235, 120, 50, 255);
+        const border = c.SDL_FRect{ .x = self.rect.x - 1, .y = self.rect.y - 1, .w = self.rect.w + 2, .h = self.rect.h + 2 };
+        _ = c.SDL_RenderRect(renderer, &border);
     }
 }
 

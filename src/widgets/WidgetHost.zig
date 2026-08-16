@@ -93,6 +93,29 @@ pub const Widget = union(WidgetKind) {
             .label, .container => null,
         };
     }
+
+    /// Keyboard-interaction model: only `Button`/`TextField` can receive
+    /// focus -- `Label`/`Container` are pure display/layout, never
+    /// interactive. Used by `focusableIdsSorted` to decide which widgets
+    /// participate in Tab order.
+    pub fn isFocusable(self: Widget) bool {
+        return switch (self) {
+            .button, .textfield => true,
+            .label, .container => false,
+        };
+    }
+
+    /// Per-kind dispatch for setting/clearing the `focused: bool` field --
+    /// no-op for `Label`/`Container`, which don't have one. Used by
+    /// `WidgetHost.setFocused` instead of a hardcoded `.textfield` check, so
+    /// `Button` (or any future focusable kind) participates the same way.
+    pub fn setFocusedFlag(self: *Widget, focused: bool) void {
+        switch (self.*) {
+            .button => |*b| b.focused = focused,
+            .textfield => |*t| t.focused = focused,
+            .label, .container => {},
+        }
+    }
 };
 
 /// The Clay tree relationships/style a widget was created with -- only
@@ -424,14 +447,70 @@ pub fn backspaceOn(self: *Self, call_io: Io, id: u32) void {
     }
 }
 
-pub fn setFocused(self: *Self, call_io: Io, id: ?u32) void {
+/// Sets `id` as the sole focused widget (clearing focus on every other
+/// slot), or clears focus entirely when `id` is `null`. Returns `true` when
+/// the newly focused widget is specifically a `.textfield` -- `main.zig`
+/// uses this to decide whether to start/stop `SDL_StartTextInput` without a
+/// second registry lookup (focusing a `Button` shouldn't turn on IME/text
+/// composition).
+pub fn setFocused(self: *Self, call_io: Io, id: ?u32) bool {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
+    var focused_is_textfield = false;
     for (&self.slots) |*slot| {
         if (slot.*) |*s| {
-            if (s.widget == .textfield) s.widget.textfield.focused = (id != null and s.id == id.?);
+            const this_one = id != null and s.id == id.?;
+            s.widget.setFocusedFlag(this_one);
+            if (this_one and s.widget == .textfield) focused_is_textfield = true;
         }
     }
+    return focused_is_textfield;
+}
+
+/// Keyboard interaction model: every focusable widget's id (see
+/// `Widget.isFocusable`), sorted ascending. Ids are assigned by a monotonic
+/// counter that's never reused, so ascending id order *is* creation order --
+/// but `snapshot()`'s array-index order is not a safe substitute for this
+/// once a widget has been destroyed and a new one created afterward (the
+/// new widget can land in a freed lower-index slot while carrying a higher
+/// id). `main.zig`'s Tab handling calls this fresh on every Tab press
+/// rather than caching it, so it never goes stale.
+pub fn focusableIdsSorted(self: *Self, call_io: Io, out: []u32) usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    var n: usize = 0;
+    for (self.slots) |slot| {
+        if (n >= out.len) break;
+        if (slot) |s| {
+            if (s.widget.isFocusable()) {
+                out[n] = s.id;
+                n += 1;
+            }
+        }
+    }
+    std.mem.sort(u32, out[0..n], {}, std.sort.asc(u32));
+    return n;
+}
+
+/// Pure Tab-navigation logic, deliberately kept free of `Io`/locking so it's
+/// unit-testable in isolation -- given `ids` (already sorted ascending, see
+/// `focusableIdsSorted`) and the currently focused id (`null` if nothing is
+/// focused), returns the next (`forward`) or previous (`!forward`) id,
+/// wrapping around either end. Returns `null` only when `ids` is empty.
+/// `current` not being present in `ids` (e.g. the focused widget was just
+/// destroyed) is treated the same as `current == null` -- starts from the
+/// beginning (forward) or end (backward) of the list.
+pub fn nextFocusable(ids: []const u32, current: ?u32, forward: bool) ?u32 {
+    if (ids.len == 0) return null;
+    const current_index: ?usize = if (current) |cur| std.mem.indexOfScalar(u32, ids, cur) else null;
+    if (current_index) |i| {
+        if (forward) {
+            return ids[(i + 1) % ids.len];
+        } else {
+            return ids[(i + ids.len - 1) % ids.len];
+        }
+    }
+    return if (forward) ids[0] else ids[ids.len - 1];
 }
 
 pub fn flashButton(self: *Self, call_io: Io, id: u32) void {

@@ -12,6 +12,24 @@ const DrawBatcher = @import("DrawBatcher.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
+/// Keyboard interaction model: the one place focus actually changes (mouse
+/// click, Tab/Shift+Tab, Escape all route through this) -- updates the
+/// registry, the caller's local tracking var, and starts/stops
+/// `SDL_StartTextInput` based on whether the newly focused widget is a
+/// `TextField` (focusing a `Button` shouldn't turn on IME/text
+/// composition). Kept as a free function taking everything explicitly
+/// rather than a closure, since Zig's nested functions can't capture outer
+/// locals.
+fn updateFocus(widgets: *WidgetHost, io: std.Io, window: *c.SDL_Window, focused_widget_id: *?u32, new_id: ?u32) void {
+    const is_textfield = widgets.setFocused(io, new_id);
+    focused_widget_id.* = new_id;
+    if (is_textfield) {
+        _ = c.SDL_StartTextInput(window);
+    } else {
+        _ = c.SDL_StopTextInput(window);
+    }
+}
+
 // M7: app identity, wasm location, and every capability an app needs
 // (SQLite, network + allowed hosts, which widget kinds) now come from
 // conf.natyv.json instead of CLI arguments -- a real install shouldn't
@@ -130,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (pointer_cursor) |cur| c.SDL_DestroyCursor(cur);
     var cursor_is_pointer = false;
 
-    var focused_textfield: ?u32 = null;
+    var focused_widget_id: ?u32 = null;
 
     std.debug.print("[main] window open -- close it to quit.\n", .{});
 
@@ -180,37 +198,61 @@ pub fn main(init: std.process.Init) !void {
                     if (event.button.button == c.SDL_BUTTON_LEFT) {
                         const mx = event.button.x;
                         const my = event.button.y;
-                        var hit_field: ?u32 = null;
+                        // Keyboard interaction model: a click now focuses
+                        // whatever it hits (button or textfield, not just
+                        // textfield as before) so Tab-navigation picks up
+                        // naturally from wherever the mouse last landed.
+                        // Buttons still fire immediately on click, same as
+                        // before -- focusing them is additional, not a
+                        // replacement for that.
+                        var hit_focusable: ?u32 = null;
 
                         for (widget_snapshot[0..widget_count]) |slot| {
                             switch (slot.widget) {
                                 .button => |b| if (b.containsPoint(mx, my)) {
                                     runtime.widgets.flashButton(io, slot.id);
                                     queue.push(io, slot.id, .click, "");
+                                    hit_focusable = slot.id;
                                 },
                                 .textfield => |t| if (t.containsPoint(mx, my)) {
-                                    hit_field = slot.id;
+                                    hit_focusable = slot.id;
                                 },
                                 .label => {},
                                 .container => {},
                             }
                         }
-                        focused_textfield = hit_field;
-                        runtime.widgets.setFocused(io, hit_field);
-                        if (hit_field != null) {
-                            _ = c.SDL_StartTextInput(window);
-                        } else {
-                            _ = c.SDL_StopTextInput(window);
-                        }
+                        updateFocus(&runtime.widgets, io, window, &focused_widget_id, hit_focusable);
                     }
                 },
                 c.SDL_EVENT_TEXT_INPUT => {
-                    if (focused_textfield) |id| runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text));
+                    if (focused_widget_id) |id| runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text));
                 },
-                c.SDL_EVENT_KEY_DOWN => {
-                    if (event.key.key == c.SDLK_BACKSPACE) {
-                        if (focused_textfield) |id| runtime.widgets.backspaceOn(io, id);
-                    }
+                c.SDL_EVENT_KEY_DOWN => switch (event.key.key) {
+                    c.SDLK_BACKSPACE => if (focused_widget_id) |id| runtime.widgets.backspaceOn(io, id),
+                    c.SDLK_TAB => {
+                        var focusable_ids: [max_widgets_on_screen]u32 = undefined;
+                        const focusable_count = runtime.widgets.focusableIdsSorted(io, &focusable_ids);
+                        const forward = (event.key.mod & c.SDL_KMOD_SHIFT) == 0;
+                        const next = WidgetHost.nextFocusable(focusable_ids[0..focusable_count], focused_widget_id, forward);
+                        updateFocus(&runtime.widgets, io, window, &focused_widget_id, next);
+                    },
+                    c.SDLK_RETURN, c.SDLK_KP_ENTER, c.SDLK_SPACE => {
+                        // Only activates a focused Button -- a focused
+                        // TextField never reaches here for Space, since
+                        // that's delivered as literal text via
+                        // SDL_EVENT_TEXT_INPUT instead, not this key-down
+                        // path.
+                        if (focused_widget_id) |id| {
+                            for (widget_snapshot[0..widget_count]) |slot| {
+                                if (slot.id == id and slot.widget == .button) {
+                                    runtime.widgets.flashButton(io, id);
+                                    queue.push(io, id, .click, "");
+                                }
+                            }
+                        }
+                    },
+                    c.SDLK_ESCAPE => updateFocus(&runtime.widgets, io, window, &focused_widget_id, null),
+                    else => {},
                 },
                 else => {},
             }
