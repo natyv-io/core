@@ -25,14 +25,35 @@
 //!   natyv_get_text  in: {"widget_id":N}                out: {"text":"..."} | {"error":..}
 //!   natyv_destroy_widget in: {"widget_id":N}           out: {} | {"error":..}
 //!
+//! W1: three more widget kinds and the generic non-text-state accessors they
+//! need (`natyv_set_text`/`natyv_get_text` are string-specific, not reusable
+//! for a bool or a float):
+//!   natyv_create_checkbox     in: {"x":f,"y":f,"w":f,"h":f,"label":"...","checked":bool}
+//!   natyv_create_radio_button in: {"x":f,"y":f,"w":f,"h":f,"label":"...","group_id":N,"checked":bool}
+//!   natyv_create_progressbar  in: {"x":f,"y":f,"w":f,"h":f,"value":f}
+//!     all out: {"widget_id":N} | {"error":"..."}
+//!   natyv_set_checked in: {"widget_id":N,"checked":bool}  out: {} | {"error":..}
+//!   natyv_get_checked in: {"widget_id":N}                 out: {"checked":bool} | {"error":..}
+//!   natyv_set_value   in: {"widget_id":N,"value":f}       out: {} | {"error":..}
+//!   natyv_get_value   in: {"widget_id":N}                 out: {"value":f} | {"error":..}
+//!   (checked/value are no-ops, not errors, on a widget kind they don't
+//!   apply to -- same "not an error, just doesn't apply" precedent
+//!   natyv_set_text already sets for e.g. Container). Setting a radio
+//!   button's checked to true deselects every other radio button sharing
+//!   its group_id (see WidgetHost.selectRadioExclusive) -- setting it false
+//!   just deselects it, no exclusivity to apply.
+//!
 //! L3: `natyv_clay_*` variants (only registered when conf.natyv.json's
 //! `ui.backend == "clay"`) take a `layout` object instead of x/y/w/h --
 //! under a Clay-managed parent, position/size become *computed output*
 //! (via L4's per-frame layout pass), not guest-supplied input:
-//!   natyv_clay_create_container in: {"layout":{...}}
-//!   natyv_clay_create_button    in: {"layout":{...},"label":"..."}
-//!   natyv_clay_create_textfield in: {"layout":{...},"placeholder":"..."}
-//!   natyv_clay_create_label     in: {"layout":{...},"text":"..."}
+//!   natyv_clay_create_container    in: {"layout":{...}}
+//!   natyv_clay_create_button       in: {"layout":{...},"label":"..."}
+//!   natyv_clay_create_textfield    in: {"layout":{...},"placeholder":"..."}
+//!   natyv_clay_create_label        in: {"layout":{...},"text":"..."}
+//!   natyv_clay_create_checkbox     in: {"layout":{...},"label":"...","checked":bool}
+//!   natyv_clay_create_radio_button in: {"layout":{...},"label":"...","group_id":N,"checked":bool}
+//!   natyv_clay_create_progressbar  in: {"layout":{...},"value":f}
 //!     all out: {"widget_id":N} | {"error":"..."}
 //!   layout: {"parent_id":N|null,
 //!            "sizing":{"width":{"type":"fit"|"grow"|"fixed"|"percent","min":f,"max":f,"percent":f}, "height":{...}},
@@ -41,8 +62,9 @@
 //!            "direction":"left_to_right"|"top_to_bottom",
 //!            "child_alignment":{"x":"left"|"right"|"center","y":"top"|"bottom"|"center"}}
 //!   (every layout field is optional -- see ClayLayoutRequest defaults below)
-//!   natyv_set_text/natyv_get_text/natyv_destroy_widget work unchanged on
-//!   Clay-created widgets too, since they're the same underlying Widget
+//!   natyv_set_text/natyv_get_text/natyv_set_checked/natyv_get_checked/
+//!   natyv_set_value/natyv_get_value/natyv_destroy_widget all work unchanged
+//!   on Clay-created widgets too, since they're the same underlying Widget
 //!   union -- only how a widget's rect gets computed differs.
 
 const std = @import("std");
@@ -54,18 +76,27 @@ const Button = @import("Button.zig");
 const TextField = @import("TextField.zig");
 const Label = @import("Label.zig");
 const Container = @import("Container.zig");
+const Checkbox = @import("Checkbox.zig");
+const RadioButton = @import("RadioButton.zig");
+const ProgressBar = @import("ProgressBar.zig");
 
 const Self = @This();
 
 pub const max_widgets = 64;
-pub const host_function_count = 6;
+// button/textfield/label create, set_text, get_text, destroy_widget (6) +
+// checkbox/radio_button/progress_bar create (3) + get_checked/set_checked/
+// get_value/set_value (4) -- W1 widget breadth.
+pub const host_function_count = 13;
 
-pub const WidgetKind = enum { button, textfield, label, container };
+pub const WidgetKind = enum { button, textfield, label, container, checkbox, radio_button, progress_bar };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
     label: Label,
     container: Container,
+    checkbox: Checkbox,
+    radio_button: RadioButton,
+    progress_bar: ProgressBar,
 
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
@@ -77,6 +108,9 @@ pub const Widget = union(WidgetKind) {
             .textfield => |*t| &t.rect,
             .label => |*l| &l.rect,
             .container => |*co| &co.rect,
+            .checkbox => |*cb| &cb.rect,
+            .radio_button => |*r| &r.rect,
+            .progress_bar => |*p| &p.rect,
         };
     }
 
@@ -90,7 +124,15 @@ pub const Widget = union(WidgetKind) {
         return switch (self) {
             .button => |b| .{ .color = b.fillColor(), .rect = b.rect },
             .textfield => |t| .{ .color = t.fillColor(), .rect = t.rect },
-            .label, .container => null,
+            // Only fills when checked -- an unchecked box has nothing to
+            // batch-fill, just the outline `drawDecorations` always draws.
+            // Uses `boxRect()`, not the full `rect`, since the label area
+            // (if any) is never filled.
+            .checkbox => |cb| if (cb.checked) .{ .color = cb.fillColor(), .rect = cb.boxRect() } else null,
+            // RadioButton.zig's doc comment explains why this opts out
+            // entirely -- its checked state is an inset dot, not a
+            // whole-rect fill.
+            .label, .container, .radio_button, .progress_bar => null,
         };
     }
 
@@ -100,8 +142,8 @@ pub const Widget = union(WidgetKind) {
     /// participate in Tab order.
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
-            .button, .textfield => true,
-            .label, .container => false,
+            .button, .textfield, .checkbox, .radio_button => true,
+            .label, .container, .progress_bar => false,
         };
     }
 
@@ -113,7 +155,9 @@ pub const Widget = union(WidgetKind) {
         switch (self.*) {
             .button => |*b| b.focused = focused,
             .textfield => |*t| t.focused = focused,
-            .label, .container => {},
+            .checkbox => |*cb| cb.focused = focused,
+            .radio_button => |*r| r.focused = focused,
+            .label, .container, .progress_bar => {},
         }
     }
 };
@@ -183,6 +227,9 @@ pub const EnabledKinds = struct {
     button: bool = true,
     textfield: bool = true,
     label: bool = true,
+    checkbox: bool = true,
+    radio_button: bool = true,
+    progress_bar: bool = true,
 };
 
 /// Registers only the create-functions for widget kinds `enabled` declares
@@ -210,16 +257,40 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
         funcs_out[n] = c.extism_function_new("natyv_create_label", &in_types[0], 1, &out_types[0], 1, createLabelHostFn, self, null);
         n += 1;
     }
+    if (enabled.checkbox) {
+        funcs_out[n] = c.extism_function_new("natyv_create_checkbox", &in_types[0], 1, &out_types[0], 1, createCheckboxHostFn, self, null);
+        n += 1;
+    }
+    if (enabled.radio_button) {
+        funcs_out[n] = c.extism_function_new("natyv_create_radio_button", &in_types[0], 1, &out_types[0], 1, createRadioButtonHostFn, self, null);
+        n += 1;
+    }
+    if (enabled.progress_bar) {
+        funcs_out[n] = c.extism_function_new("natyv_create_progressbar", &in_types[0], 1, &out_types[0], 1, createProgressBarHostFn, self, null);
+        n += 1;
+    }
     funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, setTextHostFn, self, null);
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, getTextHostFn, self, null);
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_destroy_widget", &in_types[0], 1, &out_types[0], 1, destroyWidgetHostFn, self, null);
     n += 1;
+    // W1: generic non-text state accessors (bool/float) -- same "always
+    // registered, nothing to gate" reasoning as set_text/get_text/
+    // destroy_widget above (a guest can't get a widget_id to call these
+    // with unless it already had permission to create that widget).
+    funcs_out[n] = c.extism_function_new("natyv_set_checked", &in_types[0], 1, &out_types[0], 1, setCheckedHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_get_checked", &in_types[0], 1, &out_types[0], 1, getCheckedHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_set_value", &in_types[0], 1, &out_types[0], 1, setValueHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_get_value", &in_types[0], 1, &out_types[0], 1, getValueHostFn, self, null);
+    n += 1;
     return n;
 }
 
-pub const clay_host_function_count = 4;
+pub const clay_host_function_count = 7;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -235,6 +306,9 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[1] = c.extism_function_new("natyv_clay_create_button", &in_types[0], 1, &out_types[0], 1, createClayButtonHostFn, self, null);
     funcs_out[2] = c.extism_function_new("natyv_clay_create_textfield", &in_types[0], 1, &out_types[0], 1, createClayTextFieldHostFn, self, null);
     funcs_out[3] = c.extism_function_new("natyv_clay_create_label", &in_types[0], 1, &out_types[0], 1, createClayLabelHostFn, self, null);
+    funcs_out[4] = c.extism_function_new("natyv_clay_create_checkbox", &in_types[0], 1, &out_types[0], 1, createClayCheckboxHostFn, self, null);
+    funcs_out[5] = c.extism_function_new("natyv_clay_create_radio_button", &in_types[0], 1, &out_types[0], 1, createClayRadioButtonHostFn, self, null);
+    funcs_out[6] = c.extism_function_new("natyv_clay_create_progressbar", &in_types[0], 1, &out_types[0], 1, createClayProgressBarHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -331,7 +405,9 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .button => |*b| b.syncText(engine, font),
                 .textfield => |*t| t.syncText(engine, font),
                 .label => |*l| l.syncText(engine, font),
-                .container => {},
+                .checkbox => |*cb| cb.syncText(engine, font),
+                .radio_button => |*r| r.syncText(engine, font),
+                .container, .progress_bar => {},
             }
         }
     }
@@ -351,7 +427,9 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .button => |*b| b.destroyText(),
                 .textfield => |*t| t.destroyText(),
                 .label => |*l| l.destroyText(),
-                .container => {},
+                .checkbox => |*cb| cb.destroyText(),
+                .radio_button => |*r| r.destroyText(),
+                .container, .progress_bar => {},
             }
         }
     }
@@ -386,7 +464,9 @@ fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
             self.queuePendingTextDestroy(&t.placeholder_obj);
         },
         .label => |*l| self.queuePendingTextDestroy(&l.text_obj),
-        .container => {},
+        .checkbox => |*cb| self.queuePendingTextDestroy(&cb.text_obj),
+        .radio_button => |*r| self.queuePendingTextDestroy(&r.text_obj),
+        .container, .progress_bar => {},
     }
 }
 
@@ -521,11 +601,59 @@ pub fn flashButton(self: *Self, call_io: Io, id: u32) void {
     }
 }
 
+/// W1: the click/Enter/Space activation counterpart to `flashButton`, for
+/// a checkbox -- flips its `checked` state. `main.zig`'s widened activation
+/// handling calls this instead of `flashButton` when the activated widget
+/// is a `.checkbox`.
+pub fn toggleCheckbox(self: *Self, call_io: Io, id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        if (slot.widget == .checkbox) slot.widget.checkbox.toggle();
+    }
+}
+
+/// W1: selects radio button `id` and deselects every other `.radio_button`
+/// sharing its `group_id` -- the actual mutual-exclusivity logic
+/// `RadioButton.zig`'s own doc comment defers to this file for, since it
+/// needs to reach across the whole registry, not just one widget. Called
+/// both from a real click/Enter/Space activation (`main.zig`) and from
+/// `natyv_set_checked` when a guest programmatically selects a radio, so
+/// both paths behave identically. A no-op if `id` doesn't name a radio
+/// button.
+pub fn selectRadioExclusive(self: *Self, call_io: Io, id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const group_id = blk: {
+        const slot = self.findLocked(id) orelse return;
+        break :blk switch (slot.widget) {
+            .radio_button => |r| r.group_id,
+            else => return,
+        };
+    };
+    for (&self.slots) |*slot| {
+        if (slot.*) |*s| {
+            if (s.widget == .radio_button and s.widget.radio_button.group_id == group_id) {
+                if (s.id == id) {
+                    s.widget.radio_button.select();
+                } else {
+                    s.widget.radio_button.deselect();
+                }
+            }
+        }
+    }
+}
+
 const CreateButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 };
 const CreateTextFieldRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
 const WidgetIdRequest = struct { widget_id: u32 };
 const CreateLabelRequest = struct { x: f32, y: f32, w: f32 = 0, h: f32 = 20, text: []const u8 = "" };
 const SetTextRequest = struct { widget_id: u32, text: []const u8 };
+const CreateCheckboxRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", checked: bool = false };
+const CreateRadioButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", group_id: u32, checked: bool = false };
+const CreateProgressBarRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
+const SetCheckedRequest = struct { widget_id: u32, checked: bool };
+const SetValueRequest = struct { widget_id: u32, value: f32 };
 
 // L3: wire-format mirrors of Clay's real C types (Clay_SizingAxis,
 // Clay_Padding, Clay_LayoutDirection, Clay_ChildAlignment -- see clay.h)
@@ -562,6 +690,9 @@ const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{} };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
 const ClayTextFieldRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
 const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const u8 = "" };
+const ClayCheckboxRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
+const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", group_id: u32, checked: bool = false };
+const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 
 fn toSizingAxis(req: ClaySizingAxisRequest) c.Clay_SizingAxis {
     return switch (req.type) {
@@ -719,6 +850,77 @@ fn createLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
     host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
 }
 
+fn createCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateCheckboxRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    var checkbox = Checkbox.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.label);
+    checkbox.checked = req.checked;
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .checkbox = checkbox });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+fn createRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateRadioButtonRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    var radio = RadioButton.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.group_id, req.label);
+    radio.checked = req.checked;
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .radio_button = radio });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+fn createProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateProgressBarRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const bar = ProgressBar.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.value);
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .progress_bar = bar });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
 fn createClayContainerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -759,6 +961,38 @@ fn createClayLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Ex
     insertClayWidget(self, plugin, &outputs[0], .{ .label = label }, parsed.value.layout);
 }
 
+fn createClayCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayCheckboxRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    var checkbox = Checkbox.init(std.mem.zeroes(c.SDL_FRect), parsed.value.label);
+    checkbox.checked = parsed.value.checked;
+    insertClayWidget(self, plugin, &outputs[0], .{ .checkbox = checkbox }, parsed.value.layout);
+}
+
+fn createClayRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayRadioButtonRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    var radio = RadioButton.init(std.mem.zeroes(c.SDL_FRect), parsed.value.group_id, parsed.value.label);
+    radio.checked = parsed.value.checked;
+    insertClayWidget(self, plugin, &outputs[0], .{ .radio_button = radio }, parsed.value.layout);
+}
+
+fn createClayProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayProgressBarRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const bar = ProgressBar.init(std.mem.zeroes(c.SDL_FRect), parsed.value.value);
+    insertClayWidget(self, plugin, &outputs[0], .{ .progress_bar = bar }, parsed.value.layout);
+}
+
 fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -777,7 +1011,9 @@ fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .button => |*b| b.setLabel(req.text),
         .textfield => |*t| t.setText(req.text),
         .label => |*l| l.setText(req.text),
-        .container => {},
+        .checkbox => |*cb| cb.setLabel(req.text),
+        .radio_button => |*r| r.setLabel(req.text),
+        .container, .progress_bar => {},
     }
     if (slot.clay_managed) self.layout_generation +%= 1;
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -801,7 +1037,9 @@ fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .button => |b| b.label(),
         .textfield => |t| t.text(),
         .label => |l| l.text(),
-        .container => "",
+        .checkbox => |cb| cb.label(),
+        .radio_button => |r| r.label(),
+        .container, .progress_bar => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -820,6 +1058,115 @@ fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         return;
     }
     host_fn_util.writeGuestBytes(plugin, &outputs[0], out.items);
+}
+
+/// W1: bool state for `.checkbox`/`.radio_button` -- a no-op (not an error)
+/// on any other kind, matching `setTextHostFn`'s existing precedent for
+/// kinds the operation doesn't apply to. A radio button being set `true`
+/// routes through `selectRadioExclusive` *after* releasing the lock below
+/// (that function takes its own lock -- `Io.Mutex` isn't reentrant, calling
+/// it while still holding the lock here would deadlock), so its siblings
+/// get deselected the same way a real click would; being set `false` just
+/// deselects it directly, no exclusivity to apply.
+fn setCheckedHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetCheckedRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    var is_radio = false;
+    self.mutex.lockUncancelable(self.io());
+    if (self.findLocked(req.widget_id)) |slot| {
+        switch (slot.widget) {
+            .checkbox => |*cb| cb.checked = req.checked,
+            .radio_button => |*r| {
+                is_radio = true;
+                if (!req.checked) r.deselect();
+            },
+            else => {},
+        }
+        self.mutex.unlock(self.io());
+    } else {
+        self.mutex.unlock(self.io());
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    }
+
+    if (is_radio and req.checked) self.selectRadioExclusive(self.io(), req.widget_id);
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+fn getCheckedHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.mutex.lockUncancelable(self.io());
+    defer self.mutex.unlock(self.io());
+    const slot = self.findLocked(req.widget_id) orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    };
+    const checked = switch (slot.widget) {
+        .checkbox => |cb| cb.checked,
+        .radio_button => |r| r.checked,
+        else => false,
+    };
+    var buf: [32]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"checked\":{}}}", .{checked}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+/// W1: float state for `.progress_bar` -- no-op on any other kind, same
+/// "not an error, just doesn't apply" precedent as `setCheckedHostFn`.
+/// `ProgressBar.setValue` clamps to [0,1] itself, so no clamping needed here.
+fn setValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetValueRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.mutex.lockUncancelable(self.io());
+    defer self.mutex.unlock(self.io());
+    const slot = self.findLocked(req.widget_id) orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    };
+    switch (slot.widget) {
+        .progress_bar => |*p| p.setValue(req.value),
+        else => {},
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+fn getValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.mutex.lockUncancelable(self.io());
+    defer self.mutex.unlock(self.io());
+    const slot = self.findLocked(req.widget_id) orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    };
+    const value: f32 = switch (slot.widget) {
+        .progress_bar => |p| p.value,
+        else => 0,
+    };
+    var buf: [32]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{value}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
 }
 
 fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {

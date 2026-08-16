@@ -30,6 +30,22 @@ fn updateFocus(widgets: *WidgetHost, io: std.Io, window: *c.SDL_Window, focused_
     }
 }
 
+/// W1: the shared "activate this widget" body for both a mouse click and a
+/// keyboard Enter/Space -- one place so the two input paths can't drift
+/// apart on what "activating" a given kind actually does. Not every kind is
+/// activatable (TextField, Label, Container, ProgressBar aren't); those
+/// just fall through without pushing an event at all, same as clicking
+/// empty space today.
+fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, kind: WidgetHost.WidgetKind) void {
+    switch (kind) {
+        .button => widgets.flashButton(io, id),
+        .checkbox => widgets.toggleCheckbox(io, id),
+        .radio_button => widgets.selectRadioExclusive(io, id),
+        .textfield, .label, .container, .progress_bar => return,
+    }
+    queue.push(io, id, .click, "");
+}
+
 // M7: app identity, wasm location, and every capability an app needs
 // (SQLite, network + allowed hosts, which widget kinds) now come from
 // conf.natyv.json instead of CLI arguments -- a real install shouldn't
@@ -101,6 +117,9 @@ pub fn main(init: std.process.Init) !void {
         .button = config.value.widgets.button,
         .textfield = config.value.widgets.textfield,
         .label = config.value.widgets.label,
+        .checkbox = config.value.widgets.checkbox,
+        .radio_button = config.value.widgets.radio_button,
+        .progress_bar = config.value.widgets.progress_bar,
     };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
     try runtime.loadPlugin(wasm, manifest, widget_kinds, clay_enabled);
@@ -210,8 +229,15 @@ pub fn main(init: std.process.Init) !void {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             switch (slot.widget) {
                                 .button => |b| if (b.containsPoint(mx, my)) {
-                                    runtime.widgets.flashButton(io, slot.id);
-                                    queue.push(io, slot.id, .click, "");
+                                    activateWidget(&runtime.widgets, io, &queue, slot.id, .button);
+                                    hit_focusable = slot.id;
+                                },
+                                .checkbox => |cb| if (cb.containsPoint(mx, my)) {
+                                    activateWidget(&runtime.widgets, io, &queue, slot.id, .checkbox);
+                                    hit_focusable = slot.id;
+                                },
+                                .radio_button => |r| if (r.containsPoint(mx, my)) {
+                                    activateWidget(&runtime.widgets, io, &queue, slot.id, .radio_button);
                                     hit_focusable = slot.id;
                                 },
                                 .textfield => |t| if (t.containsPoint(mx, my)) {
@@ -219,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
                                 },
                                 .label => {},
                                 .container => {},
+                                .progress_bar => {},
                             }
                         }
                         updateFocus(&runtime.widgets, io, window, &focused_widget_id, hit_focusable);
@@ -237,16 +264,16 @@ pub fn main(init: std.process.Init) !void {
                         updateFocus(&runtime.widgets, io, window, &focused_widget_id, next);
                     },
                     c.SDLK_RETURN, c.SDLK_KP_ENTER, c.SDLK_SPACE => {
-                        // Only activates a focused Button -- a focused
-                        // TextField never reaches here for Space, since
-                        // that's delivered as literal text via
+                        // Activates a focused Button/Checkbox/RadioButton --
+                        // a focused TextField never reaches here for Space,
+                        // since that's delivered as literal text via
                         // SDL_EVENT_TEXT_INPUT instead, not this key-down
-                        // path.
+                        // path. `activateWidget` itself no-ops for any kind
+                        // that isn't activatable.
                         if (focused_widget_id) |id| {
                             for (widget_snapshot[0..widget_count]) |slot| {
-                                if (slot.id == id and slot.widget == .button) {
-                                    runtime.widgets.flashButton(io, id);
-                                    queue.push(io, id, .click, "");
+                                if (slot.id == id) {
+                                    activateWidget(&runtime.widgets, io, &queue, id, std.meta.activeTag(slot.widget));
                                 }
                             }
                         }
@@ -267,8 +294,15 @@ pub fn main(init: std.process.Init) !void {
                 .textfield => |t| if (t.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
                 },
+                .checkbox => |cb| if (cb.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                },
+                .radio_button => |r| if (r.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                },
                 .label => {},
                 .container => {},
+                .progress_bar => {},
             }
         }
         if (hovering_any != cursor_is_pointer) {
@@ -295,6 +329,9 @@ pub fn main(init: std.process.Init) !void {
                 .button => |b| b.drawDecorations(renderer),
                 .textfield => |t| t.drawDecorations(renderer),
                 .label => |l| l.drawDecorations(renderer),
+                .checkbox => |cb| cb.drawDecorations(renderer),
+                .radio_button => |r| r.drawDecorations(renderer),
+                .progress_bar => |p| p.drawDecorations(renderer),
                 // L2: containers are layout-only, nothing to draw -- see
                 // Container.zig's doc comment.
                 .container => {},

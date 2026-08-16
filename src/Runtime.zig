@@ -28,6 +28,9 @@ const Container = @import("widgets/Container.zig");
 const Button = @import("widgets/Button.zig");
 const TextField = @import("widgets/TextField.zig");
 const Label = @import("widgets/Label.zig");
+const Checkbox = @import("widgets/Checkbox.zig");
+const RadioButton = @import("widgets/RadioButton.zig");
+const ProgressBar = @import("widgets/ProgressBar.zig");
 // F1: same reachability story as ClayLayout above.
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
@@ -167,6 +170,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
             },
             .label => {},
             .container => {},
+            .checkbox, .radio_button, .progress_bar => {},
         }
     }
 
@@ -318,9 +322,12 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [4]WidgetHost.Slot = undefined;
+    // 8, not 4: natyv_init creates container + button + checkbox + 2 radio
+    // buttons + a progress bar (W1) -- 6 widgets total, not just the
+    // original container+button.
+    var snap: [8]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(usize, 6), n);
 
     var container_id: ?u32 = null;
     var button_id: ?u32 = null;
@@ -377,7 +384,9 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
-    var snap: [4]WidgetHost.Slot = undefined;
+    // 8, not 4: natyv_init creates 6 widgets now (W1 added checkbox/2 radio
+    // buttons/progress bar alongside the original container+button).
+    var snap: [8]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -444,7 +453,8 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
     // First sync: nothing cached yet, must create the button's TTF_Text.
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
-    var snap: [4]WidgetHost.Slot = undefined;
+    // 8, not 4 -- see the L4 test's identical comment above.
+    var snap: [8]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -522,7 +532,8 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     // -- otherwise there'd be nothing for the bug to actually crash on.
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
-    var snap: [4]WidgetHost.Slot = undefined;
+    // 8, not 4 -- see the L4 test's identical comment above.
+    var snap: [8]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -644,4 +655,111 @@ test "focusableIdsSorted: only Button/TextField ids come back, sorted ascending,
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqual(textfield_id, ids[0]);
     try std.testing.expectEqual(button_id, ids[1]);
+}
+
+test "W1: selectRadioExclusive keeps exclusivity within a group and leaves other groups alone" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+
+    // Group 0: three radios. Group 1: one distractor -- selecting something
+    // in group 0 must never touch it.
+    const a = runtime.widgets.insertWithLayout(io, .{ .radio_button = RadioButton.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, 0, "A") }, null, .{}) orelse return error.RegistryFull;
+    const b = runtime.widgets.insertWithLayout(io, .{ .radio_button = RadioButton.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, 0, "B") }, null, .{}) orelse return error.RegistryFull;
+    const rc = runtime.widgets.insertWithLayout(io, .{ .radio_button = RadioButton.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, 0, "C") }, null, .{}) orelse return error.RegistryFull;
+    const distractor = runtime.widgets.insertWithLayout(io, .{ .radio_button = RadioButton.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, 1, "D") }, null, .{}) orelse return error.RegistryFull;
+
+    // Select A, then the distractor (its own group, harmless), then C --
+    // selecting C must deselect A (the previously-selected sibling in its
+    // group) but must not touch the distractor in the other group.
+    runtime.widgets.selectRadioExclusive(io, a);
+    runtime.widgets.selectRadioExclusive(io, distractor);
+    runtime.widgets.selectRadioExclusive(io, rc);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        const checked = slot.widget.radio_button.checked;
+        if (slot.id == a) try std.testing.expect(!checked);
+        if (slot.id == b) try std.testing.expect(!checked);
+        if (slot.id == rc) try std.testing.expect(checked);
+        if (slot.id == distractor) try std.testing.expect(checked);
+    }
+}
+
+test "W1: checkbox/radio/progress bar created and mutated through a real compiled guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var checkbox_id: ?u32 = null;
+    var radio_a_id: ?u32 = null;
+    var radio_b_id: ?u32 = null;
+    var progress_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        switch (slot.widget) {
+            .checkbox => |cb| {
+                try std.testing.expectEqualStrings("Enable Feature", cb.label());
+                try std.testing.expect(!cb.checked);
+                checkbox_id = slot.id;
+            },
+            .radio_button => |r| {
+                if (std.mem.eql(u8, r.label(), "Option A")) {
+                    try std.testing.expect(r.checked);
+                    radio_a_id = slot.id;
+                } else if (std.mem.eql(u8, r.label(), "Option B")) {
+                    try std.testing.expect(!r.checked);
+                    radio_b_id = slot.id;
+                }
+            },
+            .progress_bar => |p| {
+                try std.testing.expectApproxEqAbs(@as(f32, 0.25), p.value, 0.001);
+                progress_id = slot.id;
+            },
+            else => {},
+        }
+    }
+    const cbid = checkbox_id orelse return error.MissingCheckbox;
+    const raid = radio_a_id orelse return error.MissingRadioA;
+    const rbid = radio_b_id orelse return error.MissingRadioB;
+    const prid = progress_id orelse return error.MissingProgressBar;
+
+    // Real guest-routed checkbox toggle (natyv_set_checked via natyv_dispatch).
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"CheckIt\"}") orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == cbid) try std.testing.expect(slot.widget.checkbox.checked);
+    }
+
+    // Real guest-routed radio selection -- must flip exclusivity: B becomes
+    // checked, A (checked since natyv_init) becomes unchecked.
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SelectRadioB\"}") orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == raid) try std.testing.expect(!slot.widget.radio_button.checked);
+        if (slot.id == rbid) try std.testing.expect(slot.widget.radio_button.checked);
+    }
+
+    // Real guest-routed progress value change.
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SetProgressHalf\"}") orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == prid) try std.testing.expectApproxEqAbs(@as(f32, 0.5), slot.widget.progress_bar.value, 0.001);
+    }
 }
