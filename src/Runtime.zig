@@ -322,26 +322,35 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 8, not 4: natyv_init creates container + button + checkbox + 2 radio
-    // buttons + a progress bar (W1) -- 6 widgets total, not just the
-    // original container+button.
-    var snap: [8]WidgetHost.Slot = undefined;
+    // 16, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
+    // row labels (6 more) -- 12 widgets total. Same silent-truncation risk
+    // documented at W1's identical bump from 4 to 8 -- snapshot() caps at
+    // out.len with no error, so every clay-fixture-loading test's buffer
+    // needs auditing whenever natyv_init grows, not just the test being
+    // extended.
+    var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 6), n);
+    try std.testing.expectEqual(@as(usize, 12), n);
 
-    var container_id: ?u32 = null;
+    // W2: the fixture now creates a *second* top-level container (the
+    // scroll container, parent_id == null just like this one) alongside
+    // its 5 row labels, so "the first/only .container in the snapshot" is
+    // no longer a unique match -- derive cid from the button's own
+    // parent_id instead, which is unambiguous regardless of how many other
+    // containers exist elsewhere in the tree.
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
-        switch (slot.widget) {
-            .container => container_id = slot.id,
-            .button => |b| if (std.mem.eql(u8, b.label(), "Grow Button")) {
-                button_id = slot.id;
-            },
-            else => {},
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Grow Button")) {
+            button_id = slot.id;
         }
     }
-    const cid = container_id orelse return error.MissingContainer;
     const bid = button_id orelse return error.MissingButton;
+    var container_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.id == bid) container_id = slot.parent_id;
+    }
+    const cid = container_id orelse return error.MissingContainer;
 
     for (snap[0..n]) |slot| {
         if (slot.id == cid) {
@@ -381,12 +390,11 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     defer clay_layout.deinit(allocator);
 
     // First frame: nothing computed yet, so this must run Clay for real.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
-    // 8, not 4: natyv_init creates 6 widgets now (W1 added checkbox/2 radio
-    // buttons/progress bar alongside the original container+button).
-    var snap: [8]WidgetHost.Slot = undefined;
+    // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
+    var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -406,7 +414,7 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
 
     // Second frame: nothing changed since the first -- must skip the real
     // Clay computation entirely, not just produce the same numbers.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     // Mutating a Clay-managed widget's text bumps layout_generation (see
@@ -419,8 +427,216 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     const payload = try std.fmt.bufPrint(&payload_buf, "{{\"widget_id\":{d},\"event_type\":\"Grown\"}}", .{bid});
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+}
+
+test "W2: natyv_clay_create_container's scroll_vertical/scroll_horizontal round-trip into ClayStyle" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
+    var snap: [16]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+
+    // The scroll container is the only top-level (parent_id == null)
+    // container that parents Label children -- distinct from the original
+    // container, which parents Button/Checkbox/RadioButton/ProgressBar.
+    var found = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .container or slot.parent_id != null) continue;
+        var has_label_child = false;
+        for (snap[0..n]) |maybe_child| {
+            if (maybe_child.parent_id) |pid| {
+                if (pid == slot.id and maybe_child.widget == .label) has_label_child = true;
+            }
+        }
+        if (has_label_child) {
+            try std.testing.expect(slot.clay_style.scroll_vertical);
+            try std.testing.expect(!slot.clay_style.scroll_horizontal);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+// W2's real correctness gate. Clay_UpdateScrollContainers only ever applies
+// a wheel delta to whichever scroll container is topmost in
+// `context->pointerOverIds` -- which is only populated by the *previous*
+// real layout pass's post-EndLayout hit test, using whatever mouse position
+// that pass was given. So establishing scroll routing genuinely needs two
+// real recomputes: one to declare the scroll container to Clay with the
+// mouse already positioned over it (registering it in pointerOverIds), then
+// a second that actually carries a nonzero delta. This is inherent to
+// Clay's own architecture (confirmed by reading Clay_UpdateScrollContainers'
+// real body), not a natyv gap -- see ClayLayout.zig's layoutIfNeeded doc
+// comment for the full reasoning.
+test "W2: a nonzero scroll delta forces a real Clay recompute even when content generation is unchanged, and moves child rects" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Predicted from the fixture's real layout: root is CLAY_LEFT_TO_RIGHT
+    // (Clay's own default, unset by main.zig's zeroed root_decl), so the
+    // original Fixed(300)x(100) container occupies x:[0,300], and the
+    // Fixed(200)x(100) scroll container (created right after it, as a
+    // sibling) occupies x:[300,500], both y:[0,100]. Frame 1 must already
+    // pass a mouse position over the scroll container -- Clay only
+    // registers pointerOverIds from a real EndLayout pass, and this is the
+    // only recompute before the scroll-carrying frame below.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    var snap: [16]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var scroll_container_id: ?u32 = null;
+    var row1_id: ?u32 = null;
+    var row1_base_y: f32 = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .container or slot.parent_id != null) continue;
+        for (snap[0..n]) |maybe_child| {
+            if (maybe_child.parent_id) |pid| {
+                if (pid == slot.id and maybe_child.widget == .label and std.mem.eql(u8, maybe_child.widget.label.text(), "Scroll Row 1")) {
+                    scroll_container_id = slot.id;
+                    row1_id = maybe_child.id;
+                    row1_base_y = maybe_child.widget.label.rect.y;
+                }
+            }
+        }
+    }
+    const scid = scroll_container_id orelse return error.MissingScrollContainer;
+    const rid = row1_id orelse return error.MissingRow;
+
+    // Defensive sanity check on the layout prediction above, rather than
+    // silently trusting it -- if this ever fails, the mouse position fed
+    // into frame 1 above needs updating, not the assertions below.
+    for (snap[0..n]) |slot| {
+        if (slot.id == scid) {
+            try std.testing.expectApproxEqAbs(@as(f32, 300), slot.widget.container.rect.x, 0.01);
+            try std.testing.expectApproxEqAbs(@as(f32, 200), slot.widget.container.rect.w, 0.01);
+            try std.testing.expectApproxEqAbs(@as(f32, 100), slot.widget.container.rect.h, 0.01);
+        }
+    }
+
+    // Content is 5 rows * Fixed(40) = 200px inside a Fixed(100) container --
+    // 100px of overflow. A delta far beyond that must clamp exactly to
+    // -100, not merely "move some amount."
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == rid) {
+            try std.testing.expectApproxEqAbs(row1_base_y - 100, slot.widget.label.rect.y, 0.01);
+        }
+    }
+}
+
+// The crux regression test for W2: reproduces the real bug found by reading
+// Clay_UpdateScrollContainers' actual implementation (not just its header
+// comment) -- calling it on a frame with no real recompute silently evicts
+// the scroll container's tracked position, snapping it back to the top a
+// couple frames after the user stops scrolling. A shallow "one scroll ->
+// rect moved" test (the one above) would still pass even with that bug
+// reintroduced; this test specifically exercises a genuine skip frame
+// between two real scrolls and asserts position is preserved and
+// accumulates, not reset.
+test "W2: scroll position survives an intervening frame where nothing else changes, and accumulates rather than resetting" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Frame 1: baseline, mouse pre-positioned over the scroll container --
+    // see the previous test's identical layout prediction/reasoning.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    var snap: [16]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    var row1_id: ?u32 = null;
+    var row1_base_y: f32 = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Scroll Row 1")) {
+            row1_id = slot.id;
+            row1_base_y = slot.widget.label.rect.y;
+        }
+    }
+    const rid = row1_id orelse return error.MissingRow;
+
+    // Frame 2: a real, moderate scroll (well short of the -100 clamp found
+    // in the previous test) -- recompute #2, row1 shifts up by 30px.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+    n = runtime.widgets.snapshot(io, &snap);
+    var y_after_first_scroll: f32 = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == rid) {
+            y_after_first_scroll = slot.widget.label.rect.y;
+            try std.testing.expectApproxEqAbs(row1_base_y - 30, y_after_first_scroll, 0.01);
+        }
+    }
+
+    // Frame 3: a genuine skip frame -- generation unchanged, zero delta.
+    // Must NOT recompute, and the scroll position must NOT be reset.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == rid) try std.testing.expectApproxEqAbs(y_after_first_scroll, slot.widget.label.rect.y, 0.01);
+    }
+
+    // Frame 4: scroll again by the same moderate amount -- must land at a
+    // further, *cumulative* offset from frame 2, not reset toward the top
+    // first. If Clay_UpdateScrollContainers had been called on frame 3's
+    // skip above, this would land back at -30 from the (wrongly reset) top
+    // instead of -60 from the real starting position.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3);
+    try std.testing.expectEqual(@as(usize, 3), clay_layout.recompute_count);
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == rid) try std.testing.expectApproxEqAbs(row1_base_y - 60, slot.widget.label.rect.y, 0.01);
+    }
 }
 
 test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged frame, real sync happens on a text change" {
@@ -453,8 +669,8 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
     // First sync: nothing cached yet, must create the button's TTF_Text.
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
-    // 8, not 4 -- see the L4 test's identical comment above.
-    var snap: [8]WidgetHost.Slot = undefined;
+    // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
+    var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -532,8 +748,8 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     // -- otherwise there'd be nothing for the bug to actually crash on.
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
-    // 8, not 4 -- see the L4 test's identical comment above.
-    var snap: [8]WidgetHost.Slot = undefined;
+    // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
+    var snap: [16]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -705,7 +921,8 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [8]WidgetHost.Slot = undefined;
+    // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
+    var snap: [16]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var checkbox_id: ?u32 = null;

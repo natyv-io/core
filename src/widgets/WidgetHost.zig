@@ -60,8 +60,12 @@
 //!            "padding":{"left":u16,"right":u16,"top":u16,"bottom":u16},
 //!            "child_gap":u16,
 //!            "direction":"left_to_right"|"top_to_bottom",
-//!            "child_alignment":{"x":"left"|"right"|"center","y":"top"|"bottom"|"center"}}
+//!            "child_alignment":{"x":"left"|"right"|"center","y":"top"|"bottom"|"center"},
+//!            "scroll_vertical":bool,"scroll_horizontal":bool}
 //!   (every layout field is optional -- see ClayLayoutRequest defaults below)
+//!   W2: scroll_vertical/scroll_horizontal clip a container's children to
+//!   its own bounds and let mouse-wheel input scroll them -- only ever
+//!   meaningful on a container with a bounded (non-fit-content) size.
 //!   natyv_set_text/natyv_get_text/natyv_set_checked/natyv_get_checked/
 //!   natyv_set_value/natyv_get_value/natyv_destroy_widget all work unchanged
 //!   on Clay-created widgets too, since they're the same underlying Widget
@@ -175,6 +179,12 @@ pub const ClayStyle = struct {
     child_gap: u16 = 0,
     direction: c.Clay_LayoutDirection = c.CLAY_LEFT_TO_RIGHT,
     child_alignment: c.Clay_ChildAlignment = std.mem.zeroes(c.Clay_ChildAlignment),
+    /// W2: clips overflowing children to this element's bounds and lets
+    /// mouse-wheel input scroll them. Clay owns the actual scroll offset
+    /// internally (keyed by this widget's stable elementId) -- nothing
+    /// extra needs to be stored per-slot beyond these two flags.
+    scroll_vertical: bool = false,
+    scroll_horizontal: bool = false,
 };
 
 pub const Slot = struct {
@@ -685,6 +695,8 @@ const ClayLayoutRequest = struct {
     child_gap: u16 = 0,
     direction: ClayDirectionRequest = .left_to_right,
     child_alignment: ClayAlignmentRequest = .{},
+    scroll_vertical: bool = false,
+    scroll_horizontal: bool = false,
 };
 const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{} };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
@@ -724,6 +736,8 @@ fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
                 .center => c.CLAY_ALIGN_Y_CENTER,
             },
         },
+        .scroll_vertical = req.scroll_vertical,
+        .scroll_horizontal = req.scroll_horizontal,
     };
 }
 

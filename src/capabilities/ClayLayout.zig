@@ -21,6 +21,8 @@ const std = @import("std");
 const Io = std.Io;
 const c = @import("../c.zig").c;
 const WidgetHost = @import("../widgets/WidgetHost.zig");
+const timing = @import("../timing.zig");
+const ScrollBar = @import("../ScrollBar.zig");
 
 const Self = @This();
 
@@ -147,6 +149,27 @@ fn rootElementId() c.Clay_ElementId {
     return elementId(0);
 }
 
+/// Reads Clay's live scroll offset/dimensions for a given widget id, or
+/// `null` if that widget isn't a currently-tracked scroll container (never
+/// declared with scroll_vertical/scroll_horizontal, or not yet opened by a
+/// real layout pass). Safe to call any time after `init` -- reads Clay's
+/// persistent per-context state directly, not tied to being inside a
+/// BeginLayout/EndLayout pass. Returns `ScrollBar.Data` directly (rather
+/// than a second identical struct here) since that's its only consumer.
+pub fn scrollContainerData(widget_id: u32) ?ScrollBar.Data {
+    const data = c.Clay_GetScrollContainerData(elementId(widget_id));
+    if (!data.found) return null;
+    const pos = data.scrollPosition orelse return null;
+    return .{
+        .scroll_offset_x = pos.*.x,
+        .scroll_offset_y = pos.*.y,
+        .container_w = data.scrollContainerDimensions.width,
+        .container_h = data.scrollContainerDimensions.height,
+        .content_w = data.contentDimensions.width,
+        .content_h = data.contentDimensions.height,
+    };
+}
+
 arena_memory: []u8,
 /// The generation `layoutIfNeeded` last actually ran Clay for -- `null`
 /// means "never," so the very first call always computes regardless of
@@ -156,6 +179,9 @@ last_computed_generation: ?u64 = null,
 /// frame -- this is what proves the dirty-flag caching really avoids the
 /// call, not just avoids its visible side effects.
 recompute_count: usize = 0,
+/// W2: milliseconds at the last real recompute (not "last frame" -- see
+/// layoutIfNeeded's deltaTime comment). `null` before the first recompute.
+last_recompute_ms: ?i64 = null,
 
 pub fn init(allocator: std.mem.Allocator, window_w: f32, window_h: f32, default_font: *c.TTF_Font) !Self {
     // Defensive, not just symmetric with `deinit` below: if any previous
@@ -205,6 +231,18 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
         decl.layout.childAlignment = slot.clay_style.child_alignment;
 
         c.Clay__OpenElementWithId(elementId(slot.id));
+        // W2: Clay_GetScrollOffset() only returns the right value for
+        // whichever element is currently open -- must be read strictly
+        // between OpenElementWithId and ConfigureOpenElement, matching the
+        // exact sequencing Clay's own CLAY() macro expands to via C's comma
+        // operator (confirmed against the real macro, vendor/clay/clay.h).
+        if (slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal) {
+            decl.clip = .{
+                .horizontal = slot.clay_style.scroll_horizontal,
+                .vertical = slot.clay_style.scroll_vertical,
+                .childOffset = c.Clay_GetScrollOffset(),
+            };
+        }
         c.Clay__ConfigureOpenElement(decl);
         openChildren(slots, slot.id);
         c.Clay__CloseElement();
@@ -213,11 +251,27 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
 
 /// Runs a real Clay layout pass from the current widget registry state, but
 /// only if something Clay-managed actually changed since the last one
-/// (`WidgetHost.layout_generation` moved) -- otherwise returns immediately
-/// and every widget keeps the `rect` it already has cached from the last
-/// real computation. This is the entire caching story: Clay itself has no
-/// incremental-relayout API (confirmed against the real header), so
-/// avoiding the call is natyv's responsibility, not Clay's.
+/// (`WidgetHost.layout_generation` moved) *or* this frame carries a nonzero
+/// scroll delta -- otherwise returns immediately and every widget keeps the
+/// `rect` it already has cached from the last real computation. This is the
+/// entire caching story: Clay itself has no incremental-relayout API
+/// (confirmed against the real header), so avoiding the call is natyv's
+/// responsibility, not Clay's.
+///
+/// W2: `Clay_UpdateScrollContainers` must be called exactly once per real
+/// `Clay_BeginLayout`/`Clay_EndLayout` cycle, never independently on a
+/// skipped frame -- confirmed against Clay's real implementation
+/// (vendor/clay/clay.h): each tracked scroll container's internal
+/// `openThisFrame` flag is unconditionally flipped false on every call to
+/// `Clay_UpdateScrollContainers`, and only flipped back true when
+/// `openChildren` actually redeclares that element during a real layout
+/// pass. Calling it on a skip frame would mean the *next* such call evicts
+/// the scroll container's tracked position entirely (`RemoveSwapback`),
+/// silently snapping scroll position back to the top a couple frames after
+/// the user stops scrolling. This is why a nonzero scroll delta forces a
+/// real recompute below rather than being applied "for free" on a skip
+/// frame, and why `Clay_SetPointerState`/`Clay_UpdateScrollContainers` only
+/// ever run paired with `Clay_BeginLayout`, immediately before it.
 ///
 /// When a real pass does run: declares one synthetic root element sized to
 /// the window, opens every Clay-managed widget under its real parent
@@ -225,19 +279,37 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
 /// widget's computed `Clay_BoundingBox` back into its registry `rect` via
 /// `WidgetHost.setRect` -- the same field `Button`/`TextField`/`Label`
 /// `.draw()` and every hit-test already read, so this is invisible to the
-/// rest of the render loop.
-pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool) void {
+/// rest of the render loop. A scroll container's children shift position via
+/// this same writeback, since `openChildren` feeds their clip's
+/// `childOffset` from Clay's own internally-tracked scroll position.
+pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32) void {
     const current_generation = widgets.currentGeneration(io);
-    if (self.last_computed_generation) |last| {
-        if (last == current_generation) return;
-    }
+    const content_changed = self.last_computed_generation == null or self.last_computed_generation.? != current_generation;
+    const scrolled = scroll_dx != 0 or scroll_dy != 0;
+    if (!content_changed and !scrolled) return;
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = widgets.snapshot(io, &snap);
     const slots = snap[0..n];
 
+    // deltaTime is seconds since the *last real recompute* (not literal
+    // frame time) -- Clay_UpdateScrollContainers is only ever called
+    // alongside a real recompute (see doc comment above), so "time since
+    // last frame" for its purposes really means "time since this function
+    // last actually ran Clay." Not currently load-bearing for wheel-only
+    // scrolling (enableDragScrolling below is false, so Clay's momentum
+    // decay never activates), but wired correctly now via timing.zig's
+    // already-available nowMs() rather than hardcoded, since it's cheap and
+    // keeps this forward-compatible if drag-scrolling is ever added.
+    const now_ms = timing.nowMs();
+    const delta_time_s: f32 = if (self.last_recompute_ms) |last| @as(f32, @floatFromInt(now_ms - last)) / 1000.0 else 0.0;
+    self.last_recompute_ms = now_ms;
+
     c.Clay_SetLayoutDimensions(.{ .width = window_w, .height = window_h });
     c.Clay_SetPointerState(.{ .x = mouse_x, .y = mouse_y }, mouse_down);
+    // enableDragScrolling=false -- v1 is wheel/trackpad-notch input only, no
+    // touch/mouse-drag scrolling.
+    c.Clay_UpdateScrollContainers(false, .{ .x = scroll_dx, .y = scroll_dy }, delta_time_s);
     c.Clay_BeginLayout();
 
     var root_decl: c.Clay_ElementDeclaration = std.mem.zeroes(c.Clay_ElementDeclaration);

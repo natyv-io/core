@@ -9,6 +9,8 @@ const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
 const DrawBatcher = @import("DrawBatcher.zig");
+const ScrollClip = @import("ScrollClip.zig");
+const ScrollBar = @import("ScrollBar.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -28,6 +30,19 @@ fn updateFocus(widgets: *WidgetHost, io: std.Io, window: *c.SDL_Window, focused_
     } else {
         _ = c.SDL_StopTextInput(window);
     }
+}
+
+/// W2: `SDL_SetRenderClipRect` takes an integer `SDL_Rect`, not the
+/// `SDL_FRect` every widget rect and DrawBatcher entry uses -- floor the
+/// origin and ceil the extent (rather than a bare truncating cast) so a
+/// partially-visible edge pixel is kept rather than clipped away early.
+fn toClipRect(r: c.SDL_FRect) c.SDL_Rect {
+    return .{
+        .x = @intFromFloat(@floor(r.x)),
+        .y = @intFromFloat(@floor(r.y)),
+        .w = @intFromFloat(@ceil(r.w)),
+        .h = @intFromFloat(@ceil(r.h)),
+    };
 }
 
 /// W1: the shared "activate this widget" body for both a mouse click and a
@@ -173,7 +188,23 @@ pub fn main(init: std.process.Init) !void {
 
     var running = true;
     var widget_snapshot: [max_widgets_on_screen]WidgetHost.Slot = undefined;
+    var clip_rects: [max_widgets_on_screen]?c.SDL_FRect = undefined;
     var draw_batcher: DrawBatcher = .{};
+
+    // W2: accumulated per-frame wheel delta, in pixels (already scaled from
+    // SDL's raw wheel "notch" units), consumed by layoutIfNeeded at the top
+    // of the *next* frame then reset -- the poll loop that discovers wheel
+    // events runs after layoutIfNeeded's call site (see the ordering note
+    // below), so this is a deliberate one-frame lag, same idea as
+    // EventQueue's own "drain once per frame" discrete-event handling
+    // elsewhere in this codebase.
+    var pending_scroll_dx: f32 = 0;
+    var pending_scroll_dy: f32 = 0;
+    // Pixels of scroll per SDL wheel "notch" (event.wheel.x/y), before
+    // Clay's own internal *10 multiplier on top of that (see
+    // Clay_UpdateScrollContainers) -- tuned so one notch moves roughly one
+    // bookstore row (~38px), not a token amount.
+    const wheel_pixels_per_notch: f32 = 4.0;
 
     while (running) {
         var mouse_x: f32 = undefined;
@@ -188,8 +219,10 @@ pub fn main(init: std.process.Init) !void {
             var win_w: c_int = undefined;
             var win_h: c_int = undefined;
             _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
-            clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), mouse_x, mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0);
+            clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), mouse_x, mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0, pending_scroll_dx, pending_scroll_dy);
         }
+        pending_scroll_dx = 0;
+        pending_scroll_dy = 0;
 
         // F3: a guest destroying a widget (natyv_destroy_widget, called on
         // the worker thread inside natyv_dispatch) can't destroy its
@@ -254,6 +287,15 @@ pub fn main(init: std.process.Init) !void {
                 c.SDL_EVENT_TEXT_INPUT => {
                     if (focused_widget_id) |id| runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text));
                 },
+                c.SDL_EVENT_MOUSE_WHEEL => {
+                    // Not negated: confirmed against real hardware (Quinn's
+                    // click-through) that Clay's scrollPosition should move
+                    // directly with SDL's raw wheel.x/y sign, not inverted.
+                    // The original negation was based on a scroll-convention
+                    // assumption that turned out backwards in practice.
+                    pending_scroll_dx += event.wheel.x * wheel_pixels_per_notch;
+                    pending_scroll_dy += event.wheel.y * wheel_pixels_per_notch;
+                },
                 c.SDL_EVENT_KEY_DOWN => switch (event.key.key) {
                     c.SDLK_BACKSPACE => if (focused_widget_id) |id| runtime.widgets.backspaceOn(io, id),
                     c.SDLK_TAB => {
@@ -310,21 +352,51 @@ pub fn main(init: std.process.Init) !void {
             _ = c.SDL_SetCursor(if (hovering_any) pointer_cursor else arrow_cursor);
         }
 
+        // W2: computed once per frame -- for each widget, the rect it must
+        // be visually clipped to (the intersection of every scroll-clipping
+        // ancestor's rect up its parent chain), or null if none applies.
+        // Clay already computed correct *positions* for a scroll
+        // container's children via childOffset; this is the separate,
+        // natyv-owned step of actually cropping their rendering, since Clay
+        // has no opinion on how (or whether) natyv draws anything.
+        ScrollClip.computeClipRects(widget_snapshot[0..widget_count], clip_rects[0..widget_count]);
+
         _ = c.SDL_SetRenderDrawColor(renderer, 24, 24, 28, 255);
         _ = c.SDL_RenderClear(renderer);
 
-        // L4.5: one SDL_RenderFillRects call per distinct fill color across
-        // every widget, instead of each widget filling its own rect one at
-        // a time -- see DrawBatcher.zig. `draw_batcher` is declared outside
-        // the frame loop and reused every frame purely to avoid re-zeroing
-        // its scratch arrays each time; `flush` below resets it for the
-        // next frame regardless.
-        for (widget_snapshot[0..widget_count]) |slot| {
-            if (slot.widget.fillRect()) |fr| draw_batcher.add(fr.color, fr.rect);
+        // L4.5/W2: one SDL_RenderFillRects call per distinct fill color
+        // across every *unclipped* widget -- see DrawBatcher.zig.
+        // `draw_batcher` is declared outside the frame loop and reused
+        // every frame purely to avoid re-zeroing its scratch arrays each
+        // time; `flush` below resets it for the next frame regardless. A
+        // widget with a non-null clip rect bypasses the batcher entirely
+        // and is filled individually inside its own
+        // SDL_SetRenderClipRect/null bracket -- DrawBatcher only ever
+        // issues one draw color per call, so it can't represent "these N
+        // rects share a color but need M different active clip rects."
+        // Deliberately not extending the batcher for this: scroll-clipped
+        // widgets are a minority of on-screen widgets in any real app (see
+        // DrawBatcher.zig's own "tens, not thousands" framing), so a
+        // less-batched path for just those is a reasonable trade over a
+        // more complex (color, clip_rect) bucket key.
+        for (widget_snapshot[0..widget_count], clip_rects[0..widget_count]) |slot, clip| {
+            if (slot.widget.fillRect()) |fr| {
+                if (clip) |cr| {
+                    const sdl_clip = toClipRect(cr);
+                    _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
+                    _ = c.SDL_SetRenderDrawColor(renderer, fr.color.r, fr.color.g, fr.color.b, fr.color.a);
+                    _ = c.SDL_RenderFillRect(renderer, &fr.rect);
+                    _ = c.SDL_SetRenderClipRect(renderer, null);
+                } else {
+                    draw_batcher.add(fr.color, fr.rect);
+                }
+            }
         }
         draw_batcher.flush(renderer);
 
-        for (widget_snapshot[0..widget_count]) |slot| {
+        for (widget_snapshot[0..widget_count], clip_rects[0..widget_count]) |slot, clip| {
+            const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
+            if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
             switch (slot.widget) {
                 .button => |b| b.drawDecorations(renderer),
                 .textfield => |t| t.drawDecorations(renderer),
@@ -335,6 +407,34 @@ pub fn main(init: std.process.Init) !void {
                 // L2: containers are layout-only, nothing to draw -- see
                 // Container.zig's doc comment.
                 .container => {},
+            }
+            if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
+        }
+
+        // W2: scrollbar thumbs -- display-only position indicators (not
+        // draggable, see ScrollBar.zig's doc comment) drawn last, on top of
+        // everything else, one per scroll axis a Clay-managed container
+        // declared. Drawn unclipped -- ScrollBar.zig insets the thumb inside
+        // its own container's rect already, so it never needs cropping
+        // against an ancestor's clip rect the way scrolled *content* does.
+        if (maybe_clay_layout != null) {
+            for (widget_snapshot[0..widget_count]) |slot| {
+                if (!slot.clay_managed or slot.widget != .container) continue;
+                if (!(slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal)) continue;
+                const data = ClayLayout.scrollContainerData(slot.id) orelse continue;
+                const container_rect = slot.widget.container.rect;
+
+                _ = c.SDL_SetRenderDrawColor(renderer, 150, 150, 160, 190);
+                if (slot.clay_style.scroll_vertical) {
+                    if (ScrollBar.verticalThumb(container_rect, data)) |thumb| {
+                        _ = c.SDL_RenderFillRect(renderer, &thumb);
+                    }
+                }
+                if (slot.clay_style.scroll_horizontal) {
+                    if (ScrollBar.horizontalThumb(container_rect, data)) |thumb| {
+                        _ = c.SDL_RenderFillRect(renderer, &thumb);
+                    }
+                }
             }
         }
 
