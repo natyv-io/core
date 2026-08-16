@@ -22,4 +22,11 @@ pub const c = @cImport({
     // hatch (matched by the same define in clay_impl.c's actual compile).
     @cDefine("CLAY_DISABLE_SIMD", "1");
     @cInclude("clay.h");
+    // SDL_ttf's public header only exposes opaque types (TTF_Font*,
+    // TTF_Text*, TTF_TextEngine*, ...) -- FreeType's own headers never need
+    // @cImport-ing at all, since FreeType is consumed entirely inside the
+    // vendored SDL_ttf.c/FreeType .c sources (compiled as real C via
+    // addCSourceFiles in build.zig), never crossing into this Zig-visible
+    // header. See vendor/sdl_ttf/ and vendor/freetype/.
+    @cInclude("SDL3_ttf/SDL_ttf.h");
 });

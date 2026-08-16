@@ -28,13 +28,25 @@ fn onClayError(errorData: c.Clay_ErrorData) callconv(.c) void {
     std.debug.print("[clay] error: {s}\n", .{errorData.errorText.chars[0..@intCast(errorData.errorText.length)]});
 }
 
+// F3: real font-driven measurement, replacing the old 8x8-per-character
+// bitmap-font heuristic -- `userData` is the default `*c.TTF_Font`, passed
+// through by `Clay_SetMeasureTextFunction` (see `init`/
+// `proveTwoGrowChildrenSplitEvenly`). Not yet exercised by any real Clay
+// layout pass today: natyv's widgets are declared as plain sized elements
+// (`openChildren` below), never as Clay TEXT children via
+// `Clay__OpenTextElement` -- so Clay never actually calls this function
+// yet, and a FIT-sized leaf widget still collapses to its min (0) exactly
+// as `sdk/go/ui/clay`'s `Fit()` doc comment already says. Fixed now anyway
+// so it's correct the moment something does declare Clay text content,
+// rather than leaving a heuristic that would silently need revisiting
+// again later.
 fn measureText(text: c.Clay_StringSlice, config: [*c]c.Clay_TextElementConfig, userData: ?*anyopaque) callconv(.c) c.Clay_Dimensions {
     _ = config;
-    _ = userData;
-    // 8x8px per character -- matches SDL_RenderDebugText's fixed bitmap
-    // font, the only text rendering natyv has today. Revisit once real
-    // font rendering exists.
-    return .{ .width = @floatFromInt(text.length * 8), .height = 8 };
+    const font: *c.TTF_Font = @ptrCast(userData orelse return .{ .width = 0, .height = 0 });
+    var w: c_int = 0;
+    var h: c_int = 0;
+    _ = c.TTF_GetStringSize(font, text.chars, @intCast(text.length), &w, &h);
+    return .{ .width = @floatFromInt(w), .height = @floatFromInt(h) };
 }
 
 fn hashId(comptime label: []const u8) c.Clay_ElementId {
@@ -145,7 +157,7 @@ last_computed_generation: ?u64 = null,
 /// call, not just avoids its visible side effects.
 recompute_count: usize = 0,
 
-pub fn init(allocator: std.mem.Allocator, window_w: f32, window_h: f32) !Self {
+pub fn init(allocator: std.mem.Allocator, window_w: f32, window_h: f32, default_font: *c.TTF_Font) !Self {
     // Defensive, not just symmetric with `deinit` below: if any previous
     // Clay lifecycle in this process (another ClayLayout instance, or
     // ClayLayout.zig's own L1 proof function) left Clay's global "current
@@ -164,7 +176,7 @@ pub fn init(allocator: std.mem.Allocator, window_w: f32, window_h: f32) !Self {
         .errorHandlerFunction = onClayError,
         .userData = null,
     });
-    c.Clay_SetMeasureTextFunction(measureText, null);
+    c.Clay_SetMeasureTextFunction(measureText, default_font);
     return .{ .arena_memory = memory };
 }
 

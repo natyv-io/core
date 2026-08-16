@@ -142,6 +142,19 @@ layout_generation: u64 = 0,
 /// unset after. Only ever read from inside a host function callback, which
 /// by construction only ever runs nested inside that same call.
 current_io: ?Io = null,
+/// F3: `TTF_DestroyText` (like `TTF_CreateText`) must run on the thread
+/// that created the text -- but `natyv_destroy_widget` is a host function,
+/// called from inside `natyv_dispatch` on the *worker* thread (see
+/// Dispatch.zig's file doc comment for why guest calls live there at all).
+/// A guest destroying a widget (e.g. bookstore's refreshBookList) can't
+/// destroy its `TTF_Text` right then and there -- `destroyWidgetHostFn`
+/// queues the pointer here instead, and `flushPendingTextDestroys` (called
+/// once per frame from `main.zig`, main thread) does the real
+/// `TTF_DestroyText` call. Sized for the worst case between two frames:
+/// every widget destroyed at once, times 2 (a TextField queues both its
+/// entered-text and placeholder objects).
+pending_text_destroys: [max_widgets * 2]?*c.TTF_Text = [_]?*c.TTF_Text{null} ** (max_widgets * 2),
+pending_text_destroy_count: usize = 0,
 
 pub const EnabledKinds = struct {
     button: bool = true,
@@ -277,6 +290,95 @@ fn findLocked(self: *Self, id: u32) ?*Slot {
         }
     }
     return null;
+}
+
+/// F3: creates/updates every button/textfield/label's cached `TTF_Text`
+/// against the *live* registry, once per frame, before that frame's
+/// `snapshot` below is taken -- same "mutate the registry, then snapshot
+/// sees the fresh result" ordering `ClayLayout.layoutIfNeeded` already
+/// established for computed geometry (see main.zig's frame loop). Each
+/// widget's own `syncText` decides whether it actually needs to touch
+/// SDL_ttf at all this frame (see e.g. `Button.syncText`'s doc comment).
+pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font: *c.TTF_Font) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    for (&self.slots) |*slot| {
+        if (slot.*) |*s| {
+            switch (s.widget) {
+                .button => |*b| b.syncText(engine, font),
+                .textfield => |*t| t.syncText(engine, font),
+                .label => |*l| l.syncText(engine, font),
+                .container => {},
+            }
+        }
+    }
+}
+
+/// SDL_ttf requires every `TTF_Text` be destroyed before its owning
+/// `TTF_TextEngine` is -- called once at app shutdown (main.zig), for
+/// every widget still in the registry regardless of whether the guest ever
+/// explicitly destroyed it, since closing the window is not the same as
+/// the guest calling natyv_destroy_widget on everything first.
+pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    for (&self.slots) |*slot| {
+        if (slot.*) |*s| {
+            switch (s.widget) {
+                .button => |*b| b.destroyText(),
+                .textfield => |*t| t.destroyText(),
+                .label => |*l| l.destroyText(),
+                .container => {},
+            }
+        }
+    }
+}
+
+/// Appends `obj_ptr`'s pointee to the pending-destroy queue (see the field
+/// doc comment) and nulls it out on the widget -- called from
+/// `destroyWidgetHostFn` (worker thread) instead of calling `TTF_DestroyText`
+/// directly there, since that call is only valid on the thread that created
+/// the text. Silently drops the pointer if the queue is already at its
+/// (generous, whole-registry-sized) capacity rather than overflow -- a tiny,
+/// practically-unreachable leak is preferable to a panic in a guest-facing
+/// host function.
+fn queuePendingTextDestroy(self: *Self, obj_ptr: *?*c.TTF_Text) void {
+    if (obj_ptr.*) |obj| {
+        if (self.pending_text_destroy_count < self.pending_text_destroys.len) {
+            self.pending_text_destroys[self.pending_text_destroy_count] = obj;
+            self.pending_text_destroy_count += 1;
+        }
+        obj_ptr.* = null;
+    }
+}
+
+/// Must be called with `mutex` already held -- queues every `TTF_Text`
+/// pointer this widget owns for later destruction on the main thread. See
+/// `destroyWidgetHostFn`, the only caller.
+fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
+    switch (widget.*) {
+        .button => |*b| self.queuePendingTextDestroy(&b.text_obj),
+        .textfield => |*t| {
+            self.queuePendingTextDestroy(&t.text_obj);
+            self.queuePendingTextDestroy(&t.placeholder_obj);
+        },
+        .label => |*l| self.queuePendingTextDestroy(&l.text_obj),
+        .container => {},
+    }
+}
+
+/// Drains the pending-destroy queue -- called once per frame from
+/// `main.zig`, on the main thread (the only thread `TTF_DestroyText` is
+/// valid to call on for these objects). See the field's doc comment for why
+/// this queue exists at all instead of destroying inline in
+/// `destroyWidgetHostFn`.
+pub fn flushPendingTextDestroys(self: *Self, call_io: Io) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    for (self.pending_text_destroys[0..self.pending_text_destroy_count]) |maybe_obj| {
+        if (maybe_obj) |obj| c.TTF_DestroyText(obj);
+    }
+    self.pending_text_destroy_count = 0;
 }
 
 /// Copies the live widget set into `out` (id + widget snapshot) for the
@@ -652,8 +754,19 @@ fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Exti
     self.mutex.lockUncancelable(self.io());
     defer self.mutex.unlock(self.io());
     for (&self.slots) |*slot| {
-        if (slot.*) |s| {
+        if (slot.*) |*s| {
             if (s.id == req.widget_id) {
+                // F3: this host function runs on the worker thread (nested
+                // inside natyv_dispatch -- see Dispatch.zig's doc comment),
+                // but TTF_DestroyText is only valid on the thread that
+                // created the text (the main thread, which owns the text
+                // engine). Queue the pointer for main.zig to actually
+                // destroy next frame instead of calling it here -- see
+                // `pending_text_destroys`'s doc comment for the full story,
+                // and `destroyAllTextObjects` for the shutdown-time
+                // counterpart (safe to call directly there since it's
+                // already running on the main thread).
+                self.queueWidgetTextDestroysLocked(&s.widget);
                 if (s.clay_managed) self.layout_generation +%= 1;
                 slot.* = null;
                 host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");

@@ -5,6 +5,7 @@ const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const ClayLayout = @import("capabilities/ClayLayout.zig");
+const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
 const DrawBatcher = @import("DrawBatcher.zig");
@@ -43,6 +44,13 @@ pub fn main(init: std.process.Init) !void {
         return error.SdlInitFailed;
     }
     defer c.SDL_Quit();
+
+    // F2: the bundled default font (Inter) -- unconditional, not gated by
+    // conf.natyv.json, since every app gets it regardless (see the
+    // font-rendering plan). Not consumed yet -- that's F3, which swaps
+    // every SDL_RenderDebugText call site over to real glyph rendering.
+    var default_font = try Font.init();
+    defer default_font.deinit();
 
     var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var db_path: ?[:0]const u8 = null;
@@ -97,10 +105,23 @@ pub fn main(init: std.process.Init) !void {
     };
     defer c.SDL_DestroyRenderer(renderer);
 
+    // F3: one renderer-backed text engine for the app's lifetime -- every
+    // widget's cached TTF_Text is created against this. SDL_ttf requires
+    // every TTF_Text be destroyed before the engine that made it, so
+    // `destroyAllTextObjects`'s defer is declared *after* this one --
+    // Zig's LIFO defer order means it runs first at shutdown, same
+    // ordering fix Clay's global-context clearing needed in L4.
+    const text_engine = c.TTF_CreateRendererTextEngine(renderer) orelse {
+        std.debug.print("TTF_CreateRendererTextEngine failed: {s}\n", .{c.SDL_GetError()});
+        return error.TextEngineFailed;
+    };
+    defer c.TTF_DestroyRendererTextEngine(text_engine);
+    defer runtime.widgets.destroyAllTextObjects(io);
+
     // L4: `null` when ui.backend isn't "clay" -- no arena allocated, no
     // per-frame Clay calls at all, same "capability you didn't declare
     // costs you nothing" story as sqlite/network above.
-    var maybe_clay_layout: ?ClayLayout = if (clay_enabled) try ClayLayout.init(allocator, 900, 700) else null;
+    var maybe_clay_layout: ?ClayLayout = if (clay_enabled) try ClayLayout.init(allocator, 900, 700, default_font.font) else null;
     defer if (maybe_clay_layout) |*cl| cl.deinit(allocator);
 
     const arrow_cursor = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT);
@@ -132,6 +153,22 @@ pub fn main(init: std.process.Init) !void {
             _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
             clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), mouse_x, mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0);
         }
+
+        // F3: a guest destroying a widget (natyv_destroy_widget, called on
+        // the worker thread inside natyv_dispatch) can't destroy its
+        // TTF_Text right then -- that's only valid on the thread that
+        // created it. It queues the pointer instead; this is the main
+        // thread actually freeing it, once per frame. Must run before
+        // syncTextObjects below in case a widget was destroyed and a new
+        // one with the same generation-counter state gets created in its
+        // place within the same guest call.
+        runtime.widgets.flushPendingTextDestroys(io);
+
+        // F3: same "mutate the live registry, then snapshot sees the fresh
+        // result" ordering as layoutIfNeeded above -- must run before
+        // snapshot so a widget created or re-labeled this frame already has
+        // a real (or updated) TTF_Text by the time drawDecorations reads it.
+        runtime.widgets.syncTextObjects(io, text_engine, default_font.font);
 
         const widget_count = runtime.widgets.snapshot(io, &widget_snapshot);
 

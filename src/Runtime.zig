@@ -25,6 +25,10 @@ const ClayLayout = @import("capabilities/ClayLayout.zig");
 // ever reached transitively through WidgetHost.zig, and this file's own
 // test below is what actually exercises it (see that test's doc comment).
 const Container = @import("widgets/Container.zig");
+// F1: same reachability story as ClayLayout above.
+const Font = @import("capabilities/Font.zig");
+const EventQueue = @import("EventQueue.zig");
+const Dispatch = @import("Dispatch.zig");
 
 const Self = @This();
 
@@ -237,6 +241,20 @@ test "Clay toolchain: two GROW children split a fixed-size parent's width evenly
     try std.testing.expectApproxEqAbs(@as(f32, 150), result.child_b.x, 1.0);
 }
 
+test "F1: FreeType + SDL_ttf toolchain loads the real embedded Inter font and measures real glyphs" {
+    const size = try Font.proveFontRenderingToolchain();
+    try std.testing.expect(size.w > 0);
+    try std.testing.expect(size.h > 0);
+}
+
+test "F2: the persistent default-font capability loads Inter and reports real font metrics" {
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    const height = c.TTF_GetFontHeight(font_cap.font);
+    try std.testing.expect(height > 0);
+}
+
 test "L2: parent_id and Clay style survive a widget-registry snapshot round trip" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -346,7 +364,10 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var clay_layout = try ClayLayout.init(allocator, 300, 100);
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    var clay_layout = try ClayLayout.init(allocator, 300, 100, font_cap.font);
     defer clay_layout.deinit(allocator);
 
     // First frame: nothing computed yet, so this must run Clay for real.
@@ -388,4 +409,170 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
 
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+}
+
+test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged frame, real sync happens on a text change" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SdlInitFailed;
+    defer c.SDL_Quit();
+    const window = c.SDL_CreateWindow("f3-test", 64, 64, c.SDL_WINDOW_HIDDEN) orelse return error.SdlWindowFailed;
+    defer c.SDL_DestroyWindow(window);
+    const renderer = c.SDL_CreateRenderer(window, null) orelse return error.SdlRendererFailed;
+    defer c.SDL_DestroyRenderer(renderer);
+    const engine = c.TTF_CreateRendererTextEngine(renderer) orelse return error.TextEngineFailed;
+    defer c.TTF_DestroyRendererTextEngine(engine);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+    defer runtime.widgets.destroyAllTextObjects(io);
+
+    // First sync: nothing cached yet, must create the button's TTF_Text.
+    runtime.widgets.syncTextObjects(io, engine, font_cap.font);
+
+    var snap: [4]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var button_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button) {
+            button_id = slot.id;
+            try std.testing.expectEqual(@as(u32, 1), slot.widget.button.sync_count);
+        }
+    }
+    const bid = button_id orelse return error.MissingButton;
+
+    // Second sync: label unchanged -- must skip TTF_SetTextString entirely,
+    // not just produce the same string again.
+    runtime.widgets.syncTextObjects(io, engine, font_cap.font);
+    _ = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == bid) try std.testing.expectEqual(@as(u32, 1), slot.widget.button.sync_count);
+    }
+
+    // Relabel via the guest's real natyv_dispatch -> natyv_set_text path
+    // (same mechanism the L4 test above uses) -- must force a real re-sync
+    // on the next call.
+    var payload_buf: [64]u8 = undefined;
+    const payload = try std.fmt.bufPrint(&payload_buf, "{{\"widget_id\":{d},\"event_type\":\"Grown\"}}", .{bid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+
+    runtime.widgets.syncTextObjects(io, engine, font_cap.font);
+    _ = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == bid) try std.testing.expectEqual(@as(u32, 2), slot.widget.button.sync_count);
+    }
+}
+
+// F3 regression: Quinn hit a real crash clicking bookstore's "Add Book"
+// button -- refreshBookList destroys every old row's widgets and creates
+// new ones, and destroying a widget with a live TTF_Text called
+// TTF_DestroyText directly from inside destroyWidgetHostFn, a host function
+// that (per Dispatch.zig's own doc comment) runs on the worker thread, not
+// the main thread that owns the text engine SDL_ttf requires TTF_Text be
+// destroyed on. Fixed by queuing the pointer (`pending_text_destroys`) for
+// the main thread to actually destroy instead. This test reproduces the
+// real trigger as faithfully as a headless test can: a genuine second OS
+// thread (`Dispatch.run`, the exact function `main.zig` spawns) processing
+// a real `.click` event off a real `EventQueue` -- not a synchronous
+// same-thread `runtime.call` the way the L4/F3 tests above use, which
+// wouldn't violate SDL_ttf's thread-affinity rule even with the bug
+// present, since everything would happen on the one test thread regardless.
+test "F3 regression: destroying a widget's TTF_Text from the real worker thread doesn't crash" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SdlInitFailed;
+    defer c.SDL_Quit();
+    const window = c.SDL_CreateWindow("f3-regression-test", 64, 64, c.SDL_WINDOW_HIDDEN) orelse return error.SdlWindowFailed;
+    defer c.SDL_DestroyWindow(window);
+    const renderer = c.SDL_CreateRenderer(window, null) orelse return error.SdlRendererFailed;
+    defer c.SDL_DestroyRenderer(renderer);
+    const engine = c.TTF_CreateRendererTextEngine(renderer) orelse return error.TextEngineFailed;
+    defer c.TTF_DestroyRendererTextEngine(engine);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+    defer runtime.widgets.destroyAllTextObjects(io);
+
+    // Give the initial button a real TTF_Text before triggering the click
+    // -- otherwise there'd be nothing for the bug to actually crash on.
+    runtime.widgets.syncTextObjects(io, engine, font_cap.font);
+
+    var snap: [4]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    var button_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button) button_id = slot.id;
+    }
+    const bid = button_id orelse return error.MissingButton;
+
+    var queue = EventQueue.init(allocator);
+    defer queue.deinit();
+
+    // Real second OS thread, same call main.zig itself makes -- the guest's
+    // natyv_dispatch (and the natyv_destroy_widget it calls on a click, see
+    // clay-fixture's guest/main.go) genuinely runs off this thread, not the
+    // test's own, exactly like the real crash Quinn hit.
+    const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue });
+
+    queue.push(io, bid, .click, "");
+
+    // Simulates main.zig's frame loop -- the only thread allowed to
+    // actually call TTF_DestroyText/TTF_CreateText for these objects.
+    // Polls for the real guest-driven state change (old button destroyed,
+    // new one created and labeled) instead of a fixed sleep.
+    var relabeled = false;
+    var i: u32 = 0;
+    while (i < 500 and !relabeled) : (i += 1) {
+        runtime.widgets.flushPendingTextDestroys(io);
+        runtime.widgets.syncTextObjects(io, engine, font_cap.font);
+        n = runtime.widgets.snapshot(io, &snap);
+        // Real main.zig draws every frame too -- matching that here, not
+        // just polling registry state, since the actual crash may need a
+        // concurrent TTF_DrawRendererText touching the same text engine's
+        // shared atlas state while the worker thread destroys a text object,
+        // not just the destroy call in isolation.
+        for (snap[0..n]) |slot| {
+            if (slot.widget == .button) slot.widget.button.drawDecorations(renderer);
+            if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Recreated Button")) {
+                relabeled = true;
+            }
+        }
+        if (!relabeled) try io.sleep(.fromMilliseconds(2), .awake);
+    }
+
+    queue.requestShutdown(io);
+    worker.join();
+
+    // The real proof this test exists for is that it got this far at all
+    // without crashing -- these assertions confirm the guest-visible state
+    // ended up correct too, not just that nothing crashed.
+    try std.testing.expect(relabeled);
+    n = runtime.widgets.snapshot(io, &snap);
+    var button_count: u32 = 0;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button) button_count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), button_count);
 }
