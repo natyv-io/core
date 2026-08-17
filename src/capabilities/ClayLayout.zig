@@ -272,6 +272,20 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
                 .attachPoints = .{ .parent = c.CLAY_ATTACH_POINT_CENTER_CENTER, .element = c.CLAY_ATTACH_POINT_CENTER_CENTER },
                 .zIndex = 2,
             };
+        } else if (slot.clay_style.toast) {
+            // W7: same CLAY_ATTACH_TO_ROOT shape modal uses, anchored to a
+            // fixed screen corner (bottom-right) instead of centered --
+            // set once on a guest's persistent toast-stack container;
+            // individual toasts are plain, non-floating children of it, so
+            // they stack via the stack's own ordinary flex layout rather
+            // than each needing their own floating config. zIndex 1, same
+            // tier as plain `floating` -- a toast doesn't need modal's
+            // "always above everything" guarantee.
+            decl.floating = .{
+                .attachTo = c.CLAY_ATTACH_TO_ROOT,
+                .attachPoints = .{ .parent = c.CLAY_ATTACH_POINT_RIGHT_BOTTOM, .element = c.CLAY_ATTACH_POINT_RIGHT_BOTTOM },
+                .zIndex = 1,
+            };
         } else if (slot.clay_style.floating) {
             decl.floating = .{
                 .attachTo = c.CLAY_ATTACH_TO_PARENT,

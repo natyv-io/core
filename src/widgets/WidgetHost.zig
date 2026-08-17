@@ -100,6 +100,7 @@ const std = @import("std");
 const Io = std.Io;
 const c = @import("../c.zig").c;
 const host_fn_util = @import("../host_fn_util.zig");
+const timing = @import("../timing.zig");
 const json_util = @import("../json_util.zig");
 const Button = @import("Button.zig");
 const TextField = @import("TextField.zig");
@@ -247,6 +248,16 @@ pub const ClayStyle = struct {
     /// (blocks, never pushes `.dismiss`) and its Escape-key handling
     /// (always pushes `.dismiss`, unconditionally).
     modal: bool = false,
+    /// W7: implies floating-style positioning on its own (guest sets this
+    /// alone, not `floating`/`modal` too), anchored to a fixed screen
+    /// corner (`CLAY_ATTACH_TO_ROOT`, bottom-right) rather than below a
+    /// parent (`floating`) or centered (`modal`) -- see ClayLayout.zig's
+    /// openChildren. Set once, on a guest's single persistent toast-stack
+    /// container; individual toasts are plain (non-floating) children of
+    /// it, stacking via ordinary flex layout. Orthogonal to
+    /// `ClayContainerRequest.duration_ms` below (the actual expiry timer)
+    /// -- a toast's content Container carries `duration_ms`, not `toast`.
+    toast: bool = false,
 };
 
 pub const Slot = struct {
@@ -263,6 +274,14 @@ pub const Slot = struct {
     /// changing has no effect on Clay's tree, so it shouldn't force a
     /// recompute).
     clay_managed: bool = false,
+    /// W7: when set, `main.zig`'s per-frame `destroyExpiredWidgets` call
+    /// destroys this widget (and every descendant -- see that function's
+    /// doc comment for why cascading is required here specifically) once
+    /// `timing.nowMs() >= expires_at_ms`. `null` (the default) means "never
+    /// expires," same as every widget before this existed. Bookkeeping,
+    /// not a layout property -- lives here, not on `ClayStyle`, same
+    /// reasoning `clay_managed` already gets.
+    expires_at_ms: ?i64 = null,
 };
 
 allocator: std.mem.Allocator,
@@ -430,12 +449,18 @@ const InsertClayError = error{ NoSuchParent, RegistryFull };
 /// by the `natyv_clay_*` host functions below, which need to report a
 /// meaningful error back to the guest rather than just failing later when
 /// L4's layout pass can't find the parent.
-fn insertLockedWithLayoutValidated(self: *Self, widget: Widget, parent_id: ?u32, clay_style: ClayStyle) InsertClayError!u32 {
+fn insertLockedWithLayoutValidated(self: *Self, widget: Widget, parent_id: ?u32, clay_style: ClayStyle, expires_at_ms: ?i64) InsertClayError!u32 {
     if (parent_id) |pid| {
         if (self.findLocked(pid) == null) return error.NoSuchParent;
     }
     const id = self.insertLockedWithLayout(widget, parent_id, clay_style) orelse return error.RegistryFull;
-    if (self.findLocked(id)) |slot| slot.clay_managed = true;
+    if (self.findLocked(id)) |slot| {
+        slot.clay_managed = true;
+        // W7: only Container creation ever passes a non-null value here
+        // (see insertClayWidget's callers) -- set while still holding the
+        // lock this function's caller already took, no second lock cycle.
+        slot.expires_at_ms = expires_at_ms;
+    }
     self.layout_generation +%= 1;
     return id;
 }
@@ -511,6 +536,99 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
             }
         }
     }
+}
+
+/// W7: called once per frame from `main.zig`, main thread -- destroys
+/// `TTF_Text` immediately, no queueing needed (unlike `natyv_destroy_widget`,
+/// which runs on the worker thread and can't touch the text engine
+/// directly), same reasoning `destroyAllTextObjects` above already
+/// established for shutdown.
+///
+/// Unlike every other destroy path in this project (always guest-initiated,
+/// with an explicit-per-child-only contract every prior floating widget
+/// relies on -- e.g. `closeDropdown`'s 3-widget destroy loop), this
+/// cascades to every descendant of an expired widget. There is no guest
+/// callback to clean children up here -- if only the expired root's own
+/// slot were nulled, its content would be orphaned (still registered,
+/// parented to an id that no longer exists, nothing left to ever destroy
+/// it). This is a deliberate, narrowly-scoped exception confined to this
+/// one host-driven path; `natyv_destroy_widget`'s own no-cascade contract
+/// is completely unchanged.
+pub fn destroyExpiredWidgets(self: *Self, call_io: Io, now_ms: i64) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+
+    var expired_roots: [max_widgets]u32 = undefined;
+    var expired_count: usize = 0;
+    for (self.slots) |maybe_slot| {
+        if (maybe_slot) |s| {
+            if (s.expires_at_ms) |exp| {
+                if (now_ms >= exp) {
+                    expired_roots[expired_count] = s.id;
+                    expired_count += 1;
+                }
+            }
+        }
+    }
+    for (expired_roots[0..expired_count]) |root_id| self.destroySubtreeLocked(root_id);
+}
+
+/// Destroys `root_id` and every descendant reachable via `parent_id`.
+/// Two-phase deliberately -- collects the full set to destroy first
+/// (against still-fully-intact slot data), then destroys everything in a
+/// second pass. Doing it in one pass would risk nulling an ancestor's slot
+/// before a not-yet-visited descendant's own parent_id chain-walk reaches
+/// it, which would sever that walk early (`findLocked` on an
+/// already-nulled ancestor returns nothing) and wrongly leave a real
+/// descendant behind.
+fn destroySubtreeLocked(self: *Self, root_id: u32) void {
+    var to_destroy: [max_widgets]u32 = undefined;
+    var count: usize = 0;
+    for (self.slots) |maybe_slot| {
+        if (maybe_slot) |s| {
+            if (s.id != root_id and self.isDescendantLocked(s.id, root_id)) {
+                to_destroy[count] = s.id;
+                count += 1;
+            }
+        }
+    }
+    to_destroy[count] = root_id;
+    count += 1;
+
+    for (&self.slots) |*slot| {
+        if (slot.*) |*s| {
+            for (to_destroy[0..count]) |id| {
+                if (s.id == id) {
+                    switch (s.widget) {
+                        .button => |*b| b.destroyText(),
+                        .textfield => |*t| t.destroyText(),
+                        .label => |*l| l.destroyText(),
+                        .checkbox => |*cb| cb.destroyText(),
+                        .radio_button => |*r| r.destroyText(),
+                        .container, .progress_bar, .slider => {},
+                    }
+                    if (s.clay_managed) self.layout_generation +%= 1;
+                    slot.* = null;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// True when `id` is a strict descendant of `root_id` (walks `parent_id`
+/// up the chain) -- `id == root_id` itself is checked separately by every
+/// caller. Same shape `FloatingOrder.isDescendantOfOrSelf` uses over a
+/// snapshot slice; a small local equivalent over the live registry lives
+/// here instead of reusing that one, since `FloatingOrder.zig` already
+/// imports this file and the reverse import would be circular.
+fn isDescendantLocked(self: *Self, id: u32, root_id: u32) bool {
+    var current = (self.findLocked(id) orelse return false).parent_id;
+    while (current) |pid| {
+        if (pid == root_id) return true;
+        current = (self.findLocked(pid) orelse break).parent_id;
+    }
+    return false;
 }
 
 /// Appends `obj_ptr`'s pointee to the pending-destroy queue (see the field
@@ -810,8 +928,9 @@ const ClayLayoutRequest = struct {
     scroll_horizontal: bool = false,
     floating: bool = false,
     modal: bool = false,
+    toast: bool = false,
 };
-const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{}, background: bool = false };
+const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{}, background: bool = false, duration_ms: u32 = 0 };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
 const ClayTextFieldRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
 const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const u8 = "" };
@@ -854,6 +973,7 @@ fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
         .scroll_horizontal = req.scroll_horizontal,
         .floating = req.floating,
         .modal = req.modal,
+        .toast = req.toast,
     };
 }
 
@@ -864,11 +984,11 @@ fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
 /// real geometry is computed output starting in L4, not creation input, so
 /// there's nothing meaningful to draw until the first real Clay layout pass
 /// runs.
-fn insertClayWidget(self: *Self, plugin: ?*c.ExtismCurrentPlugin, out_val: *allowzero c.ExtismVal, widget: Widget, layout: ClayLayoutRequest) void {
+fn insertClayWidget(self: *Self, plugin: ?*c.ExtismCurrentPlugin, out_val: *allowzero c.ExtismVal, widget: Widget, layout: ClayLayoutRequest, expires_at_ms: ?i64) void {
     const style = toClayStyle(layout);
     const call_io = self.io();
     self.mutex.lockUncancelable(call_io);
-    const result = self.insertLockedWithLayoutValidated(widget, layout.parent_id, style);
+    const result = self.insertLockedWithLayoutValidated(widget, layout.parent_id, style, expires_at_ms);
     self.mutex.unlock(call_io);
 
     const widget_id = result catch |err| {
@@ -1081,7 +1201,11 @@ fn createClayContainerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const 
     const parsed = parseRequest(ClayContainerRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
     defer parsed.deinit();
     const container = Container.init(std.mem.zeroes(c.SDL_FRect), parsed.value.background);
-    insertClayWidget(self, plugin, &outputs[0], .{ .container = container }, parsed.value.layout);
+    // W7: 0 (the default) means "never expires" -- only Container's own
+    // creation ever computes a non-null value here, see
+    // insertLockedWithLayoutValidated's doc comment.
+    const expires_at_ms: ?i64 = if (parsed.value.duration_ms > 0) timing.nowMs() + @as(i64, parsed.value.duration_ms) else null;
+    insertClayWidget(self, plugin, &outputs[0], .{ .container = container }, parsed.value.layout, expires_at_ms);
 }
 
 fn createClayButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -1091,7 +1215,7 @@ fn createClayButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.E
     const parsed = parseRequest(ClayButtonRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
     defer parsed.deinit();
     const button = Button.init(std.mem.zeroes(c.SDL_FRect), parsed.value.label);
-    insertClayWidget(self, plugin, &outputs[0], .{ .button = button }, parsed.value.layout);
+    insertClayWidget(self, plugin, &outputs[0], .{ .button = button }, parsed.value.layout, null);
 }
 
 fn createClayTextFieldHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -1101,7 +1225,7 @@ fn createClayTextFieldHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const 
     const parsed = parseRequest(ClayTextFieldRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
     defer parsed.deinit();
     const field = TextField.init(std.mem.zeroes(c.SDL_FRect), parsed.value.placeholder);
-    insertClayWidget(self, plugin, &outputs[0], .{ .textfield = field }, parsed.value.layout);
+    insertClayWidget(self, plugin, &outputs[0], .{ .textfield = field }, parsed.value.layout, null);
 }
 
 fn createClayLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -1111,7 +1235,7 @@ fn createClayLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Ex
     const parsed = parseRequest(ClayLabelRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
     defer parsed.deinit();
     const label = Label.init(std.mem.zeroes(c.SDL_FRect), parsed.value.text);
-    insertClayWidget(self, plugin, &outputs[0], .{ .label = label }, parsed.value.layout);
+    insertClayWidget(self, plugin, &outputs[0], .{ .label = label }, parsed.value.layout, null);
 }
 
 fn createClayCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -1122,7 +1246,7 @@ fn createClayCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c
     defer parsed.deinit();
     var checkbox = Checkbox.init(std.mem.zeroes(c.SDL_FRect), parsed.value.label);
     checkbox.checked = parsed.value.checked;
-    insertClayWidget(self, plugin, &outputs[0], .{ .checkbox = checkbox }, parsed.value.layout);
+    insertClayWidget(self, plugin, &outputs[0], .{ .checkbox = checkbox }, parsed.value.layout, null);
 }
 
 fn createClayRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -1133,7 +1257,7 @@ fn createClayRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]cons
     defer parsed.deinit();
     var radio = RadioButton.init(std.mem.zeroes(c.SDL_FRect), parsed.value.group_id, parsed.value.label);
     radio.checked = parsed.value.checked;
-    insertClayWidget(self, plugin, &outputs[0], .{ .radio_button = radio }, parsed.value.layout);
+    insertClayWidget(self, plugin, &outputs[0], .{ .radio_button = radio }, parsed.value.layout, null);
 }
 
 fn createClayProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -1143,7 +1267,7 @@ fn createClayProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]cons
     const parsed = parseRequest(ClayProgressBarRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
     defer parsed.deinit();
     const bar = ProgressBar.init(std.mem.zeroes(c.SDL_FRect), parsed.value.value);
-    insertClayWidget(self, plugin, &outputs[0], .{ .progress_bar = bar }, parsed.value.layout);
+    insertClayWidget(self, plugin, &outputs[0], .{ .progress_bar = bar }, parsed.value.layout, null);
 }
 
 fn createClaySliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -1153,7 +1277,7 @@ fn createClaySliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.E
     const parsed = parseRequest(ClaySliderRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
     defer parsed.deinit();
     const slider = Slider.init(std.mem.zeroes(c.SDL_FRect), parsed.value.value);
-    insertClayWidget(self, plugin, &outputs[0], .{ .slider = slider }, parsed.value.layout);
+    insertClayWidget(self, plugin, &outputs[0], .{ .slider = slider }, parsed.value.layout, null);
 }
 
 fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {

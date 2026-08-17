@@ -7,6 +7,7 @@ const WidgetHost = @import("widgets/WidgetHost.zig");
 const Slider = @import("widgets/Slider.zig");
 const TextField = @import("widgets/TextField.zig");
 const json_util = @import("json_util.zig");
+const timing = @import("timing.zig");
 const ClayLayout = @import("capabilities/ClayLayout.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
@@ -376,6 +377,13 @@ pub fn main(init: std.process.Init) !void {
         // one with the same generation-counter state gets created in its
         // place within the same guest call.
         runtime.widgets.flushPendingTextDestroys(io);
+
+        // W7: destroys any widget (and cascades to its descendants -- see
+        // destroyExpiredWidgets's doc comment) whose expiry has passed --
+        // e.g. a toast that's been showing long enough. Same "must run
+        // before syncTextObjects/snapshot" ordering as the flush above,
+        // for the same reason.
+        runtime.widgets.destroyExpiredWidgets(io, timing.nowMs());
 
         // F3: same "mutate the live registry, then snapshot sees the fresh
         // result" ordering as layoutIfNeeded above -- must run before

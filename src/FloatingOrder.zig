@@ -30,11 +30,15 @@ pub fn computeIsFloating(slots: []const WidgetHost.Slot, out: []bool) void {
 }
 
 fn isFloatingOrDescendant(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot) bool {
-    if (slot.clay_style.floating or slot.clay_style.modal) return true;
+    // W7: `toast` joins `floating`/`modal` here for the same reason modal
+    // did in W5 -- lets the existing floating draw pass and floating-first
+    // hit-test pass cover toast content for free, no new machinery needed
+    // (toasts are display-only and never register a hit anyway).
+    if (slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) return true;
     var current = slot.parent_id;
     while (current) |id| {
         const parent = findSlot(slots, id) orelse break;
-        if (parent.clay_style.floating or parent.clay_style.modal) return true;
+        if (parent.clay_style.floating or parent.clay_style.modal or parent.clay_style.toast) return true;
         current = parent.parent_id;
     }
     return false;
@@ -119,6 +123,16 @@ fn modalSlot(id: u32, parent_id: ?u32) WidgetHost.Slot {
     };
 }
 
+fn toastSlot(id: u32, parent_id: ?u32) WidgetHost.Slot {
+    return .{
+        .id = id,
+        .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) },
+        .parent_id = parent_id,
+        .clay_style = .{ .toast = true },
+        .clay_managed = true,
+    };
+}
+
 test "a widget with no floating ancestor anywhere in the chain is not floating" {
     var slots = [_]WidgetHost.Slot{
         containerSlot(1, null, false),
@@ -171,6 +185,17 @@ test "a modal widget is floating too, with no separate flag needed" {
     var slots = [_]WidgetHost.Slot{
         modalSlot(1, null),
         containerSlot(2, 1, false), // content inside the modal
+    };
+    var out: [2]bool = undefined;
+    computeIsFloating(&slots, &out);
+    try std.testing.expectEqual(true, out[0]);
+    try std.testing.expectEqual(true, out[1]);
+}
+
+test "a toast stack container and its content are floating too, with no separate flag needed" {
+    var slots = [_]WidgetHost.Slot{
+        toastSlot(1, null),
+        containerSlot(2, 1, false), // one toast's own content, inside the stack
     };
     var out: [2]bool = undefined;
     computeIsFloating(&slots, &out);
