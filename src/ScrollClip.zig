@@ -51,7 +51,7 @@ const Container = @import("widgets/Container.zig");
 fn containerSlot(id: u32, parent_id: ?u32, rect: c.SDL_FRect, scroll_vertical: bool, scroll_horizontal: bool) WidgetHost.Slot {
     return .{
         .id = id,
-        .widget = .{ .container = Container.init(rect) },
+        .widget = .{ .container = Container.init(rect, false) },
         .parent_id = parent_id,
         .clay_style = .{ .scroll_vertical = scroll_vertical, .scroll_horizontal = scroll_horizontal },
         .clay_managed = true,
@@ -61,7 +61,7 @@ fn containerSlot(id: u32, parent_id: ?u32, rect: c.SDL_FRect, scroll_vertical: b
 fn leafSlot(id: u32, parent_id: ?u32) WidgetHost.Slot {
     return .{
         .id = id,
-        .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }) },
+        .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) },
         .parent_id = parent_id,
         .clay_style = .{},
         .clay_managed = true,

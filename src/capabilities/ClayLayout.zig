@@ -254,7 +254,25 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
         // needed. Positions the floating element's top-left just below its
         // parent's bottom-left corner (e.g. a dropdown's options panel
         // appearing directly under its trigger).
-        if (slot.clay_style.floating) {
+        // W5: modal implies floating-style positioning -- the guest sets
+        // `modal` alone, not `floating` as well -- but centers against the
+        // whole window (CLAY_ATTACH_TO_ROOT + CENTER_CENTER/CENTER_CENTER)
+        // instead of Dropdown's "attach below my parent" shape, since a
+        // modal isn't conceptually anchored to whatever triggered it the
+        // way a dropdown panel is anchored to its trigger button.
+        // zIndex 2 (vs. plain floating's 1) keeps a modal visually above
+        // any ordinary open floating content if both happen to be open at
+        // once -- see FloatingOrder.zig/main.zig for how natyv's own draw
+        // order, hit-testing, and input-blocking account for the
+        // modal/floating distinction (Clay itself has no opinion on any of
+        // that, only position).
+        if (slot.clay_style.modal) {
+            decl.floating = .{
+                .attachTo = c.CLAY_ATTACH_TO_ROOT,
+                .attachPoints = .{ .parent = c.CLAY_ATTACH_POINT_CENTER_CENTER, .element = c.CLAY_ATTACH_POINT_CENTER_CENTER },
+                .zIndex = 2,
+            };
+        } else if (slot.clay_style.floating) {
             decl.floating = .{
                 .attachTo = c.CLAY_ATTACH_TO_PARENT,
                 .attachPoints = .{ .parent = c.CLAY_ATTACH_POINT_LEFT_BOTTOM, .element = c.CLAY_ATTACH_POINT_LEFT_TOP },

@@ -271,7 +271,7 @@ test "L2: parent_id and Clay style survive a widget-registry snapshot round trip
     var runtime = try init(allocator, null);
     defer runtime.deinit();
 
-    const parent_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 300, .h = 100 }) }, null, .{}) orelse return error.RegistryFull;
+    const parent_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 300, .h = 100 }, false) }, null, .{}) orelse return error.RegistryFull;
 
     const child_style: WidgetHost.ClayStyle = .{
         .sizing = .{
@@ -283,7 +283,7 @@ test "L2: parent_id and Clay style survive a widget-registry snapshot round trip
         .direction = c.CLAY_TOP_TO_BOTTOM,
         .child_alignment = .{ .x = c.CLAY_ALIGN_X_CENTER, .y = c.CLAY_ALIGN_Y_TOP },
     };
-    const child_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }) }, parent_id, child_style) orelse return error.RegistryFull;
+    const child_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, parent_id, child_style) orelse return error.RegistryFull;
 
     var snap: [4]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
@@ -325,15 +325,16 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // 16, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
-    // button (1 more) -- 14 widgets total (the dropdown's floating panel
-    // itself is only created on demand, not by natyv_init -- see the W4
-    // test below). Same silent-truncation risk documented at W1's
-    // identical bump from 4 to 8 -- snapshot() caps at out.len with no
-    // error, so every clay-fixture-loading test's buffer needs auditing
-    // whenever natyv_init grows, not just the test being extended.
+    // button (1 more) + a W5 modal trigger button (1 more) -- 15 widgets
+    // total (the dropdown's floating panel and the modal's panel are both
+    // only created on demand, not by natyv_init -- see the W4/W5 tests
+    // below). Same silent-truncation risk documented at W1's identical
+    // bump from 4 to 8 -- snapshot() caps at out.len with no error, so
+    // every clay-fixture-loading test's buffer needs auditing whenever
+    // natyv_init grows, not just the test being extended.
     var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 14), n);
+    try std.testing.expectEqual(@as(usize, 15), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -786,7 +787,7 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     // test's own, exactly like the real crash Quinn hit.
     const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue });
 
-    queue.push(io, bid, .click, "");
+    queue.push(io, bid, .click, "", 0);
 
     // Simulates main.zig's frame loop -- the only thread allowed to
     // actually call TTF_DestroyText/TTF_CreateText for these objects.
@@ -886,7 +887,7 @@ test "focusableIdsSorted: only Button/TextField ids come back, sorted ascending,
     // prove this really sorts rather than happening to already be ordered.
     const label_id = runtime.widgets.insertWithLayout(io, .{ .label = Label.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "hi") }, null, .{}) orelse return error.RegistryFull;
     const textfield_id = runtime.widgets.insertWithLayout(io, .{ .textfield = TextField.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "") }, null, .{}) orelse return error.RegistryFull;
-    const container_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }) }, null, .{}) orelse return error.RegistryFull;
+    const container_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}) orelse return error.RegistryFull;
     const button_id = runtime.widgets.insertWithLayout(io, .{ .button = Button.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "go") }, null, .{}) orelse return error.RegistryFull;
     _ = label_id;
     _ = container_id;
@@ -1130,5 +1131,106 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
         // The panel and its options must be gone entirely, not just
         // hidden -- natyv has no "visible" concept, only exists/doesn't.
         try std.testing.expect(slot.id != pid);
+    }
+}
+
+test "W5: a modal round-trips modal/background into ClayStyle/Container, centers via a real Clay layout pass, and a real dismiss event destroys it through a real guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    // Unlike the W4 dropdown test above (which never actually runs a real
+    // Clay layout pass, so its "positioned below the trigger" comparison
+    // holds only because both rects stay at their zeroed insert-time
+    // default), this test runs a real layoutIfNeeded pass -- required to
+    // prove "centered in the window" as anything more than a trivial
+    // {0,0}-equals-{0,0} coincidence. 900x700 matches main.zig's real
+    // default window size.
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    // 24: natyv_init's 15 widgets (see the L3 test's comment above), plus
+    // this test opens the modal (panel + message + close button = 3 more)
+    // -- 18 at peak. Same silent-truncation risk documented at every prior
+    // buffer bump in this file.
+    var snap: [24]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Open Modal")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+    // Not yet open -- natyv_init only ever creates the trigger itself,
+    // same "closed by default" state W4's dropdown test already proved.
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != tid);
+    }
+
+    // Real guest-routed open (natyv_clay_create_container with modal:true,
+    // background:true, via natyv_dispatch -- openModal).
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenModal\"}") orelse return error.CallFailed;
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    var panel_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .container and slot.clay_style.modal) {
+            // W5 wire round-trip: modal and background both landed for
+            // real, not just modal (Container.background gates the visible
+            // panel fill/border -- see Container.zig).
+            try std.testing.expect(slot.widget.container.background);
+            panel_id = slot.id;
+            panel_rect = slot.widget.container.rect;
+        }
+    }
+    const pid = panel_id orelse return error.MissingPanel;
+
+    var child_count: usize = 0;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid) child_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), child_count); // message Label + close Button
+
+    // Real Clay layout pass already ran above -- the modal's real computed
+    // rect must be centered in the whole window (CLAY_ATTACH_TO_ROOT +
+    // CENTER_CENTER/CENTER_CENTER, see ClayLayout.zig's openChildren), not
+    // positioned below its trigger the way Dropdown's floating panel is,
+    // and not left at {0,0} the way it would be if modal positioning
+    // silently didn't apply.
+    try std.testing.expectApproxEqAbs(@as(f32, (900 - 240) / 2), panel_rect.x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, (700 - 120) / 2), panel_rect.y, 0.5);
+
+    // Real guest-routed dismiss (a real `.dismiss` event targeting the
+    // modal's own widget id, exactly as main.zig fires on Escape or a
+    // backdrop click -- not a hand-built event type like OpenModal above)
+    // -- proving the built-in close affordance half of "built-in + custom
+    // close" reaches the guest and that closeModal (the guest's own
+    // choice) is what actually destroys the subtree, not the host forcing
+    // it.
+    var dismiss_buf: [64]u8 = undefined;
+    const dismiss_payload = try std.fmt.bufPrint(&dismiss_buf, "{{\"widget_id\":{d},\"event_type\":\"dismiss\"}}", .{pid});
+    _ = runtime.call(io, "natyv_dispatch", dismiss_payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    for (snap[0..n]) |slot| {
+        // The panel and its children must be gone entirely, not just
+        // hidden -- natyv has no "visible" concept, only exists/doesn't.
+        try std.testing.expect(slot.id != pid);
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != pid);
     }
 }

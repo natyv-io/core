@@ -55,14 +55,14 @@ fn toClipRect(r: c.SDL_FRect) c.SDL_Rect {
 /// empty space today. W3: Slider joins that non-activatable set too --
 /// Enter/Space isn't slider semantics, it's driven by drag/arrow-keys
 /// instead (see `notifySliderValue` and the drag-update block below).
-fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, kind: WidgetHost.WidgetKind) void {
+fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, kind: WidgetHost.WidgetKind, surface_id: u32) void {
     switch (kind) {
         .button => widgets.flashButton(io, id),
         .checkbox => widgets.toggleCheckbox(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
         .textfield, .label, .container, .progress_bar, .slider => return,
     }
-    queue.push(io, id, .click, "");
+    queue.push(io, id, .click, "", surface_id);
 }
 
 /// W3: the slider counterpart to `activateWidget` -- called both from a
@@ -74,11 +74,11 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
 /// `.change` coalescing means calling this every frame during a drag never
 /// floods the queue -- only the latest value per widget is ever pending
 /// delivery.
-fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, value: f32) void {
+fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, value: f32, surface_id: u32) void {
     const clamped = widgets.setSliderValue(io, id, value) orelse return;
     var buf: [32]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{clamped}) catch "{}";
-    queue.push(io, id, .change, json);
+    queue.push(io, id, .change, json, surface_id);
 }
 
 /// W4: the per-kind mouse-hit body every `SDL_EVENT_MOUSE_BUTTON_DOWN`
@@ -90,18 +90,18 @@ fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u
 /// interactive. `dragging_slider_id` is an out-param the same way it was
 /// an inline assignment before -- a slider hit starts a drag as a side
 /// effect, same as before.
-fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32) ?u32 {
+fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32) ?u32 {
     switch (slot.widget) {
         .button => |b| if (b.containsPoint(mx, my)) {
-            activateWidget(widgets, io, queue, slot.id, .button);
+            activateWidget(widgets, io, queue, slot.id, .button, FloatingOrder.surfaceIdFor(slots, slot.id));
             return slot.id;
         },
         .checkbox => |cb| if (cb.containsPoint(mx, my)) {
-            activateWidget(widgets, io, queue, slot.id, .checkbox);
+            activateWidget(widgets, io, queue, slot.id, .checkbox, FloatingOrder.surfaceIdFor(slots, slot.id));
             return slot.id;
         },
         .radio_button => |r| if (r.containsPoint(mx, my)) {
-            activateWidget(widgets, io, queue, slot.id, .radio_button);
+            activateWidget(widgets, io, queue, slot.id, .radio_button, FloatingOrder.surfaceIdFor(slots, slot.id));
             return slot.id;
         },
         .textfield => |t| if (t.containsPoint(mx, my)) {
@@ -129,10 +129,24 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         .radio_button => |r| r.drawDecorations(renderer),
         .progress_bar => |p| p.drawDecorations(renderer),
         .slider => |s| s.drawDecorations(renderer),
-        // L2: containers are layout-only, nothing to draw -- see
+        // W5: draws a border only when `background` is set -- see
         // Container.zig's doc comment.
-        .container => {},
+        .container => |cont| cont.drawDecorations(renderer),
     }
+}
+
+/// W4/W5: shared fill-then-decorate body for a single floating widget --
+/// used by both halves of the floating draw pass below, which W5 splits in
+/// two around a modal's backdrop instead of running as one loop.
+fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer) void {
+    const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
+    if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
+    if (slot.widget.fillRect()) |fr| {
+        _ = c.SDL_SetRenderDrawColor(renderer, fr.color.r, fr.color.g, fr.color.b, fr.color.a);
+        _ = c.SDL_RenderFillRect(renderer, &fr.rect);
+    }
+    drawWidgetDecorations(slot.widget, renderer);
+    if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
 }
 
 // M7: app identity, wasm location, and every capability an app needs
@@ -279,6 +293,12 @@ pub fn main(init: std.process.Init) !void {
     // everything else. See FloatingOrder.zig.
     var is_floating: [max_widgets_on_screen]bool = undefined;
     var draw_batcher: DrawBatcher = .{};
+    // W5: the topmost currently-open modal's widget id (see
+    // FloatingOrder.topmostModalRoot), recomputed once per frame alongside
+    // is_floating. Gates the hit-test/keyboard input-blocking restructure
+    // and the backdrop draw pass below -- null means "no modal open,
+    // behave exactly as before W5."
+    var topmost_modal: ?u32 = null;
 
     // W2: accumulated per-frame wheel delta, in pixels (already scaled from
     // SDL's raw wheel "notch" units), consumed by layoutIfNeeded at the top
@@ -333,6 +353,7 @@ pub fn main(init: std.process.Init) !void {
         // W4: computed here, before the event loop below, since
         // MOUSE_BUTTON_DOWN's hit-testing needs it this same frame.
         FloatingOrder.computeIsFloating(widget_snapshot[0..widget_count], is_floating[0..widget_count]);
+        topmost_modal = FloatingOrder.topmostModalRoot(widget_snapshot[0..widget_count]);
 
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
@@ -351,22 +372,45 @@ pub fn main(init: std.process.Init) !void {
                         // replacement for that.
                         var hit_focusable: ?u32 = null;
 
-                        // W4: floating content (e.g. an open dropdown's
-                        // options panel) draws on top of everything else
-                        // (see the floating draw pass below), so it must
-                        // also claim clicks first -- checked in its own
-                        // pass, and if anything floating was hit, the
-                        // normal pass is skipped entirely so a click on a
-                        // floating option can't also fire whatever's
-                        // visually underneath it.
-                        for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
-                            if (!floating) continue;
-                            if (tryHitWidget(&runtime.widgets, io, &queue, slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
-                        }
-                        if (hit_focusable == null) {
+                        if (topmost_modal) |modal_id| {
+                            // W5: a modal blocks input to everything outside
+                            // its own subtree -- unlike Dropdown's "miss
+                            // falls through to normal content" behavior, a
+                            // miss here is fully consumed (no fallback to
+                            // any other floating or normal-content pass at
+                            // all).
+                            //
+                            // W5 follow-up (Quinn's real click-through
+                            // feedback, 2026-08-17): a backdrop-click miss
+                            // never fires `.dismiss` -- it only blocks, full
+                            // stop. Quinn: "for a modal, backdrop clicking
+                            // shouldn't close ever... only ever block, i
+                            // think that's more idiomatic of modals." Escape
+                            // (below) and a guest-declared close Button
+                            // inside the modal are the only two ways to
+                            // close one.
+                            for (widget_snapshot[0..widget_count]) |slot| {
+                                if (!FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
+                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                            }
+                        } else {
+                            // W4: floating content (e.g. an open dropdown's
+                            // options panel) draws on top of everything else
+                            // (see the floating draw pass below), so it must
+                            // also claim clicks first -- checked in its own
+                            // pass, and if anything floating was hit, the
+                            // normal pass is skipped entirely so a click on a
+                            // floating option can't also fire whatever's
+                            // visually underneath it.
                             for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
-                                if (floating) continue;
-                                if (tryHitWidget(&runtime.widgets, io, &queue, slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                                if (!floating) continue;
+                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                            }
+                            if (hit_focusable == null) {
+                                for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
+                                    if (floating) continue;
+                                    if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                                }
                             }
                         }
                         updateFocus(&runtime.widgets, io, window, &focused_widget_id, hit_focusable);
@@ -410,12 +454,21 @@ pub fn main(init: std.process.Init) !void {
                         if (focused_widget_id) |id| {
                             for (widget_snapshot[0..widget_count]) |slot| {
                                 if (slot.id == id) {
-                                    activateWidget(&runtime.widgets, io, &queue, id, std.meta.activeTag(slot.widget));
+                                    activateWidget(&runtime.widgets, io, &queue, id, std.meta.activeTag(slot.widget), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                                 }
                             }
                         }
                     },
-                    c.SDLK_ESCAPE => updateFocus(&runtime.widgets, io, window, &focused_widget_id, null),
+                    // W5: Escape dismisses the topmost open modal instead of
+                    // clearing focus -- same `.dismiss`-and-let-the-guest-
+                    // decide treatment as a backdrop click above. Focus is
+                    // deliberately left alone (a dismiss isn't a guaranteed
+                    // close). When no modal is open, unchanged.
+                    c.SDLK_ESCAPE => if (topmost_modal) |modal_id| {
+                        queue.push(io, modal_id, .dismiss, "", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], modal_id));
+                    } else {
+                        updateFocus(&runtime.widgets, io, window, &focused_widget_id, null);
+                    },
                     // W3: nudges the *focused* widget's value if it's a
                     // slider -- confirmed unbound by anything else in this
                     // switch today, so safe to add unconditionally; a no-op
@@ -425,14 +478,14 @@ pub fn main(init: std.process.Init) !void {
                     c.SDLK_LEFT, c.SDLK_DOWN => if (focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
-                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step);
+                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             }
                         }
                     },
                     c.SDLK_RIGHT, c.SDLK_UP => if (focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
-                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step);
+                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             }
                         }
                     },
@@ -452,13 +505,22 @@ pub fn main(init: std.process.Init) !void {
         if (dragging_slider_id) |id| {
             for (widget_snapshot[0..widget_count]) |slot| {
                 if (slot.id == id and slot.widget == .slider) {
-                    notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.valueFromX(mouse_x));
+                    notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.valueFromX(mouse_x), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                 }
             }
         }
 
         var hovering_any = false;
         for (widget_snapshot[0..widget_count]) |slot| {
+            // W5 follow-up (Quinn's real click-through feedback,
+            // 2026-08-17): when a modal is open, a widget outside its
+            // subtree can't actually be clicked (see the input-blocking
+            // hit-test above) -- showing the pointer cursor over it anyway
+            // would be misleading, implying it's clickable when it isn't.
+            // Same scoping the click-blocking hit-test uses.
+            if (topmost_modal) |modal_id| {
+                if (!FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
+            }
             switch (slot.widget) {
                 .button => |b| if (b.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
@@ -541,7 +603,7 @@ pub fn main(init: std.process.Init) !void {
             if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
         }
 
-        // W4: floating content (e.g. a dropdown's options panel and its
+        // W4/W5: floating content (e.g. a dropdown's options panel and its
         // rows) drawn last among "real" widgets, after draw_batcher.flush()
         // above -- guarantees it renders on top of every normal widget
         // regardless of registry order, same "drawn last" precedent
@@ -551,16 +613,36 @@ pub fn main(init: std.process.Init) !void {
         // overlap each other in practice, and are small (see
         // DrawBatcher.zig's own "tens, not thousands" framing), so there's
         // no real cost to the simpler per-widget draw here.
+        //
+        // W5: when a modal is open, this splits around a translucent
+        // backdrop instead of running as one pass. Everything floating that
+        // ISN'T inside the topmost modal draws first, so it (and, in a
+        // nested-modal scenario, any earlier modal that isn't an ancestor
+        // of the topmost one) gets correctly dimmed by the backdrop -- then
+        // the topmost modal's own subtree draws on top of the backdrop,
+        // undimmed.
         for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
             if (!floating) continue;
-            const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
-            if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
-            if (slot.widget.fillRect()) |fr| {
-                _ = c.SDL_SetRenderDrawColor(renderer, fr.color.r, fr.color.g, fr.color.b, fr.color.a);
-                _ = c.SDL_RenderFillRect(renderer, &fr.rect);
+            if (topmost_modal) |modal_id| {
+                if (FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
             }
-            drawWidgetDecorations(slot.widget, renderer);
-            if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
+            drawFloatingWidget(slot, clip, renderer);
+        }
+        if (topmost_modal) |modal_id| {
+            var win_w: c_int = undefined;
+            var win_h: c_int = undefined;
+            _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
+            _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND);
+            _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 140);
+            const backdrop: c.SDL_FRect = .{ .x = 0, .y = 0, .w = @floatFromInt(win_w), .h = @floatFromInt(win_h) };
+            _ = c.SDL_RenderFillRect(renderer, &backdrop);
+            _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_NONE);
+
+            for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
+                if (!floating) continue;
+                if (!FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
+                drawFloatingWidget(slot, clip, renderer);
+            }
         }
 
         // W2: scrollbar thumbs -- display-only position indicators (not

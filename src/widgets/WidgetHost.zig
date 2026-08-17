@@ -161,13 +161,16 @@ pub const Widget = union(WidgetKind) {
             // Uses `boxRect()`, not the full `rect`, since the label area
             // (if any) is never filled.
             .checkbox => |cb| if (cb.checked) .{ .color = cb.fillColor(), .rect = cb.boxRect() } else null,
+            // W5: only fills when `background` is set -- see
+            // Container.zig's doc comment.
+            .container => |cont| if (cont.fillColor()) |color| .{ .color = color, .rect = cont.rect } else null,
             // RadioButton.zig's doc comment explains why this opts out
             // entirely -- its checked state is an inset dot, not a
             // whole-rect fill.
             // W3: Slider needs its own two-color (track + fill) custom draw
             // in drawDecorations, same "opts out of the single-color batched
             // fill" precedent ProgressBar already established.
-            .label, .container, .radio_button, .progress_bar, .slider => null,
+            .label, .radio_button, .progress_bar, .slider => null,
         };
     }
 
@@ -224,6 +227,26 @@ pub const ClayStyle = struct {
     /// for how natyv's own draw order and click hit-testing account for it
     /// (Clay itself has no opinion on either -- it only computes position).
     floating: bool = false,
+    /// W5: implies floating-style positioning (the guest sets this alone,
+    /// not `floating: true` as well) but centered against the whole window
+    /// via `CLAY_ATTACH_TO_ROOT` instead of Dropdown's "attach below my
+    /// parent" shape -- see ClayLayout.zig's openChildren. Also the signal
+    /// FloatingOrder.zig's modal-specific functions (topmost-of-several,
+    /// input-blocking subtree, surface id) key off of; a plain `floating`
+    /// widget (like Dropdown's panel) never blocks input or gets a
+    /// backdrop, only a `modal` one does.
+    ///
+    /// A backdrop click never dismisses -- deliberate, per Quinn's
+    /// real click-through feedback (2026-08-17): "for a modal, backdrop
+    /// clicking shouldn't close ever... only ever block. that's more
+    /// idiomatic." An earlier version made this a per-modal opt-in
+    /// (`backdrop_dismiss`); Quinn simplified it to always-block instead,
+    /// so that flag was removed rather than left as dead/unused wire
+    /// surface. Escape and a guest-declared close Button are the only two
+    /// ways to close a modal -- see main.zig's backdrop-miss handling
+    /// (blocks, never pushes `.dismiss`) and its Escape-key handling
+    /// (always pushes `.dismiss`, unconditionally).
+    modal: bool = false,
 };
 
 pub const Slot = struct {
@@ -765,8 +788,9 @@ const ClayLayoutRequest = struct {
     scroll_vertical: bool = false,
     scroll_horizontal: bool = false,
     floating: bool = false,
+    modal: bool = false,
 };
-const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{} };
+const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{}, background: bool = false };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
 const ClayTextFieldRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
 const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const u8 = "" };
@@ -808,6 +832,7 @@ fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
         .scroll_vertical = req.scroll_vertical,
         .scroll_horizontal = req.scroll_horizontal,
         .floating = req.floating,
+        .modal = req.modal,
     };
 }
 
@@ -1034,7 +1059,7 @@ fn createClayContainerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const 
     const self: *Self = @ptrCast(@alignCast(user_data.?));
     const parsed = parseRequest(ClayContainerRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
     defer parsed.deinit();
-    const container = Container.init(std.mem.zeroes(c.SDL_FRect));
+    const container = Container.init(std.mem.zeroes(c.SDL_FRect), parsed.value.background);
     insertClayWidget(self, plugin, &outputs[0], .{ .container = container }, parsed.value.layout);
 }
 

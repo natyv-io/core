@@ -15,7 +15,11 @@ const Io = std.Io;
 
 const Self = @This();
 
-pub const EventType = enum { click, change };
+/// W5: `.dismiss` is fired to a modal's own widget id on Escape or a
+/// backdrop click -- discrete like `.click` (always appended, never
+/// coalesced), since a guest deciding "should I actually close" needs
+/// every request, not just the latest.
+pub const EventType = enum { click, change, dismiss };
 
 pub const Entry = struct {
     widget_id: u32,
@@ -23,6 +27,11 @@ pub const Entry = struct {
     /// Owned, heap-allocated -- free via `EventQueue.freeEntry` once done.
     payload: []u8,
     seq: u32,
+    /// W5: which modal (if any) `widget_id` is nested under, or 0 (root/
+    /// main surface) -- see FloatingOrder.surfaceIdFor. Carried on every
+    /// event, not just modal-related ones, so a future surface kind
+    /// (NativeWindow) needs no wire-contract change.
+    surface_id: u32 = 0,
 };
 
 allocator: std.mem.Allocator,
@@ -45,7 +54,7 @@ pub fn freeEntry(self: *Self, entry: Entry) void {
     self.allocator.free(entry.payload);
 }
 
-pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload: []const u8) void {
+pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload: []const u8, surface_id: u32) void {
     const owned = self.allocator.dupe(u8, payload) catch |err| {
         std.debug.print("[queue]  DROPPED push, alloc failed: {}\n", .{err});
         return;
@@ -75,7 +84,7 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
     self.seq_counter += 1;
     const seq = self.seq_counter;
 
-    self.items.append(self.allocator, .{ .widget_id = widget_id, .event_type = event_type, .payload = owned, .seq = seq }) catch |err| {
+    self.items.append(self.allocator, .{ .widget_id = widget_id, .event_type = event_type, .payload = owned, .seq = seq, .surface_id = surface_id }) catch |err| {
         std.debug.print("[queue]  DROPPED push, alloc failed: {}\n", .{err});
         self.allocator.free(owned);
         return;
@@ -114,8 +123,8 @@ test "click events for the same widget are never coalesced" {
     var queue = Self.init(allocator);
     defer queue.deinit();
 
-    queue.push(io, 1, .click, "a");
-    queue.push(io, 1, .click, "b");
+    queue.push(io, 1, .click, "a", 0);
+    queue.push(io, 1, .click, "b", 0);
     try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
 }
 
@@ -128,8 +137,8 @@ test "change events for the same widget coalesce to the latest payload" {
     var queue = Self.init(allocator);
     defer queue.deinit();
 
-    queue.push(io, 1, .change, "{\"value\":0.1}");
-    queue.push(io, 1, .change, "{\"value\":0.9}");
+    queue.push(io, 1, .change, "{\"value\":0.1}", 0);
+    queue.push(io, 1, .change, "{\"value\":0.9}", 0);
     try std.testing.expectEqual(@as(usize, 1), queue.items.items.len);
     try std.testing.expectEqualStrings("{\"value\":0.9}", queue.items.items[0].payload);
 }
@@ -143,8 +152,8 @@ test "change events for different widgets don't coalesce with each other" {
     var queue = Self.init(allocator);
     defer queue.deinit();
 
-    queue.push(io, 1, .change, "a");
-    queue.push(io, 2, .change, "b");
+    queue.push(io, 1, .change, "a", 0);
+    queue.push(io, 2, .change, "b", 0);
     try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
 }
 
@@ -157,8 +166,8 @@ test "click and change for the same widget are independent, not coalesced with e
     var queue = Self.init(allocator);
     defer queue.deinit();
 
-    queue.push(io, 1, .click, "a");
-    queue.push(io, 1, .change, "b");
+    queue.push(io, 1, .click, "a", 0);
+    queue.push(io, 1, .change, "b", 0);
     try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
 }
 
@@ -171,12 +180,41 @@ test "a change event popped and then pushed again starts a fresh entry, not a st
     var queue = Self.init(allocator);
     defer queue.deinit();
 
-    queue.push(io, 1, .change, "a");
+    queue.push(io, 1, .change, "a", 0);
     const popped = queue.pop(io).?;
     queue.freeEntry(popped);
     try std.testing.expectEqual(@as(usize, 0), queue.items.items.len);
 
-    queue.push(io, 1, .change, "b");
+    queue.push(io, 1, .change, "b", 0);
     try std.testing.expectEqual(@as(usize, 1), queue.items.items.len);
     try std.testing.expectEqualStrings("b", queue.items.items[0].payload);
+}
+
+test "dismiss events for the same widget are never coalesced, matching click" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .dismiss, "", 0);
+    queue.push(io, 1, .dismiss, "", 0);
+    try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
+}
+
+test "push carries surface_id through to the popped entry" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .click, "a", 7);
+    const popped = queue.pop(io).?;
+    defer queue.freeEntry(popped);
+    try std.testing.expectEqual(@as(u32, 7), popped.surface_id);
 }

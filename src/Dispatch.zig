@@ -40,7 +40,10 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue) void {
 
 fn buildDispatchPayload(allocator: std.mem.Allocator, event: EventQueue.Entry) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.print(allocator, "{{\"widget_id\":{d},\"event_type\":\"{s}\",\"payload\":", .{ event.widget_id, @tagName(event.event_type) });
+    // W5: surface_id (0 = root/main surface) is a top-level sibling on
+    // every dispatch event, not nested under payload -- see
+    // FloatingOrder.surfaceIdFor's doc comment for why.
+    try out.print(allocator, "{{\"widget_id\":{d},\"event_type\":\"{s}\",\"surface_id\":{d},\"payload\":", .{ event.widget_id, @tagName(event.event_type), event.surface_id });
     try json_util.writeString(&out, allocator, event.payload);
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
