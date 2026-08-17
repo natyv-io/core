@@ -152,7 +152,11 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
     // widgets the guest created (by placeholder/label, not by assuming
     // fixed ids), type into them via the same WidgetHost methods SDL text
     // input calls, and push a click the same way a real mouse click would.
-    var snap: [32]WidgetHost.Slot = undefined;
+    // 40, not 32: W8's delete-confirm Dialog adds up to 5 more widgets
+    // (root + message Label + button row + 2 buttons) on top of what this
+    // test already exercises -- same silent-truncation risk documented at
+    // every prior buffer bump in this file.
+    var snap: [40]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var author_id: ?u32 = null;
@@ -200,15 +204,121 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
     }
     try std.testing.expect(found_book);
 
+    // W8: clicking "Delete" no longer removes the book immediately -- it
+    // opens a real confirmation Dialog instead (showDeleteConfirm).
     click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{delete_id orelse return error.MissingDeleteButton});
     _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
 
     n = runtime.widgets.snapshot(io, &snap);
     found_book = false;
+    var confirm_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        switch (slot.widget) {
+            .label => |l| if (std.mem.indexOf(u8, l.text(), "Frank Herbert") != null) {
+                found_book = true;
+            },
+            .button => |b| if (std.mem.eql(u8, b.label(), "Confirm")) {
+                confirm_id = slot.id;
+            },
+            else => {},
+        }
+    }
+    // Still present -- nothing is deleted until "Confirm" is clicked.
+    try std.testing.expect(found_book);
+
+    click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{confirm_id orelse return error.MissingConfirmButton});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    found_book = false;
+    var dialog_widgets_remain = false;
     for (snap[0..n]) |slot| {
         if (slot.widget == .label and std.mem.indexOf(u8, slot.widget.label.text(), "Frank Herbert") != null) found_book = true;
+        if (slot.widget == .button and (std.mem.eql(u8, slot.widget.button.label(), "Confirm") or std.mem.eql(u8, slot.widget.button.label(), "Cancel"))) dialog_widgets_remain = true;
     }
     try std.testing.expect(!found_book);
+    // The dialog (root, message, button row, both buttons) must be fully
+    // gone too -- Dialog.close() explicitly destroys every widget it
+    // created, not just its root (Container.Destroy has no cascading
+    // delete, see clay.Dialog's own doc comment on the guest side).
+    try std.testing.expect(!dialog_widgets_remain);
+}
+
+test "bookstore: cancelling the delete-confirm dialog leaves the book untouched" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/bookstore/guest/bookstore.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, ":memory:");
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [40]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var author_id: ?u32 = null;
+    var title_id: ?u32 = null;
+    var genre_id: ?u32 = null;
+    var add_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        switch (slot.widget) {
+            .textfield => |t| {
+                if (std.mem.eql(u8, t.placeholder(), "Author")) author_id = slot.id;
+                if (std.mem.eql(u8, t.placeholder(), "Title")) title_id = slot.id;
+                if (std.mem.eql(u8, t.placeholder(), "Genre")) genre_id = slot.id;
+            },
+            .button => |b| {
+                if (std.mem.eql(u8, b.label(), "Add Book")) add_id = slot.id;
+            },
+            else => {},
+        }
+    }
+
+    var text_scratch: [128]u8 = undefined;
+    _ = runtime.widgets.appendTextTo(io, author_id orelse return error.MissingAuthorField, "Ursula K. Le Guin", &text_scratch);
+    _ = runtime.widgets.appendTextTo(io, title_id orelse return error.MissingTitleField, "The Dispossessed", &text_scratch);
+    _ = runtime.widgets.appendTextTo(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
+
+    var dispatch_buf: [128]u8 = undefined;
+    var click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    var delete_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Delete")) delete_id = slot.id;
+    }
+
+    click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{delete_id orelse return error.MissingDeleteButton});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    var cancel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Cancel")) cancel_id = slot.id;
+    }
+
+    click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{cancel_id orelse return error.MissingCancelButton});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    var found_book = false;
+    var dialog_widgets_remain = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.indexOf(u8, slot.widget.label.text(), "Ursula K. Le Guin") != null) found_book = true;
+        if (slot.widget == .button and (std.mem.eql(u8, slot.widget.button.label(), "Confirm") or std.mem.eql(u8, slot.widget.button.label(), "Cancel"))) dialog_widgets_remain = true;
+    }
+    // Cancel leaves the book alone -- OnResult only runs its real body for
+    // "Confirm" (see showDeleteConfirm's guest-side branch), but the
+    // dialog itself is still fully destroyed either way (Dialog.close()
+    // runs unconditionally in OnResult before the button-specific check).
+    try std.testing.expect(found_book);
+    try std.testing.expect(!dialog_widgets_remain);
 }
 
 test "widget host functions: create/get/set/destroy round trip through a trivial guest" {
