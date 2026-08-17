@@ -12,6 +12,7 @@ const Dispatch = @import("Dispatch.zig");
 const DrawBatcher = @import("DrawBatcher.zig");
 const ScrollClip = @import("ScrollClip.zig");
 const ScrollBar = @import("ScrollBar.zig");
+const FloatingOrder = @import("FloatingOrder.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -78,6 +79,60 @@ fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u
     var buf: [32]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{clamped}) catch "{}";
     queue.push(io, id, .change, json);
+}
+
+/// W4: the per-kind mouse-hit body every `SDL_EVENT_MOUSE_BUTTON_DOWN`
+/// arm already used inline before this existed -- extracted so it can run
+/// in two priority passes (floating content first, then normal content)
+/// instead of one, see the event handler below. Behavior for any single
+/// widget is completely unchanged from before this extraction; returns the
+/// hit widget's id (to focus) or null if `slot` wasn't hit/isn't
+/// interactive. `dragging_slider_id` is an out-param the same way it was
+/// an inline assignment before -- a slider hit starts a drag as a side
+/// effect, same as before.
+fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32) ?u32 {
+    switch (slot.widget) {
+        .button => |b| if (b.containsPoint(mx, my)) {
+            activateWidget(widgets, io, queue, slot.id, .button);
+            return slot.id;
+        },
+        .checkbox => |cb| if (cb.containsPoint(mx, my)) {
+            activateWidget(widgets, io, queue, slot.id, .checkbox);
+            return slot.id;
+        },
+        .radio_button => |r| if (r.containsPoint(mx, my)) {
+            activateWidget(widgets, io, queue, slot.id, .radio_button);
+            return slot.id;
+        },
+        .textfield => |t| if (t.containsPoint(mx, my)) {
+            return slot.id;
+        },
+        .slider => |s| if (s.containsPoint(mx, my)) {
+            dragging_slider_id.* = slot.id;
+            return slot.id;
+        },
+        .label, .container, .progress_bar => {},
+    }
+    return null;
+}
+
+/// The border/text/checkmark/etc a widget draws on top of its own fill --
+/// shared by the normal decoration pass and the W4 floating-content pass
+/// below, so a new widget kind only needs one switch arm added here, not
+/// duplicated across both passes.
+fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) void {
+    switch (widget) {
+        .button => |b| b.drawDecorations(renderer),
+        .textfield => |t| t.drawDecorations(renderer),
+        .label => |l| l.drawDecorations(renderer),
+        .checkbox => |cb| cb.drawDecorations(renderer),
+        .radio_button => |r| r.drawDecorations(renderer),
+        .progress_bar => |p| p.drawDecorations(renderer),
+        .slider => |s| s.drawDecorations(renderer),
+        // L2: containers are layout-only, nothing to draw -- see
+        // Container.zig's doc comment.
+        .container => {},
+    }
 }
 
 // M7: app identity, wasm location, and every capability an app needs
@@ -217,6 +272,12 @@ pub fn main(init: std.process.Init) !void {
     var running = true;
     var widget_snapshot: [max_widgets_on_screen]WidgetHost.Slot = undefined;
     var clip_rects: [max_widgets_on_screen]?c.SDL_FRect = undefined;
+    // W4: whether each widget is itself floating or nested under a
+    // floating ancestor (e.g. a dropdown's options panel and its rows) --
+    // computed once per frame, used both to give floating content priority
+    // in mouse hit-testing and to draw it in its own pass on top of
+    // everything else. See FloatingOrder.zig.
+    var is_floating: [max_widgets_on_screen]bool = undefined;
     var draw_batcher: DrawBatcher = .{};
 
     // W2: accumulated per-frame wheel delta, in pixels (already scaled from
@@ -269,6 +330,9 @@ pub fn main(init: std.process.Init) !void {
         runtime.widgets.syncTextObjects(io, text_engine, default_font.font);
 
         const widget_count = runtime.widgets.snapshot(io, &widget_snapshot);
+        // W4: computed here, before the event loop below, since
+        // MOUSE_BUTTON_DOWN's hit-testing needs it this same frame.
+        FloatingOrder.computeIsFloating(widget_snapshot[0..widget_count], is_floating[0..widget_count]);
 
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
@@ -287,38 +351,22 @@ pub fn main(init: std.process.Init) !void {
                         // replacement for that.
                         var hit_focusable: ?u32 = null;
 
-                        for (widget_snapshot[0..widget_count]) |slot| {
-                            switch (slot.widget) {
-                                .button => |b| if (b.containsPoint(mx, my)) {
-                                    activateWidget(&runtime.widgets, io, &queue, slot.id, .button);
-                                    hit_focusable = slot.id;
-                                },
-                                .checkbox => |cb| if (cb.containsPoint(mx, my)) {
-                                    activateWidget(&runtime.widgets, io, &queue, slot.id, .checkbox);
-                                    hit_focusable = slot.id;
-                                },
-                                .radio_button => |r| if (r.containsPoint(mx, my)) {
-                                    activateWidget(&runtime.widgets, io, &queue, slot.id, .radio_button);
-                                    hit_focusable = slot.id;
-                                },
-                                .textfield => |t| if (t.containsPoint(mx, my)) {
-                                    hit_focusable = slot.id;
-                                },
-                                // W3: just starts the drag -- no value is
-                                // computed here. The per-frame drag-update
-                                // block below runs later this same frame
-                                // (using the polled mouse_x, essentially
-                                // identical to `mx`/`my` here) and handles
-                                // both this click-to-jump case and every
-                                // subsequent drag frame through one code
-                                // path, not two.
-                                .slider => |s| if (s.containsPoint(mx, my)) {
-                                    hit_focusable = slot.id;
-                                    dragging_slider_id = slot.id;
-                                },
-                                .label => {},
-                                .container => {},
-                                .progress_bar => {},
+                        // W4: floating content (e.g. an open dropdown's
+                        // options panel) draws on top of everything else
+                        // (see the floating draw pass below), so it must
+                        // also claim clicks first -- checked in its own
+                        // pass, and if anything floating was hit, the
+                        // normal pass is skipped entirely so a click on a
+                        // floating option can't also fire whatever's
+                        // visually underneath it.
+                        for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
+                            if (!floating) continue;
+                            if (tryHitWidget(&runtime.widgets, io, &queue, slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                        }
+                        if (hit_focusable == null) {
+                            for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
+                                if (floating) continue;
+                                if (tryHitWidget(&runtime.widgets, io, &queue, slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
                             }
                         }
                         updateFocus(&runtime.widgets, io, window, &focused_widget_id, hit_focusable);
@@ -464,7 +512,13 @@ pub fn main(init: std.process.Init) !void {
         // DrawBatcher.zig's own "tens, not thousands" framing), so a
         // less-batched path for just those is a reasonable trade over a
         // more complex (color, clip_rect) bucket key.
-        for (widget_snapshot[0..widget_count], clip_rects[0..widget_count]) |slot, clip| {
+        for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
+            // W4: floating content is drawn in its own pass below, after
+            // draw_batcher.flush() -- it can't be interleaved into this
+            // pass's immediate/batched fills, since anything the batcher
+            // adds here only actually renders at flush() below, which
+            // would then paint over an already-drawn floating widget.
+            if (floating) continue;
             if (slot.widget.fillRect()) |fr| {
                 if (clip) |cr| {
                     const sdl_clip = toClipRect(cr);
@@ -479,21 +533,33 @@ pub fn main(init: std.process.Init) !void {
         }
         draw_batcher.flush(renderer);
 
-        for (widget_snapshot[0..widget_count], clip_rects[0..widget_count]) |slot, clip| {
+        for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
+            if (floating) continue;
             const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
             if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
-            switch (slot.widget) {
-                .button => |b| b.drawDecorations(renderer),
-                .textfield => |t| t.drawDecorations(renderer),
-                .label => |l| l.drawDecorations(renderer),
-                .checkbox => |cb| cb.drawDecorations(renderer),
-                .radio_button => |r| r.drawDecorations(renderer),
-                .progress_bar => |p| p.drawDecorations(renderer),
-                .slider => |s| s.drawDecorations(renderer),
-                // L2: containers are layout-only, nothing to draw -- see
-                // Container.zig's doc comment.
-                .container => {},
+            drawWidgetDecorations(slot.widget, renderer);
+            if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
+        }
+
+        // W4: floating content (e.g. a dropdown's options panel and its
+        // rows) drawn last among "real" widgets, after draw_batcher.flush()
+        // above -- guarantees it renders on top of every normal widget
+        // regardless of registry order, same "drawn last" precedent
+        // ScrollBar's thumbs already established for W2. Unbatched and
+        // fill-then-decorate per widget (not split into two sub-passes
+        // like the normal content above) -- floating subtrees don't
+        // overlap each other in practice, and are small (see
+        // DrawBatcher.zig's own "tens, not thousands" framing), so there's
+        // no real cost to the simpler per-widget draw here.
+        for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
+            if (!floating) continue;
+            const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
+            if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
+            if (slot.widget.fillRect()) |fr| {
+                _ = c.SDL_SetRenderDrawColor(renderer, fr.color.r, fr.color.g, fr.color.b, fr.color.a);
+                _ = c.SDL_RenderFillRect(renderer, &fr.rect);
             }
+            drawWidgetDecorations(slot.widget, renderer);
             if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
         }
 

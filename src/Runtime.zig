@@ -324,14 +324,16 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
 
     // 16, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
-    // row labels (6 more) + a W3 slider (1 more) -- 13 widgets total. Same
-    // silent-truncation risk documented at W1's identical bump from 4 to 8
-    // -- snapshot() caps at out.len with no error, so every
-    // clay-fixture-loading test's buffer needs auditing whenever
-    // natyv_init grows, not just the test being extended.
+    // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
+    // button (1 more) -- 14 widgets total (the dropdown's floating panel
+    // itself is only created on demand, not by natyv_init -- see the W4
+    // test below). Same silent-truncation risk documented at W1's
+    // identical bump from 4 to 8 -- snapshot() caps at out.len with no
+    // error, so every clay-fixture-loading test's buffer needs auditing
+    // whenever natyv_init grows, not just the test being extended.
     var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 13), n);
+    try std.testing.expectEqual(@as(usize, 14), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -396,9 +398,14 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
     var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
+    // W4: the fixture now creates a *second* button (the dropdown trigger,
+    // "Select...", Fixed height 32) alongside "Grow Button" (GROW width,
+    // Fixed height 40) -- "the button in the snapshot" is no longer
+    // unique, same class of fix the L3 test's cid derivation already
+    // needed at W2. Match by label instead of taking whichever comes last.
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
-        if (slot.widget == .button) button_id = slot.id;
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Grow Button")) button_id = slot.id;
     }
     const bid = button_id orelse return error.MissingButton;
 
@@ -672,11 +679,18 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
     var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
+    // W4: two buttons exist now (the fixture's own "Grow Button" plus the
+    // dropdown trigger) -- every button gets synced once on this first
+    // call regardless of which, so the sync_count==1 check still holds for
+    // both, but `bid` itself must be "Grow Button" specifically: the
+    // fixture's own natyv_dispatch fallback always relabels *that* widget
+    // (its package-level buttonID), not whichever id the dispatch payload
+    // below happens to name.
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
         if (slot.widget == .button) {
-            button_id = slot.id;
             try std.testing.expectEqual(@as(u32, 1), slot.widget.button.sync_count);
+            if (std.mem.eql(u8, slot.widget.button.label(), "Grow Button")) button_id = slot.id;
         }
     }
     const bid = button_id orelse return error.MissingButton;
@@ -751,9 +765,15 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
     var snap: [16]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
+    // W4: must be "Grow Button" specifically, not whichever button the
+    // scan finds last -- a real click's widget_id now matters (the
+    // dropdown trigger routes to open/close instead of the destroy/
+    // recreate behavior this test is actually exercising), not just the
+    // "click" event_type string the way it did before real per-widget
+    // click routing existed.
     var button_id: ?u32 = null;
     for (snap[0..n]) |slot| {
-        if (slot.widget == .button) button_id = slot.id;
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Grow Button")) button_id = slot.id;
     }
     const bid = button_id orelse return error.MissingButton;
 
@@ -800,11 +820,21 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     // ended up correct too, not just that nothing crashed.
     try std.testing.expect(relabeled);
     n = runtime.widgets.snapshot(io, &snap);
-    var button_count: u32 = 0;
+    // W4: the fixture now also has a "Select..." dropdown trigger button
+    // that has nothing to do with this destroy/recreate cycle -- assert
+    // exactly one "Recreated Button" exists (not zero, not duplicated) and
+    // that the unrelated trigger is untouched, rather than a bare global
+    // button count that broke the moment a second, unrelated button
+    // existed in the fixture at all.
+    var recreated_count: u32 = 0;
+    var trigger_found = false;
     for (snap[0..n]) |slot| {
-        if (slot.widget == .button) button_count += 1;
+        if (slot.widget != .button) continue;
+        if (std.mem.eql(u8, slot.widget.button.label(), "Recreated Button")) recreated_count += 1;
+        if (std.mem.eql(u8, slot.widget.button.label(), "Select...")) trigger_found = true;
     }
-    try std.testing.expectEqual(@as(u32, 1), button_count);
+    try std.testing.expectEqual(@as(u32, 1), recreated_count);
+    try std.testing.expect(trigger_found);
 }
 
 test "nextFocusable: empty list returns null regardless of current or direction" {
@@ -1013,5 +1043,92 @@ test "W3: slider created via natyv_clay_create_slider round-trips its value, and
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == sid) try std.testing.expectApproxEqAbs(@as(f32, 0.25), slot.widget.slider.value, 0.001);
+    }
+}
+
+test "W4: a dropdown's floating options panel round-trips floating into ClayStyle, positions below its trigger, and select-and-close destroys it through a real guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    // 20, not 16: natyv_init's 14 widgets, plus this test opens the
+    // dropdown (panel + 2 options = 3 more) -- 17 at peak. Same
+    // silent-truncation risk documented at every prior buffer bump in this
+    // file -- snapshot() caps at out.len with no error.
+    var snap: [20]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    var trigger_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Select...")) {
+            trigger_id = slot.id;
+            trigger_rect = slot.widget.button.rect;
+        }
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+    // Not yet open -- natyv_init only ever creates the trigger itself (see
+    // the fixture's own doc comment), same "closed by default" state a
+    // real dropdown starts in.
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != tid);
+    }
+
+    // Real guest-routed open (natyv_clay_create_container with
+    // floating:true, via natyv_dispatch -- openDropdown).
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"ToggleDropdown\"}") orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) {
+            // W4 wire round-trip: floating landed in ClayStyle.
+            try std.testing.expect(slot.clay_style.floating);
+            panel_id = slot.id;
+        }
+    }
+    const pid = panel_id orelse return error.MissingPanel;
+
+    var option_count: usize = 0;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button) option_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), option_count);
+
+    // Real Clay layout pass already ran (triggered by the container
+    // create above bumping layout_generation) -- the floating panel's
+    // real computed rect must be positioned below the trigger's bottom
+    // edge (CLAY_ATTACH_POINT_LEFT_BOTTOM/LEFT_TOP, see ClayLayout.zig's
+    // openChildren), not left at {0,0} the way it would be if floating
+    // positioning silently didn't apply.
+    for (snap[0..n]) |slot| {
+        if (slot.id == pid) {
+            const panel_rect = slot.widget.container.rect;
+            try std.testing.expectApproxEqAbs(trigger_rect.x, panel_rect.x, 0.5);
+            try std.testing.expectApproxEqAbs(trigger_rect.y + trigger_rect.h, panel_rect.y, 0.5);
+        }
+    }
+
+    // Real guest-routed select-and-close (natyv_set_text on the trigger +
+    // natyv_destroy_widget on the panel/options, via natyv_dispatch --
+    // closeDropdown), same "destroy old widgets" pattern examples/bookstore
+    // and the F3-regression fixture case already established.
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SelectOption2\"}") orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    for (snap[0..n]) |slot| {
+        if (slot.id == tid) try std.testing.expectEqualStrings("Option 2", slot.widget.button.label());
+        // The panel and its options must be gone entirely, not just
+        // hidden -- natyv has no "visible" concept, only exists/doesn't.
+        try std.testing.expect(slot.id != pid);
     }
 }

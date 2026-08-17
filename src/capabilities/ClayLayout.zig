@@ -243,6 +243,24 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
                 .childOffset = c.Clay_GetScrollOffset(),
             };
         }
+        // W4: unlike .clip above, floating doesn't read any Clay state
+        // that's only valid while this element is open -- Clay resolves a
+        // floating element's real position in a later pass, against its
+        // parent's already-computed bounding box (confirmed against the
+        // real source, vendor/clay/clay.h). CLAY_ATTACH_TO_PARENT is used
+        // deliberately instead of CLAY_ATTACH_TO_ELEMENT_WITH_ID -- natyv's
+        // own parent_id already names exactly the element Clay would need
+        // a second id field to point at, so no extra wire-contract field is
+        // needed. Positions the floating element's top-left just below its
+        // parent's bottom-left corner (e.g. a dropdown's options panel
+        // appearing directly under its trigger).
+        if (slot.clay_style.floating) {
+            decl.floating = .{
+                .attachTo = c.CLAY_ATTACH_TO_PARENT,
+                .attachPoints = .{ .parent = c.CLAY_ATTACH_POINT_LEFT_BOTTOM, .element = c.CLAY_ATTACH_POINT_LEFT_TOP },
+                .zIndex = 1,
+            };
+        }
         c.Clay__ConfigureOpenElement(decl);
         openChildren(slots, slot.id);
         c.Clay__CloseElement();

@@ -63,11 +63,16 @@
 //!            "child_gap":u16,
 //!            "direction":"left_to_right"|"top_to_bottom",
 //!            "child_alignment":{"x":"left"|"right"|"center","y":"top"|"bottom"|"center"},
-//!            "scroll_vertical":bool,"scroll_horizontal":bool}
+//!            "scroll_vertical":bool,"scroll_horizontal":bool,"floating":bool}
 //!   (every layout field is optional -- see ClayLayoutRequest defaults below)
 //!   W2: scroll_vertical/scroll_horizontal clip a container's children to
 //!   its own bounds and let mouse-wheel input scroll them -- only ever
 //!   meaningful on a container with a bounded (non-fit-content) size.
+//!   W4: floating layers this element (and its own children) on top of
+//!   normal content instead of taking part in its parent's normal flex
+//!   flow -- e.g. a dropdown's options panel, attached below whatever
+//!   widget this one's parent_id names. See ClayLayout.zig's openChildren
+//!   and FloatingOrder.zig for how position/draw-order/hit-testing work.
 //!   natyv_set_text/natyv_get_text/natyv_set_checked/natyv_get_checked/
 //!   natyv_set_value/natyv_get_value/natyv_destroy_widget all work unchanged
 //!   on Clay-created widgets too, since they're the same underlying Widget
@@ -83,6 +88,13 @@
 //! as every other value-bearing kind -- the asymmetry is only in how the
 //! *common* case (dragging) gets reported, not in the create/get/set wire
 //! contract itself.
+//!
+//! W4: a dropdown/select needs no new widget kind or host function at all
+//! -- it's composed entirely from existing kinds (a Button trigger, a
+//! `floating: true` Container holding Button/Label option rows), the same
+//! guest-authored-composition pattern RadioButton groups and bookstore's
+//! book list already use. The only new surface is the `floating` layout
+//! flag above.
 
 const std = @import("std");
 const Io = std.Io;
@@ -205,6 +217,13 @@ pub const ClayStyle = struct {
     /// extra needs to be stored per-slot beyond these two flags.
     scroll_vertical: bool = false,
     scroll_horizontal: bool = false,
+    /// W4: layers this element (and everything nested under it) over the
+    /// top of normal content instead of taking part in its parent's normal
+    /// flex flow -- see ClayLayout.zig's openChildren for how this becomes
+    /// a real Clay_FloatingElementConfig, and FloatingOrder.zig/main.zig
+    /// for how natyv's own draw order and click hit-testing account for it
+    /// (Clay itself has no opinion on either -- it only computes position).
+    floating: bool = false,
 };
 
 pub const Slot = struct {
@@ -745,6 +764,7 @@ const ClayLayoutRequest = struct {
     child_alignment: ClayAlignmentRequest = .{},
     scroll_vertical: bool = false,
     scroll_horizontal: bool = false,
+    floating: bool = false,
 };
 const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{} };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
@@ -787,6 +807,7 @@ fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
         },
         .scroll_vertical = req.scroll_vertical,
         .scroll_horizontal = req.scroll_horizontal,
+        .floating = req.floating,
     };
 }
 
