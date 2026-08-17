@@ -5,6 +5,8 @@ const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const Slider = @import("widgets/Slider.zig");
+const TextField = @import("widgets/TextField.zig");
+const json_util = @import("json_util.zig");
 const ClayLayout = @import("capabilities/ClayLayout.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
@@ -24,7 +26,20 @@ const max_widgets_on_screen = WidgetHost.max_widgets;
 /// composition). Kept as a free function taking everything explicitly
 /// rather than a closure, since Zig's nested functions can't capture outer
 /// locals.
-fn updateFocus(widgets: *WidgetHost, io: std.Io, window: *c.SDL_Window, focused_widget_id: *?u32, new_id: ?u32) void {
+///
+/// W6: also fires `.blur` to whatever was previously focused, when focus
+/// actually changes away from it (re-clicking the same already-focused
+/// widget, or `new_id` genuinely equal to the old one, isn't a blur).
+/// Fired for any widget kind, not just textfields -- simpler than
+/// special-casing, and harmless for a guest that never registered a
+/// handler for it, same "host fires generically, guest decides relevance"
+/// precedent every other event type here already follows.
+fn updateFocus(widgets: *WidgetHost, io: std.Io, window: *c.SDL_Window, queue: *EventQueue, slots: []const WidgetHost.Slot, focused_widget_id: *?u32, new_id: ?u32) void {
+    if (focused_widget_id.*) |old_id| {
+        if (new_id == null or old_id != new_id.?) {
+            queue.push(io, old_id, .blur, "", FloatingOrder.surfaceIdFor(slots, old_id));
+        }
+    }
     const is_textfield = widgets.setFocused(io, new_id);
     focused_widget_id.* = new_id;
     if (is_textfield) {
@@ -79,6 +94,25 @@ fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u
     var buf: [32]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{clamped}) catch "{}";
     queue.push(io, id, .change, json, surface_id);
+}
+
+/// W6: the TextField counterpart to `notifySliderValue` -- called after
+/// `appendTextTo`/`backspaceOn` already mutated the widget and copied its
+/// real post-mutation text into `new_text`. Unlike the slider's payload
+/// (a bare float, safe to `bufPrint` directly), arbitrary typed text needs
+/// real JSON string escaping -- reuses `json_util.writeString`, the same
+/// escaping `Dispatch.zig`'s own payload-wrapping already relies on, over a
+/// stack-based `FixedBufferAllocator` so this stays allocation-free like
+/// every other per-frame push site here.
+fn notifyTextChanged(queue: *EventQueue, io: std.Io, id: u32, new_text: []const u8, slots: []const WidgetHost.Slot) void {
+    var buf: [TextField.max_len + 16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(a, "{\"text\":") catch return;
+    json_util.writeString(&out, a, new_text) catch return;
+    out.append(a, '}') catch return;
+    queue.push(io, id, .text_changed, out.items, FloatingOrder.surfaceIdFor(slots, id));
 }
 
 /// W4: the per-kind mouse-hit body every `SDL_EVENT_MOUSE_BUTTON_DOWN`
@@ -413,7 +447,7 @@ pub fn main(init: std.process.Init) !void {
                                 }
                             }
                         }
-                        updateFocus(&runtime.widgets, io, window, &focused_widget_id, hit_focusable);
+                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &focused_widget_id, hit_focusable);
                     }
                 },
                 c.SDL_EVENT_MOUSE_BUTTON_UP => {
@@ -424,7 +458,12 @@ pub fn main(init: std.process.Init) !void {
                     if (event.button.button == c.SDL_BUTTON_LEFT) dragging_slider_id = null;
                 },
                 c.SDL_EVENT_TEXT_INPUT => {
-                    if (focused_widget_id) |id| runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text));
+                    if (focused_widget_id) |id| {
+                        var text_buf: [TextField.max_len]u8 = undefined;
+                        if (runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text), &text_buf)) |n| {
+                            notifyTextChanged(&queue, io, id, text_buf[0..n], widget_snapshot[0..widget_count]);
+                        }
+                    }
                 },
                 c.SDL_EVENT_MOUSE_WHEEL => {
                     // Not negated: confirmed against real hardware (Quinn's
@@ -436,13 +475,18 @@ pub fn main(init: std.process.Init) !void {
                     pending_scroll_dy += event.wheel.y * wheel_pixels_per_notch;
                 },
                 c.SDL_EVENT_KEY_DOWN => switch (event.key.key) {
-                    c.SDLK_BACKSPACE => if (focused_widget_id) |id| runtime.widgets.backspaceOn(io, id),
+                    c.SDLK_BACKSPACE => if (focused_widget_id) |id| {
+                        var text_buf: [TextField.max_len]u8 = undefined;
+                        if (runtime.widgets.backspaceOn(io, id, &text_buf)) |n| {
+                            notifyTextChanged(&queue, io, id, text_buf[0..n], widget_snapshot[0..widget_count]);
+                        }
+                    },
                     c.SDLK_TAB => {
                         var focusable_ids: [max_widgets_on_screen]u32 = undefined;
                         const focusable_count = runtime.widgets.focusableIdsSorted(io, &focusable_ids);
                         const forward = (event.key.mod & c.SDL_KMOD_SHIFT) == 0;
                         const next = WidgetHost.nextFocusable(focusable_ids[0..focusable_count], focused_widget_id, forward);
-                        updateFocus(&runtime.widgets, io, window, &focused_widget_id, next);
+                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &focused_widget_id, next);
                     },
                     c.SDLK_RETURN, c.SDLK_KP_ENTER, c.SDLK_SPACE => {
                         // Activates a focused Button/Checkbox/RadioButton --
@@ -455,6 +499,16 @@ pub fn main(init: std.process.Init) !void {
                             for (widget_snapshot[0..widget_count]) |slot| {
                                 if (slot.id == id) {
                                     activateWidget(&runtime.widgets, io, &queue, id, std.meta.activeTag(slot.widget), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                                    // W6: Enter (not Space -- that must keep
+                                    // inserting a literal space) additionally
+                                    // signals "select the highlighted
+                                    // combobox option" when the focused
+                                    // widget is a textfield -- activateWidget
+                                    // itself no-ops for .textfield, this is
+                                    // genuinely additional, not a replacement.
+                                    if (slot.widget == .textfield and event.key.key != c.SDLK_SPACE) {
+                                        queue.push(io, id, .key_nav, "{\"key\":\"enter\"}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                                    }
                                 }
                             }
                         }
@@ -467,25 +521,50 @@ pub fn main(init: std.process.Init) !void {
                     c.SDLK_ESCAPE => if (topmost_modal) |modal_id| {
                         queue.push(io, modal_id, .dismiss, "", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], modal_id));
                     } else {
-                        updateFocus(&runtime.widgets, io, window, &focused_widget_id, null);
+                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &focused_widget_id, null);
                     },
                     // W3: nudges the *focused* widget's value if it's a
                     // slider -- confirmed unbound by anything else in this
                     // switch today, so safe to add unconditionally; a no-op
                     // when nothing focused or the focused widget isn't a
                     // slider (`notifySliderValue`/`setSliderValue` both
-                    // handle that, see their doc comments).
-                    c.SDLK_LEFT, c.SDLK_DOWN => if (focused_widget_id) |id| {
+                    // handle that, see their doc comments). Left/Right were
+                    // split off from Down/Up (W6, previously grouped
+                    // together as "decrement"/"increment") so Down/Up alone
+                    // could *also* mean "move the combobox highlight" for a
+                    // focused textfield, without Left/Right picking up that
+                    // meaning too -- Left/Right are deliberately left
+                    // reserved/unused for a textfield today (e.g. a future
+                    // cursor-position feature), not repurposed.
+                    c.SDLK_LEFT => if (focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             }
                         }
                     },
-                    c.SDLK_RIGHT, c.SDLK_UP => if (focused_widget_id) |id| {
+                    c.SDLK_RIGHT => if (focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            }
+                        }
+                    },
+                    c.SDLK_DOWN => if (focused_widget_id) |id| {
+                        for (widget_snapshot[0..widget_count]) |slot| {
+                            if (slot.id == id and slot.widget == .slider) {
+                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            } else if (slot.id == id and slot.widget == .textfield) {
+                                queue.push(io, id, .key_nav, "{\"key\":\"down\"}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            }
+                        }
+                    },
+                    c.SDLK_UP => if (focused_widget_id) |id| {
+                        for (widget_snapshot[0..widget_count]) |slot| {
+                            if (slot.id == id and slot.widget == .slider) {
+                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            } else if (slot.id == id and slot.widget == .textfield) {
+                                queue.push(io, id, .key_nav, "{\"key\":\"up\"}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             }
                         }
                     },

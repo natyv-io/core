@@ -19,7 +19,15 @@ const Self = @This();
 /// backdrop click -- discrete like `.click` (always appended, never
 /// coalesced), since a guest deciding "should I actually close" needs
 /// every request, not just the latest.
-pub const EventType = enum { click, change, dismiss };
+///
+/// W6: `.text_changed` is the second continuous type (payload
+/// `{"text":"..."}`) -- fired after every TextField edit, coalesced like
+/// `.change` (a fast typer or a paste can append several times in one
+/// frame; only the latest full text matters). `.blur` (fired to whatever
+/// widget just lost focus) and `.key_nav` (fired to a focused TextField on
+/// Up/Down/Enter, payload `{"key":"up"|"down"|"enter"}`) are both discrete
+/// like `.click`/`.dismiss` -- never coalesced, every one matters.
+pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav };
 
 pub const Entry = struct {
     widget_id: u32,
@@ -65,16 +73,20 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
 
     // W3: coalesce with an already-queued (not yet popped -- `pop` removes
     // immediately via `orderedRemove`, so this can never merge with
-    // something already delivered) `.change` entry for the same widget,
-    // overwriting its payload in place rather than appending a second one.
-    if (event_type == .change) {
+    // something already delivered) entry of the *same* continuous type for
+    // the same widget, overwriting its payload in place rather than
+    // appending a second one. W6: `.text_changed` joins `.change` as a
+    // second continuous type -- matched against `event_type` itself (not
+    // hardcoded to `.change`) so the two families never cross-coalesce
+    // with each other.
+    if (event_type == .change or event_type == .text_changed) {
         for (self.items.items) |*existing| {
-            if (existing.widget_id == widget_id and existing.event_type == .change) {
+            if (existing.widget_id == widget_id and existing.event_type == event_type) {
                 self.allocator.free(existing.payload);
                 existing.payload = owned;
                 self.seq_counter += 1;
                 existing.seq = self.seq_counter;
-                std.debug.print("[queue]  coalesced    widget={d} type=change seq={d} (qlen={d})\n", .{ widget_id, existing.seq, self.items.items.len });
+                std.debug.print("[queue]  coalesced    widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), existing.seq, self.items.items.len });
                 self.cond.signal(io);
                 return;
             }
@@ -202,6 +214,51 @@ test "dismiss events for the same widget are never coalesced, matching click" {
     queue.push(io, 1, .dismiss, "", 0);
     queue.push(io, 1, .dismiss, "", 0);
     try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
+}
+
+test "text_changed events for the same widget coalesce to the latest payload" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .text_changed, "{\"text\":\"h\"}", 0);
+    queue.push(io, 1, .text_changed, "{\"text\":\"hi\"}", 0);
+    try std.testing.expectEqual(@as(usize, 1), queue.items.items.len);
+    try std.testing.expectEqualStrings("{\"text\":\"hi\"}", queue.items.items[0].payload);
+}
+
+test "change and text_changed for the same widget id don't cross-coalesce with each other" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .change, "a", 0);
+    queue.push(io, 1, .text_changed, "b", 0);
+    try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
+}
+
+test "blur and key_nav events are never coalesced, matching click/dismiss" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .blur, "", 0);
+    queue.push(io, 1, .blur, "", 0);
+    queue.push(io, 1, .key_nav, "{\"key\":\"down\"}", 0);
+    queue.push(io, 1, .key_nav, "{\"key\":\"down\"}", 0);
+    try std.testing.expectEqual(@as(usize, 4), queue.items.items.len);
 }
 
 test "push carries surface_id through to the popped entry" {

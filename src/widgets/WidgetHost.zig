@@ -579,7 +579,19 @@ pub fn snapshot(self: *Self, call_io: Io, out: []Slot) usize {
     return n;
 }
 
-pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8) void {
+/// W6: returns the number of bytes copied into `out` (`out.len >=
+/// TextField.max_len` required) -- the widget's real post-mutation text --
+/// or `null` if `id` isn't a textfield. `null`, not `0`, for the not-a-
+/// textfield case specifically because `0` is itself a real, meaningful
+/// result (backspacing the last character leaves an empty string, which
+/// still needs a `.text_changed` event) -- same "?T, not a T with an
+/// overloaded sentinel" shape `setSliderValue` (W3) established. Copying
+/// the text out here (rather than handing back a slice into the live,
+/// mutex-protected, guest-mutable-via-a-concurrent-`natyv_set_text`
+/// buffer) is deliberate, same reasoning `setSliderValue` documents for
+/// returning a value instead of a pointer. `main.zig` uses the copy to
+/// build a `.text_changed` event.
+pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     if (self.findLocked(id)) |slot| {
@@ -590,19 +602,28 @@ pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8) void {
             // needs to force a recompute. A legacy (non-Clay) textfield's
             // text has no effect on any Clay tree, so it shouldn't.
             if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textfield.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
         }
     }
+    return null;
 }
 
-pub fn backspaceOn(self: *Self, call_io: Io, id: u32) void {
+/// W6: see `appendTextTo`'s doc comment -- same shape.
+pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     if (self.findLocked(id)) |slot| {
         if (slot.widget == .textfield) {
             slot.widget.textfield.backspace();
             if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textfield.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
         }
     }
+    return null;
 }
 
 /// Sets `id` as the sole focused widget (clearing focus on every other

@@ -11,6 +11,7 @@ const timing = @import("timing.zig");
 const Manifest = @import("Manifest.zig");
 const SqliteCapability = @import("capabilities/Sqlite.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
+const json_util = @import("json_util.zig");
 // L1: Clay's own arena/BeginLayout/EndLayout lifecycle isn't wired into the
 // render loop yet (that's L4) -- a real test below calls its
 // proveTwoGrowChildrenSplitEvenly directly (see that test for why: a
@@ -174,9 +175,10 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
         }
     }
 
-    runtime.widgets.appendTextTo(io, author_id orelse return error.MissingAuthorField, "Frank Herbert");
-    runtime.widgets.appendTextTo(io, title_id orelse return error.MissingTitleField, "Dune");
-    runtime.widgets.appendTextTo(io, genre_id orelse return error.MissingGenreField, "Sci-Fi");
+    var text_scratch: [128]u8 = undefined;
+    _ = runtime.widgets.appendTextTo(io, author_id orelse return error.MissingAuthorField, "Frank Herbert", &text_scratch);
+    _ = runtime.widgets.appendTextTo(io, title_id orelse return error.MissingTitleField, "Dune", &text_scratch);
+    _ = runtime.widgets.appendTextTo(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
 
     var dispatch_buf: [128]u8 = undefined;
     var click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
@@ -322,19 +324,20 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 16, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 17, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
-    // button (1 more) + a W5 modal trigger button (1 more) -- 15 widgets
-    // total (the dropdown's floating panel and the modal's panel are both
-    // only created on demand, not by natyv_init -- see the W4/W5 tests
+    // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
+    // TextField (1 more) -- 16 widgets total (the dropdown's floating
+    // panel, the modal's panel, and the combobox's options panel are all
+    // only created on demand, not by natyv_init -- see the W4/W5/W6 tests
     // below). Same silent-truncation risk documented at W1's identical
     // bump from 4 to 8 -- snapshot() caps at out.len with no error, so
     // every clay-fixture-loading test's buffer needs auditing whenever
     // natyv_init grows, not just the test being extended.
-    var snap: [16]WidgetHost.Slot = undefined;
+    var snap: [17]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 15), n);
+    try std.testing.expectEqual(@as(usize, 16), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1232,5 +1235,170 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
         // hidden -- natyv has no "visible" concept, only exists/doesn't.
         try std.testing.expect(slot.id != pid);
         try std.testing.expect(slot.parent_id == null or slot.parent_id.? != pid);
+    }
+}
+
+/// W6: builds a real dispatch envelope the same shape `Dispatch.zig`'s
+/// `buildDispatchPayload` produces on the host side -- `payload_json` is
+/// embedded as a properly escaped JSON *string* (via `json_util.writeString`,
+/// the same helper `Dispatch.zig` itself uses), not a raw nested object,
+/// matching the real wire contract `event.Payload` on the guest side
+/// expects to `json.Unmarshal` a second time.
+fn buildDispatchEnvelope(buf: []u8, widget_id: u32, event_type: []const u8, payload_json: []const u8) ![]u8 {
+    var fba = std.heap.FixedBufferAllocator.init(buf);
+    const a = fba.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(a, "{{\"widget_id\":{d},\"event_type\":\"{s}\",\"payload\":", .{ widget_id, event_type });
+    try json_util.writeString(&out, a, payload_json);
+    try out.append(a, '}');
+    return out.items;
+}
+
+test "W6: a combobox's .text_changed re-filters, .key_nav moves the highlight and selects, through a real guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    // 24: natyv_init's 16 widgets (see the L3 test's comment above), plus
+    // this test opens the combobox's panel (up to 5 filtered options) --
+    // well within headroom, same silent-truncation risk documented at
+    // every prior buffer bump in this file.
+    var snap: [24]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var field_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        // Exactly one TextField exists in this fixture -- see natyv_init's
+        // own doc comments -- so matching by kind alone is unambiguous
+        // here, unlike the label-based matches W4/W5's tests need for
+        // Button (this fixture has several of those).
+        if (slot.widget == .textfield) field_id = slot.id;
+    }
+    const fid = field_id orelse return error.MissingComboField;
+    // Not yet open -- natyv_init only ever creates the TextField itself.
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != fid);
+    }
+
+    // Real guest-routed filter (natyv_clay_create_container/_button via
+    // natyv_dispatch's "text_changed" case -- renderComboOptions). "an"
+    // matches only "Banana" among the fixture's 5-item option list.
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try buildDispatchEnvelope(&dispatch_buf, fid, "text_changed", "{\"text\":\"an\"}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == fid and slot.widget == .container) panel_id = slot.id;
+    }
+    const pid = panel_id orelse return error.MissingComboPanel;
+
+    var option_id: ?u32 = null;
+    var option_count: usize = 0;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button) {
+            option_count += 1;
+            option_id = slot.id;
+            // W6 wire round-trip: no highlight marker yet -- text_changed
+            // resets comboHighlighted to -1 before re-rendering.
+            try std.testing.expectEqualStrings("Banana", slot.widget.button.label());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), option_count);
+    const oid = option_id orelse return error.MissingComboOption;
+
+    // Real guest-routed highlight move (natyv_set_text on the option via
+    // natyv_dispatch's "key_nav" -> "down" case, since destroy/recreate is
+    // how this fixture rebuilds the panel on every highlight move too).
+    payload = try buildDispatchEnvelope(&dispatch_buf, fid, "key_nav", "{\"key\":\"down\"}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button) {
+            try std.testing.expectEqualStrings("\xe2\x96\xb8 Banana", slot.widget.button.label());
+        }
+    }
+    // Destroyed and recreated (not just relabeled) on the highlight move,
+    // same "destroy old widgets, create new ones" pattern as everything
+    // else in this project -- the option's own id is not stable across it.
+    _ = oid;
+
+    // Real guest-routed select-and-close (natyv_set_text on the TextField
+    // + natyv_destroy_widget on the panel/option, via natyv_dispatch's
+    // "key_nav" -> "enter" case).
+    payload = try buildDispatchEnvelope(&dispatch_buf, fid, "key_nav", "{\"key\":\"enter\"}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    for (snap[0..n]) |slot| {
+        if (slot.id == fid) try std.testing.expectEqualStrings("Banana", slot.widget.textfield.text());
+        // The panel and its option must be gone entirely, not just
+        // hidden -- natyv has no "visible" concept, only exists/doesn't.
+        try std.testing.expect(slot.id != pid);
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != fid);
+    }
+}
+
+test "W6: a real .blur event closes the combobox panel without selecting anything" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [24]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var field_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .textfield) field_id = slot.id;
+    }
+    const fid = field_id orelse return error.MissingComboField;
+
+    var dispatch_buf: [256]u8 = undefined;
+    // "e" matches Cherry/Date/Elderberry -- several options, doesn't matter
+    // which for this test, only that the panel is genuinely open first.
+    var payload = try buildDispatchEnvelope(&dispatch_buf, fid, "text_changed", "{\"text\":\"e\"}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == fid and slot.widget == .container) panel_id = slot.id;
+    }
+    const pid = panel_id orelse return error.MissingComboPanel;
+
+    // Real guest-routed blur -- fired by main.zig's updateFocus to
+    // whatever widget just lost focus, on any focus change away from it
+    // (see updateFocus's W6 doc comment); synthesized here directly since
+    // this test only needs to prove the guest's own "e"vent -> close"
+    // wiring, not a real mouse click moving focus elsewhere.
+    payload = try buildDispatchEnvelope(&dispatch_buf, fid, "blur", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    for (snap[0..n]) |slot| {
+        // No selection happened -- the TextField's own text is still
+        // whatever it started as (empty, natyv_init never sets one).
+        if (slot.id == fid) try std.testing.expectEqualStrings("", slot.widget.textfield.text());
+        try std.testing.expect(slot.id != pid);
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != fid);
     }
 }

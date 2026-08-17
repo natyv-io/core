@@ -8,7 +8,7 @@ const c = @import("../c.zig").c;
 
 const Self = @This();
 
-const max_len = 127;
+pub const max_len = 127;
 const max_placeholder_len = 63;
 
 rect: c.SDL_FRect,
