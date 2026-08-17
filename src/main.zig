@@ -35,10 +35,25 @@ const max_widgets_on_screen = WidgetHost.max_widgets;
 /// special-casing, and harmless for a guest that never registered a
 /// handler for it, same "host fires generically, guest decides relevance"
 /// precedent every other event type here already follows.
+///
+/// W9 follow-up (Quinn's real click-through feedback): the payload now
+/// carries `new_focus_id` (0 = none) -- a real gap found via Menu's
+/// submenu, not just a nice-to-have. Clicking "More" to open a submenu
+/// moves focus onto "More" itself, which (since it differs from the
+/// previously-focused top-level trigger) fires a genuine `.blur` on the
+/// trigger in the very same frame, right after the "More" click's own
+/// `.click` already opened the submenu -- without knowing *what* focus
+/// moved to, a guest's blur handler can't tell "focus moved to something
+/// that's still part of my own menu" (should NOT close) apart from "focus
+/// moved somewhere unrelated" (a real click-away, should close), and
+/// blindly closing on every blur was destroying the submenu the same
+/// frame it opened.
 fn updateFocus(widgets: *WidgetHost, io: std.Io, window: *c.SDL_Window, queue: *EventQueue, slots: []const WidgetHost.Slot, focused_widget_id: *?u32, new_id: ?u32) void {
     if (focused_widget_id.*) |old_id| {
         if (new_id == null or old_id != new_id.?) {
-            queue.push(io, old_id, .blur, "", FloatingOrder.surfaceIdFor(slots, old_id));
+            var buf: [32]u8 = undefined;
+            const payload = std.fmt.bufPrint(&buf, "{{\"new_focus_id\":{d}}}", .{new_id orelse 0}) catch "{}";
+            queue.push(io, old_id, .blur, payload, FloatingOrder.surfaceIdFor(slots, old_id));
         }
     }
     const is_textfield = widgets.setFocused(io, new_id);
@@ -114,6 +129,24 @@ fn notifyTextChanged(queue: *EventQueue, io: std.Io, id: u32, new_text: []const 
     json_util.writeString(&out, a, new_text) catch return;
     out.append(a, '}') catch return;
     queue.push(io, id, .text_changed, out.items, FloatingOrder.surfaceIdFor(slots, id));
+}
+
+/// Pure per-kind geometry check, factored out of `tryHitWidget`'s switch
+/// below -- W9 follow-up: needed by the floating-content pre-scan (see the
+/// mouse-down handler below) to find which currently-open floating subtree
+/// actually contains a click point *before* any side effect (activateWidget's
+/// `.click` push, starting a slider drag) fires for anything, so overlapping
+/// floating panels (e.g. Menu's submenu, stacked on top of its own
+/// still-open parent panel) can be ranked without double-firing.
+fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
+    return switch (widget) {
+        .button => |b| b.containsPoint(mx, my),
+        .checkbox => |cb| cb.containsPoint(mx, my),
+        .radio_button => |r| r.containsPoint(mx, my),
+        .textfield => |t| t.containsPoint(mx, my),
+        .slider => |s| s.containsPoint(mx, my),
+        .label, .container, .progress_bar => false,
+    };
 }
 
 /// W4: the per-kind mouse-hit body every `SDL_EVENT_MOUSE_BUTTON_DOWN`
@@ -444,8 +477,46 @@ pub fn main(init: std.process.Init) !void {
                             // normal pass is skipped entirely so a click on a
                             // floating option can't also fire whatever's
                             // visually underneath it.
+                            //
+                            // W9 follow-up (Quinn's real click-through
+                            // feedback): a real gap, not just Menu-specific --
+                            // several floating subtrees can be open at once
+                            // (e.g. Menu's submenu, stacked on top of its own
+                            // still-open parent panel) and, since
+                            // `WidgetHost.slots` is a fixed-size array reused
+                            // first-fit on destroy, a widget's position in
+                            // this snapshot has *no* relationship to creation
+                            // order -- so simply running every floating
+                            // widget's `tryHitWidget` in snapshot order could
+                            // fire a real, side-effecting `.click` for *both*
+                            // an overlapping submenu item and whatever
+                            // top-level item sits underneath it at the same
+                            // point, not just whichever happened to match
+                            // last. Fixed with a pure pre-scan (no side
+                            // effects -- see `widgetContainsPoint`) that finds
+                            // the highest `nearestFloatingRoot` among floating
+                            // widgets the click point actually lands on
+                            // (`FloatingOrder.nearestFloatingRoot`'s doc
+                            // comment: higher id = opened more recently = the
+                            // topmost overlapping subtree), then only that
+                            // subtree's widgets go through the real,
+                            // side-effecting `tryHitWidget` pass below -- a
+                            // widget belonging to a lower (older) floating
+                            // root that happens to geometrically overlap the
+                            // click point is skipped entirely, not just
+                            // outrun by a later match.
+                            var topmost_floating_root: ?u32 = null;
                             for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
                                 if (!floating) continue;
+                                if (!widgetContainsPoint(slot.widget, mx, my)) continue;
+                                const root = FloatingOrder.nearestFloatingRoot(widget_snapshot[0..widget_count], slot.id) orelse continue;
+                                if (topmost_floating_root == null or root > topmost_floating_root.?) topmost_floating_root = root;
+                            }
+                            for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
+                                if (!floating) continue;
+                                if (topmost_floating_root) |root| {
+                                    if (FloatingOrder.nearestFloatingRoot(widget_snapshot[0..widget_count], slot.id) != root) continue;
+                                }
                                 if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
                             }
                             if (hit_focusable == null) {
@@ -539,11 +610,12 @@ pub fn main(init: std.process.Init) !void {
                     // handle that, see their doc comments). Left/Right were
                     // split off from Down/Up (W6, previously grouped
                     // together as "decrement"/"increment") so Down/Up alone
-                    // could *also* mean "move the combobox highlight" for a
-                    // focused textfield, without Left/Right picking up that
-                    // meaning too -- Left/Right are deliberately left
-                    // reserved/unused for a textfield today (e.g. a future
-                    // cursor-position feature), not repurposed.
+                    // could *also* mean "move the highlight" for a focused
+                    // textfield (Combobox, W6) or Button (Menu, W9),
+                    // without Left/Right picking up that meaning too --
+                    // Left/Right are deliberately left reserved/unused for
+                    // either kind today (e.g. a future cursor-position
+                    // feature), not repurposed.
                     c.SDLK_LEFT => if (focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
@@ -562,7 +634,13 @@ pub fn main(init: std.process.Init) !void {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
-                            } else if (slot.id == id and slot.widget == .textfield) {
+                            } else if (slot.id == id and (slot.widget == .textfield or slot.widget == .button)) {
+                                // W9: widened from textfield-only (W6, for
+                                // Combobox) to also cover a focused Button
+                                // -- a Menu trigger or submenu-triggering
+                                // item uses this exact same mechanism to
+                                // move its own highlight, no new host
+                                // concept needed.
                                 queue.push(io, id, .key_nav, "{\"key\":\"down\"}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             }
                         }
@@ -571,7 +649,7 @@ pub fn main(init: std.process.Init) !void {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
-                            } else if (slot.id == id and slot.widget == .textfield) {
+                            } else if (slot.id == id and (slot.widget == .textfield or slot.widget == .button)) {
                                 queue.push(io, id, .key_nav, "{\"key\":\"up\"}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             }
                         }

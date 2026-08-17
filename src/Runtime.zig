@@ -434,23 +434,24 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 19, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 20, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
     // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
     // TextField (1 more) + a W7 toast trigger button and the persistent
-    // toast-stack container (2 more) -- 18 widgets total (the dropdown's
-    // floating panel, the modal's panel, and the combobox's options panel
+    // toast-stack container (2 more) + a W9 menu trigger button (1 more)
+    // -- 19 widgets total (the dropdown's floating panel, the modal's
+    // panel, the combobox's options panel, and the menu's panel/submenu
     // are all only created on demand, not by natyv_init -- see the
-    // W4/W5/W6/W7 tests below; the toast stack itself IS created here,
+    // W4/W5/W6/W7/W9 tests below; the toast stack itself IS created here,
     // unlike those, but individual toasts inside it aren't). Same
     // silent-truncation risk documented at W1's identical bump from 4 to
     // 8 -- snapshot() caps at out.len with no error, so every
     // clay-fixture-loading test's buffer needs auditing whenever
     // natyv_init grows, not just the test being extended.
-    var snap: [19]WidgetHost.Slot = undefined;
+    var snap: [20]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 18), n);
+    try std.testing.expectEqual(@as(usize, 19), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1601,4 +1602,340 @@ test "W7: a toast round-trips duration_ms into a real expires_at_ms, and destroy
     try std.testing.expect(!found_toast);
     try std.testing.expect(!found_message);
     try std.testing.expect(found_stack);
+}
+
+test "W9: a menu's nested submenu positions correctly, each level's key_nav is independently scoped, and selecting a submenu item closes both levels" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    // Real layout pass, same reasoning W5's own test documents: proving
+    // "positions correctly" as anything more than a trivial {0,0}-equals-
+    // {0,0} coincidence needs a real Clay recompute, not just a snapshot.
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    // 30: natyv_init's 19 widgets (see the L3 test's comment above), plus
+    // this test opens the top-level menu (panel + 3 items = 4 more) and
+    // the submenu (panel + 2 items = 3 more) -- 26 at peak. Same
+    // silent-truncation risk documented at every prior buffer bump in
+    // this file.
+    var snap: [30]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Menu")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingMenuTrigger;
+
+    // Real guest-routed open (natyv_clay_create_container with
+    // floating:true, via natyv_dispatch -- openMenu).
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    var more_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) panel_id = slot.id;
+    }
+    const pid = panel_id orelse return error.MissingMenuPanel;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "More \xe2\x96\xb8")) more_id = slot.id;
+    }
+    var mid = more_id orelse return error.MissingMoreItem;
+
+    // W9 follow-up regression test: pressing Enter while "More ▸" is
+    // highlighted must open the submenu -- Enter never produces a
+    // separate `.key_nav` "enter" event for a focused Button (that stays
+    // gated to `.textfield` only), it always produces this same `.click`
+    // on the focused widget (main.zig's SDLK_RETURN handling), so
+    // synthesizing that `.click` on the trigger is exactly what a real
+    // Enter keypress sends. Caught via Quinn's real click-through: the
+    // previous version ignored menuHighlighted and just toggled the whole
+    // menu closed instead of opening the submenu. "More ▸" is the 2nd
+    // top-level item (index 1), so two "down" presses reach it
+    // (-1 -> 0 -> 1).
+    var dispatch_buf: [256]u8 = undefined;
+    var payload: []u8 = undefined;
+    for (0..2) |_| {
+        payload = try buildDispatchEnvelope(&dispatch_buf, tid, "key_nav", "{\"key\":\"down\"}");
+        _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    }
+    // Each "down" press re-renders (destroys/recreates, same as
+    // Combobox's own highlight moves) *every* top-level item, including
+    // "More ▸" itself -- its widget id captured above is stale by now, so
+    // it must be looked up fresh before this test can reference it again.
+    // A fresh layoutIfNeeded pass is required too: the recreated widgets
+    // don't get a real Clay-computed rect until layout runs again, so
+    // reading rect before this would capture a stale/default (0,0) rect
+    // rather than "More ▸"'s actual on-screen position.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "\xe2\x96\xb8 More \xe2\x96\xb8")) mid = slot.id;
+    }
+    const more_rect = for (snap[0..n]) |slot| {
+        if (slot.id == mid) break slot.widget.button.rect;
+    } else return error.MissingMoreItem;
+
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var submenu_opened_via_enter = false;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == mid and slot.widget == .container) submenu_opened_via_enter = true;
+    }
+    try std.testing.expect(submenu_opened_via_enter);
+
+    // Close *just* the submenu back down (a real click on "More ▸" itself
+    // -- submenuHighlighted is -1 right after opening, so this hits the
+    // click handler's `default: closeSubmenu()` branch) -- the top-level
+    // panel (pid) and "More ▸" (mid) stay intact, so the rest of this
+    // test can continue via the ordinary real-mouse-click flow below,
+    // completely unaffected by this regression check.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{mid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+
+    // Real guest-routed submenu open -- a real click on "More ▸" (not a
+    // hand-built shortcut), proving the click actually routes to the
+    // right widget, not just that openSubmenu itself works.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{mid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var submenu_panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == mid and slot.widget == .container) submenu_panel_id = slot.id;
+    }
+    const spid = submenu_panel_id orelse return error.MissingSubmenuPanel;
+
+    var sub_item_count: usize = 0;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == spid and slot.widget == .button) sub_item_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), sub_item_count);
+
+    // Both levels exist simultaneously (real cascading behavior, not
+    // replace-in-place) with real, distinct Clay-computed positions --
+    // the actual proof nesting positions correctly, not just "doesn't
+    // crash." The submenu is parented to (and thus, per its floating
+    // attach config, positioned below) the "More ▸" item specifically,
+    // not the top-level trigger.
+    for (snap[0..n]) |slot| {
+        if (slot.id == spid) {
+            try std.testing.expectApproxEqAbs(more_rect.x, slot.widget.container.rect.x, 0.5);
+            try std.testing.expectApproxEqAbs(more_rect.y + more_rect.h, slot.widget.container.rect.y, 0.5);
+        }
+    }
+
+    // W9 regression test: a real mouse click on "More ▸" (as sent above)
+    // also moves focus onto it, which fires a genuine `.blur` on the
+    // previously-focused top-level trigger in the very same frame --
+    // `natyv_dispatch` calls in this test only ever send the one event
+    // asked for, so this synthesizes the accompanying `.blur` a real
+    // click through main.zig's actual event loop would also send (see
+    // updateFocus), the same shape `.click` itself already has here.
+    // Caught via Quinn's real click-through: without checking where focus
+    // actually went, this blur used to destroy the submenu the same
+    // frame it opened.
+    var blur_payload_buf: [64]u8 = undefined;
+    const blur_payload = try std.fmt.bufPrint(&blur_payload_buf, "{{\"new_focus_id\":{d}}}", .{mid});
+    payload = try buildDispatchEnvelope(&dispatch_buf, tid, "blur", blur_payload);
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var submenu_survived_blur = false;
+    for (snap[0..n]) |slot| {
+        if (slot.id == spid) submenu_survived_blur = true;
+    }
+    try std.testing.expect(submenu_survived_blur);
+
+    // Real guest-routed highlight move, scoped to the submenu specifically
+    // (natyv_dispatch's "key_nav" case targeting moreItemID, not
+    // menuTriggerID) -- proving per-level scoping actually works, not
+    // accidentally cycling the top-level items instead.
+    payload = try buildDispatchEnvelope(&dispatch_buf, mid, "key_nav", "{\"key\":\"down\"}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var other_top_level_marker_found = false;
+    var more_still_marked = false;
+    var submenu_marker_found = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .button) continue;
+        if (slot.parent_id != null and slot.parent_id.? == pid and std.mem.indexOf(u8, slot.widget.button.label(), "\xe2\x96\xb8 ") != null) {
+            if (slot.id == mid) more_still_marked = true else other_top_level_marker_found = true;
+        }
+        if (slot.parent_id != null and slot.parent_id.? == spid and std.mem.eql(u8, slot.widget.button.label(), "\xe2\x96\xb8 Sub A")) submenu_marker_found = true;
+    }
+    // Only the submenu's own highlight moved -- the top level's own
+    // highlight (still on "More ▸", from before its submenu was even
+    // opened) is untouched: neither cleared nor moved to a different
+    // top-level item.
+    try std.testing.expect(submenu_marker_found);
+    try std.testing.expect(more_still_marked);
+    try std.testing.expect(!other_top_level_marker_found);
+
+    // Real guest-routed select-and-close-everything (natyv_set_text on
+    // the trigger + natyv_destroy_widget on every widget at both levels,
+    // via natyv_dispatch -- selectSubmenuItem/closeMenu). The submenu's
+    // "Sub A" button was just destroyed/recreated by the key_nav-driven
+    // re-render above (same as Combobox), so its widget id must be looked
+    // up fresh from the latest snapshot rather than an id captured
+    // earlier in this test.
+    var live_sub_a_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == spid and slot.widget == .button and std.mem.indexOf(u8, slot.widget.button.label(), "Sub A") != null) live_sub_a_id = slot.id;
+    }
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{live_sub_a_id orelse return error.MissingLiveSubA});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    // Compared inline, not stored for after the loop -- `slot` is a
+    // per-iteration copy, and a slice from `slot.widget.button.label()`
+    // (into that copy's own `label_buf` field) would dangle once the loop
+    // moves past this iteration, same lesson every other test in this
+    // file's "set a bool inside the loop, check the bool after" pattern
+    // already avoids.
+    var trigger_relabeled = false;
+    var any_menu_widgets_remain = false;
+    for (snap[0..n]) |slot| {
+        if (slot.id == tid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Menu: Sub A")) trigger_relabeled = true;
+        if (slot.id == pid or slot.id == spid) any_menu_widgets_remain = true;
+        if (slot.parent_id) |parent| {
+            if (parent == pid or parent == spid) any_menu_widgets_remain = true;
+        }
+    }
+    try std.testing.expect(trigger_relabeled);
+    // Both levels fully gone -- closeMenu() always closes the entire
+    // cascade, not just the innermost one.
+    try std.testing.expect(!any_menu_widgets_remain);
+
+    // W9 follow-up regression test: with the submenu opened via Enter
+    // (a synthesized `.click` on the still-focused trigger, same as the
+    // "submenu_opened_via_enter" check above), pressing "down" must move
+    // the *submenu's* highlight -- not the top-level's. Real bug caught
+    // via Quinn's click-through: key_nav kept landing on tid (focus never
+    // moves to moreItemID unless a real mouse click -- not Enter's
+    // synthesized one -- hits it via main.zig's hit-test-driven
+    // updateFocus), so arrow keys cycled the top-level highlight instead,
+    // which is invisible behind the now-open submenu and looked like
+    // arrow keys "did nothing." Self-contained: opens a fresh menu from
+    // scratch (everything above was just fully torn down) rather than
+    // reusing any state from earlier in this test.
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+    var reopened_pid: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) reopened_pid = slot.id;
+    }
+    const rpid = reopened_pid orelse return error.MissingMenuPanel;
+
+    for (0..2) |_| {
+        payload = try buildDispatchEnvelope(&dispatch_buf, tid, "key_nav", "{\"key\":\"down\"}");
+        _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    }
+    n = runtime.widgets.snapshot(io, &snap);
+    var reopened_mid: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == rpid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "\xe2\x96\xb8 More \xe2\x96\xb8")) reopened_mid = slot.id;
+    }
+    const rmid = reopened_mid orelse return error.MissingMoreItem;
+
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    var reopened_spid: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == rmid and slot.widget == .container) reopened_spid = slot.id;
+    }
+    const rspid = reopened_spid orelse return error.MissingSubmenuPanel;
+
+    payload = try buildDispatchEnvelope(&dispatch_buf, tid, "key_nav", "{\"key\":\"down\"}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var submenu_marker_found_after_enter_open = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and slot.parent_id != null and slot.parent_id.? == rspid and std.mem.eql(u8, slot.widget.button.label(), "\xe2\x96\xb8 Sub A")) submenu_marker_found_after_enter_open = true;
+    }
+    try std.testing.expect(submenu_marker_found_after_enter_open);
+
+    // W9 follow-up regression test: pressing Enter (a synthesized `.click`
+    // on tid, still the focused widget -- the submenu opened via Enter, so
+    // focus never left the trigger) while a submenu item is highlighted
+    // must select it. Real bug caught via Quinn's click-through: without
+    // checking submenuPanelID first, this click kept re-matching
+    // `menuHighlighted == moreItemIndex` (still true -- opening the
+    // submenu never resets the top-level highlight) and silently
+    // re-opened the (already-open) submenu instead of ever reaching
+    // selectSubmenuItem, making Enter look like it did nothing.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_relabeled_via_submenu_enter = false;
+    var menu_widgets_remain_after_submenu_enter = false;
+    for (snap[0..n]) |slot| {
+        if (slot.id == tid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Menu: Sub A")) trigger_relabeled_via_submenu_enter = true;
+        if (slot.id == rpid or slot.id == rspid) menu_widgets_remain_after_submenu_enter = true;
+        if (slot.parent_id) |parent| {
+            if (parent == rpid or parent == rspid) menu_widgets_remain_after_submenu_enter = true;
+        }
+    }
+    try std.testing.expect(trigger_relabeled_via_submenu_enter);
+    try std.testing.expect(!menu_widgets_remain_after_submenu_enter);
+
+    // W9 follow-up regression test: the same "Enter selects the
+    // highlighted item" path, but for a plain top-level item (never
+    // touching the submenu at all) -- covers Quinn's other click-through
+    // report ("hitting enter on a top level selection ... doesn't select
+    // it"), and guards against a regression from the submenuPanelID
+    // branch just added above (it must never fire when the submenu was
+    // never opened). Self-contained: opens a fresh menu from scratch.
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    payload = try buildDispatchEnvelope(&dispatch_buf, tid, "key_nav", "{\"key\":\"down\"}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    var final_pid: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) final_pid = slot.id;
+    }
+    const fpid = final_pid orelse return error.MissingMenuPanel;
+
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_relabeled_via_top_level_enter = false;
+    var menu_widgets_remain_after_top_level_enter = false;
+    for (snap[0..n]) |slot| {
+        if (slot.id == tid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Menu: Open")) trigger_relabeled_via_top_level_enter = true;
+        if (slot.id == fpid) menu_widgets_remain_after_top_level_enter = true;
+        if (slot.parent_id) |parent| {
+            if (parent == fpid) menu_widgets_remain_after_top_level_enter = true;
+        }
+    }
+    try std.testing.expect(trigger_relabeled_via_top_level_enter);
+    try std.testing.expect(!menu_widgets_remain_after_top_level_enter);
 }

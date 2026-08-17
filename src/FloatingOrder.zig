@@ -44,6 +44,37 @@ fn isFloatingOrDescendant(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot)
     return false;
 }
 
+/// The id of `id`'s nearest (innermost) floating/modal/toast ancestor, or
+/// `id` itself if it's directly floating/modal/toast, or `null` if `id` has
+/// no such ancestor at all. Unlike `isFloatingOrDescendant` (a plain bool),
+/// this identifies *which* floating subtree a widget belongs to.
+///
+/// W9 follow-up (Quinn's real click-through feedback): a real gap found via
+/// Menu's submenu. `WidgetHost.slots` is a fixed-size array reused
+/// first-fit on destroy (confirmed against source) -- a widget's position
+/// in a snapshot has *no* relationship to creation order, so the old
+/// "whichever floating widget matches last in iteration order" hit-test/
+/// draw behavior wasn't just imprecise, it was arbitrary. This is the fix:
+/// `WidgetHost.next_id` is monotonic and never reused, so the
+/// nearest-floating-root id *is* a reliable recency signal -- a submenu
+/// (opened after, so its root's id is always higher than the parent panel
+/// it's nested inside) ranks above the content it visually overlaps. Used
+/// by main.zig to resolve overlapping floating subtrees for both hit-
+/// testing (so a submenu click can't also register on whatever's visually
+/// underneath it) and draw order (so that stays true of what's drawn on
+/// top, not just what's clickable).
+pub fn nearestFloatingRoot(slots: []const WidgetHost.Slot, id: u32) ?u32 {
+    const slot = findSlot(slots, id) orelse return null;
+    if (slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) return slot.id;
+    var current = slot.parent_id;
+    while (current) |pid| {
+        const parent = findSlot(slots, pid) orelse break;
+        if (parent.clay_style.floating or parent.clay_style.modal or parent.clay_style.toast) return parent.id;
+        current = parent.parent_id;
+    }
+    return null;
+}
+
 /// The id of the topmost currently-open modal (highest id among widgets
 /// with `clay_style.modal == true`), or null if none is open. Relies on
 /// `WidgetHost.next_id` being monotonic and never reused (confirmed against
@@ -201,6 +232,38 @@ test "a toast stack container and its content are floating too, with no separate
     computeIsFloating(&slots, &out);
     try std.testing.expectEqual(true, out[0]);
     try std.testing.expectEqual(true, out[1]);
+}
+
+test "nearestFloatingRoot is null for a widget with no floating ancestor" {
+    var slots = [_]WidgetHost.Slot{ containerSlot(1, null, false), containerSlot(2, 1, false) };
+    try std.testing.expectEqual(@as(?u32, null), nearestFloatingRoot(&slots, 2));
+}
+
+test "nearestFloatingRoot returns the widget's own id when it's directly floating" {
+    var slots = [_]WidgetHost.Slot{
+        containerSlot(1, null, false), // trigger
+        containerSlot(2, 1, true), // floating panel
+    };
+    try std.testing.expectEqual(@as(?u32, 2), nearestFloatingRoot(&slots, 2));
+}
+
+test "nearestFloatingRoot picks the innermost floating ancestor, not the outermost" {
+    // Menu's own shape: a top-level floating panel (2), with an item (3)
+    // that opens a *nested* floating submenu (4) containing its own item
+    // (5). The submenu's item's nearest floating root must be the submenu
+    // (4) itself, not the top-level panel (2) it's also nested inside --
+    // this is what lets main.zig rank the submenu above the top-level
+    // panel it visually overlaps (4 > 2, since it was created later).
+    var slots = [_]WidgetHost.Slot{
+        containerSlot(1, null, false), // trigger
+        containerSlot(2, 1, true), // top-level floating panel
+        containerSlot(3, 2, false), // "More ▸" item, opens the submenu
+        containerSlot(4, 3, true), // nested floating submenu panel
+        containerSlot(5, 4, false), // an item inside the submenu
+    };
+    try std.testing.expectEqual(@as(?u32, 2), nearestFloatingRoot(&slots, 3));
+    try std.testing.expectEqual(@as(?u32, 4), nearestFloatingRoot(&slots, 4));
+    try std.testing.expectEqual(@as(?u32, 4), nearestFloatingRoot(&slots, 5));
 }
 
 test "topmostModalRoot is null when no modal is open" {
