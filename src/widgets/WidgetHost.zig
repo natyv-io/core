@@ -31,6 +31,7 @@
 //!   natyv_create_checkbox     in: {"x":f,"y":f,"w":f,"h":f,"label":"...","checked":bool}
 //!   natyv_create_radio_button in: {"x":f,"y":f,"w":f,"h":f,"label":"...","group_id":N,"checked":bool}
 //!   natyv_create_progressbar  in: {"x":f,"y":f,"w":f,"h":f,"value":f}
+//!   natyv_create_slider       in: {"x":f,"y":f,"w":f,"h":f,"value":f}
 //!     all out: {"widget_id":N} | {"error":"..."}
 //!   natyv_set_checked in: {"widget_id":N,"checked":bool}  out: {} | {"error":..}
 //!   natyv_get_checked in: {"widget_id":N}                 out: {"checked":bool} | {"error":..}
@@ -54,6 +55,7 @@
 //!   natyv_clay_create_checkbox     in: {"layout":{...},"label":"...","checked":bool}
 //!   natyv_clay_create_radio_button in: {"layout":{...},"label":"...","group_id":N,"checked":bool}
 //!   natyv_clay_create_progressbar  in: {"layout":{...},"value":f}
+//!   natyv_clay_create_slider       in: {"layout":{...},"value":f}
 //!     all out: {"widget_id":N} | {"error":"..."}
 //!   layout: {"parent_id":N|null,
 //!            "sizing":{"width":{"type":"fit"|"grow"|"fixed"|"percent","min":f,"max":f,"percent":f}, "height":{...}},
@@ -70,6 +72,17 @@
 //!   natyv_set_value/natyv_get_value/natyv_destroy_widget all work unchanged
 //!   on Clay-created widgets too, since they're the same underlying Widget
 //!   union -- only how a widget's rect gets computed differs.
+//!
+//! W3: Slider is natyv's first *host-authoritative* interactive widget --
+//! every kind above changes state because the guest called a
+//! natyv_set_* function; a slider's value normally changes because of a
+//! live mouse drag or arrow-key nudge main.zig owns, and the guest finds
+//! out *after the fact* via a new EventQueue "change" event (see
+//! EventQueue.zig), not by initiating the change itself. natyv_set_value/
+//! natyv_get_value still work on a slider too (e.g. to set a default), same
+//! as every other value-bearing kind -- the asymmetry is only in how the
+//! *common* case (dragging) gets reported, not in the create/get/set wire
+//! contract itself.
 
 const std = @import("std");
 const Io = std.Io;
@@ -83,16 +96,17 @@ const Container = @import("Container.zig");
 const Checkbox = @import("Checkbox.zig");
 const RadioButton = @import("RadioButton.zig");
 const ProgressBar = @import("ProgressBar.zig");
+const Slider = @import("Slider.zig");
 
 const Self = @This();
 
 pub const max_widgets = 64;
 // button/textfield/label create, set_text, get_text, destroy_widget (6) +
 // checkbox/radio_button/progress_bar create (3) + get_checked/set_checked/
-// get_value/set_value (4) -- W1 widget breadth.
-pub const host_function_count = 13;
+// get_value/set_value (4) -- W1 widget breadth. + slider create (1) -- W3.
+pub const host_function_count = 14;
 
-pub const WidgetKind = enum { button, textfield, label, container, checkbox, radio_button, progress_bar };
+pub const WidgetKind = enum { button, textfield, label, container, checkbox, radio_button, progress_bar, slider };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -101,6 +115,7 @@ pub const Widget = union(WidgetKind) {
     checkbox: Checkbox,
     radio_button: RadioButton,
     progress_bar: ProgressBar,
+    slider: Slider,
 
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
@@ -115,6 +130,7 @@ pub const Widget = union(WidgetKind) {
             .checkbox => |*cb| &cb.rect,
             .radio_button => |*r| &r.rect,
             .progress_bar => |*p| &p.rect,
+            .slider => |*s| &s.rect,
         };
     }
 
@@ -136,7 +152,10 @@ pub const Widget = union(WidgetKind) {
             // RadioButton.zig's doc comment explains why this opts out
             // entirely -- its checked state is an inset dot, not a
             // whole-rect fill.
-            .label, .container, .radio_button, .progress_bar => null,
+            // W3: Slider needs its own two-color (track + fill) custom draw
+            // in drawDecorations, same "opts out of the single-color batched
+            // fill" precedent ProgressBar already established.
+            .label, .container, .radio_button, .progress_bar, .slider => null,
         };
     }
 
@@ -146,7 +165,7 @@ pub const Widget = union(WidgetKind) {
     /// participate in Tab order.
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
-            .button, .textfield, .checkbox, .radio_button => true,
+            .button, .textfield, .checkbox, .radio_button, .slider => true,
             .label, .container, .progress_bar => false,
         };
     }
@@ -161,6 +180,7 @@ pub const Widget = union(WidgetKind) {
             .textfield => |*t| t.focused = focused,
             .checkbox => |*cb| cb.focused = focused,
             .radio_button => |*r| r.focused = focused,
+            .slider => |*s| s.focused = focused,
             .label, .container, .progress_bar => {},
         }
     }
@@ -240,6 +260,7 @@ pub const EnabledKinds = struct {
     checkbox: bool = true,
     radio_button: bool = true,
     progress_bar: bool = true,
+    slider: bool = true,
 };
 
 /// Registers only the create-functions for widget kinds `enabled` declares
@@ -279,6 +300,10 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
         funcs_out[n] = c.extism_function_new("natyv_create_progressbar", &in_types[0], 1, &out_types[0], 1, createProgressBarHostFn, self, null);
         n += 1;
     }
+    if (enabled.slider) {
+        funcs_out[n] = c.extism_function_new("natyv_create_slider", &in_types[0], 1, &out_types[0], 1, createSliderHostFn, self, null);
+        n += 1;
+    }
     funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, setTextHostFn, self, null);
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, getTextHostFn, self, null);
@@ -300,7 +325,7 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     return n;
 }
 
-pub const clay_host_function_count = 7;
+pub const clay_host_function_count = 8;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -319,6 +344,7 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[4] = c.extism_function_new("natyv_clay_create_checkbox", &in_types[0], 1, &out_types[0], 1, createClayCheckboxHostFn, self, null);
     funcs_out[5] = c.extism_function_new("natyv_clay_create_radio_button", &in_types[0], 1, &out_types[0], 1, createClayRadioButtonHostFn, self, null);
     funcs_out[6] = c.extism_function_new("natyv_clay_create_progressbar", &in_types[0], 1, &out_types[0], 1, createClayProgressBarHostFn, self, null);
+    funcs_out[7] = c.extism_function_new("natyv_clay_create_slider", &in_types[0], 1, &out_types[0], 1, createClaySliderHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -417,7 +443,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .label => |*l| l.syncText(engine, font),
                 .checkbox => |*cb| cb.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),
-                .container, .progress_bar => {},
+                .container, .progress_bar, .slider => {},
             }
         }
     }
@@ -439,7 +465,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .label => |*l| l.destroyText(),
                 .checkbox => |*cb| cb.destroyText(),
                 .radio_button => |*r| r.destroyText(),
-                .container, .progress_bar => {},
+                .container, .progress_bar, .slider => {},
             }
         }
     }
@@ -476,7 +502,7 @@ fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .label => |*l| self.queuePendingTextDestroy(&l.text_obj),
         .checkbox => |*cb| self.queuePendingTextDestroy(&cb.text_obj),
         .radio_button => |*r| self.queuePendingTextDestroy(&r.text_obj),
-        .container, .progress_bar => {},
+        .container, .progress_bar, .slider => {},
     }
 }
 
@@ -654,6 +680,27 @@ pub fn selectRadioExclusive(self: *Self, call_io: Io, id: u32) void {
     }
 }
 
+/// W3: the host-authoritative counterpart to `toggleCheckbox`/
+/// `selectRadioExclusive` -- called directly by `main.zig`'s drag-update
+/// block and arrow-key nudge handling (not via a host function; there's no
+/// guest call involved in a mouse drag). Returns the *actual clamped*
+/// value if it changed, or `null` if `id` doesn't name a slider or the
+/// clamped value is unchanged (e.g. a drag pinned against 0/1 while the
+/// mouse keeps moving) -- returning the clamped value, not just a bool,
+/// means `main.zig`'s `notifySliderValue` can report exactly what got
+/// stored without a second lookup, never an out-of-range value a caller
+/// (e.g. an arrow-key nudge past 0/1) happened to pass in.
+pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(id) orelse return null;
+    if (slot.widget != .slider) return null;
+    const old = slot.widget.slider.value;
+    slot.widget.slider.setValue(value);
+    const new = slot.widget.slider.value;
+    return if (new != old) new else null;
+}
+
 const CreateButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 };
 const CreateTextFieldRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
 const WidgetIdRequest = struct { widget_id: u32 };
@@ -662,6 +709,7 @@ const SetTextRequest = struct { widget_id: u32, text: []const u8 };
 const CreateCheckboxRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", checked: bool = false };
 const CreateRadioButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", group_id: u32, checked: bool = false };
 const CreateProgressBarRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
+const CreateSliderRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
 const SetCheckedRequest = struct { widget_id: u32, checked: bool };
 const SetValueRequest = struct { widget_id: u32, value: f32 };
 
@@ -705,6 +753,7 @@ const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const
 const ClayCheckboxRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
 const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", group_id: u32, checked: bool = false };
 const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
+const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 
 fn toSizingAxis(req: ClaySizingAxisRequest) c.Clay_SizingAxis {
     return switch (req.type) {
@@ -935,6 +984,29 @@ fn createProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
 }
 
+fn createSliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateSliderRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const slider = Slider.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.value);
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .slider = slider });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
 fn createClayContainerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -1007,6 +1079,16 @@ fn createClayProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]cons
     insertClayWidget(self, plugin, &outputs[0], .{ .progress_bar = bar }, parsed.value.layout);
 }
 
+fn createClaySliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClaySliderRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const slider = Slider.init(std.mem.zeroes(c.SDL_FRect), parsed.value.value);
+    insertClayWidget(self, plugin, &outputs[0], .{ .slider = slider }, parsed.value.layout);
+}
+
 fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -1027,7 +1109,7 @@ fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .label => |*l| l.setText(req.text),
         .checkbox => |*cb| cb.setLabel(req.text),
         .radio_button => |*r| r.setLabel(req.text),
-        .container, .progress_bar => {},
+        .container, .progress_bar, .slider => {},
     }
     if (slot.clay_managed) self.layout_generation +%= 1;
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -1053,7 +1135,7 @@ fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .label => |l| l.text(),
         .checkbox => |cb| cb.label(),
         .radio_button => |r| r.label(),
-        .container, .progress_bar => "",
+        .container, .progress_bar, .slider => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1155,6 +1237,12 @@ fn setValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal
     };
     switch (slot.widget) {
         .progress_bar => |*p| p.setValue(req.value),
+        // W3: a guest can still call natyv_set_value on a slider directly
+        // (e.g. to reset it to a default) even though the common case is
+        // host-driven drag/arrow-key input -- same "not an error, just
+        // doesn't apply" precedent everywhere else in this file, except
+        // here it *does* apply.
+        .slider => |*s| s.setValue(req.value),
         else => {},
     }
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -1176,6 +1264,7 @@ fn getValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal
     };
     const value: f32 = switch (slot.widget) {
         .progress_bar => |p| p.value,
+        .slider => |s| s.value,
         else => 0,
     };
     var buf: [32]u8 = undefined;

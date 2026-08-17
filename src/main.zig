@@ -4,6 +4,7 @@ const Config = @import("Config.zig");
 const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
+const Slider = @import("widgets/Slider.zig");
 const ClayLayout = @import("capabilities/ClayLayout.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
@@ -50,15 +51,33 @@ fn toClipRect(r: c.SDL_FRect) c.SDL_Rect {
 /// apart on what "activating" a given kind actually does. Not every kind is
 /// activatable (TextField, Label, Container, ProgressBar aren't); those
 /// just fall through without pushing an event at all, same as clicking
-/// empty space today.
+/// empty space today. W3: Slider joins that non-activatable set too --
+/// Enter/Space isn't slider semantics, it's driven by drag/arrow-keys
+/// instead (see `notifySliderValue` and the drag-update block below).
 fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, kind: WidgetHost.WidgetKind) void {
     switch (kind) {
         .button => widgets.flashButton(io, id),
         .checkbox => widgets.toggleCheckbox(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
-        .textfield, .label, .container, .progress_bar => return,
+        .textfield, .label, .container, .progress_bar, .slider => return,
     }
     queue.push(io, id, .click, "");
+}
+
+/// W3: the slider counterpart to `activateWidget` -- called both from a
+/// click-to-jump/drag update and an arrow-key nudge. Mutates the host-side
+/// value immediately via `WidgetHost.setSliderValue` (so the thumb responds
+/// the same frame, not waiting on a guest round trip) and, only if the
+/// clamped value actually changed, pushes a "change" event carrying that
+/// *clamped* value so the guest finds out too. `EventQueue.push`'s
+/// `.change` coalescing means calling this every frame during a drag never
+/// floods the queue -- only the latest value per widget is ever pending
+/// delivery.
+fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, value: f32) void {
+    const clamped = widgets.setSliderValue(io, id, value) orelse return;
+    var buf: [32]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{clamped}) catch "{}";
+    queue.push(io, id, .change, json);
 }
 
 // M7: app identity, wasm location, and every capability an app needs
@@ -135,6 +154,7 @@ pub fn main(init: std.process.Init) !void {
         .checkbox = config.value.widgets.checkbox,
         .radio_button = config.value.widgets.radio_button,
         .progress_bar = config.value.widgets.progress_bar,
+        .slider = config.value.widgets.slider,
     };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
     try runtime.loadPlugin(wasm, manifest, widget_kinds, clay_enabled);
@@ -183,6 +203,14 @@ pub fn main(init: std.process.Init) !void {
     var cursor_is_pointer = false;
 
     var focused_widget_id: ?u32 = null;
+    // W3: which slider (if any) is currently being dragged -- set on
+    // MOUSE_BUTTON_DOWN when the click lands on a slider, cleared
+    // unconditionally on MOUSE_BUTTON_UP regardless of where the mouse
+    // currently is (standard drag semantics: releasing outside the widget's
+    // bounds still ends the drag). Not stored on the widget itself, same
+    // "main.zig owns interaction state, WidgetHost owns widget state"
+    // split `focused_widget_id` already establishes.
+    var dragging_slider_id: ?u32 = null;
 
     std.debug.print("[main] window open -- close it to quit.\n", .{});
 
@@ -276,6 +304,18 @@ pub fn main(init: std.process.Init) !void {
                                 .textfield => |t| if (t.containsPoint(mx, my)) {
                                     hit_focusable = slot.id;
                                 },
+                                // W3: just starts the drag -- no value is
+                                // computed here. The per-frame drag-update
+                                // block below runs later this same frame
+                                // (using the polled mouse_x, essentially
+                                // identical to `mx`/`my` here) and handles
+                                // both this click-to-jump case and every
+                                // subsequent drag frame through one code
+                                // path, not two.
+                                .slider => |s| if (s.containsPoint(mx, my)) {
+                                    hit_focusable = slot.id;
+                                    dragging_slider_id = slot.id;
+                                },
                                 .label => {},
                                 .container => {},
                                 .progress_bar => {},
@@ -283,6 +323,13 @@ pub fn main(init: std.process.Init) !void {
                         }
                         updateFocus(&runtime.widgets, io, window, &focused_widget_id, hit_focusable);
                     }
+                },
+                c.SDL_EVENT_MOUSE_BUTTON_UP => {
+                    // W3: ends the drag unconditionally, regardless of
+                    // where the mouse currently is -- standard drag
+                    // semantics (releasing outside the widget's bounds
+                    // still stops it).
+                    if (event.button.button == c.SDL_BUTTON_LEFT) dragging_slider_id = null;
                 },
                 c.SDL_EVENT_TEXT_INPUT => {
                     if (focused_widget_id) |id| runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text));
@@ -321,9 +368,44 @@ pub fn main(init: std.process.Init) !void {
                         }
                     },
                     c.SDLK_ESCAPE => updateFocus(&runtime.widgets, io, window, &focused_widget_id, null),
+                    // W3: nudges the *focused* widget's value if it's a
+                    // slider -- confirmed unbound by anything else in this
+                    // switch today, so safe to add unconditionally; a no-op
+                    // when nothing focused or the focused widget isn't a
+                    // slider (`notifySliderValue`/`setSliderValue` both
+                    // handle that, see their doc comments).
+                    c.SDLK_LEFT, c.SDLK_DOWN => if (focused_widget_id) |id| {
+                        for (widget_snapshot[0..widget_count]) |slot| {
+                            if (slot.id == id and slot.widget == .slider) {
+                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step);
+                            }
+                        }
+                    },
+                    c.SDLK_RIGHT, c.SDLK_UP => if (focused_widget_id) |id| {
+                        for (widget_snapshot[0..widget_count]) |slot| {
+                            if (slot.id == id and slot.widget == .slider) {
+                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step);
+                            }
+                        }
+                    },
                     else => {},
                 },
                 else => {},
+            }
+        }
+
+        // W3: per-frame slider drag update -- runs after the event-poll
+        // loop above (so `dragging_slider_id` set earlier this same frame,
+        // on the initial click, is already visible here), using the
+        // already-polled `mouse_x`/`mouse_y` from the top of the loop
+        // rather than a dedicated MOUSE_MOTION handler. This one block
+        // covers both "jump to click position" and "continue following the
+        // drag" -- no separate code path needed for the click-to-jump case.
+        if (dragging_slider_id) |id| {
+            for (widget_snapshot[0..widget_count]) |slot| {
+                if (slot.id == id and slot.widget == .slider) {
+                    notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.valueFromX(mouse_x));
+                }
             }
         }
 
@@ -340,6 +422,9 @@ pub fn main(init: std.process.Init) !void {
                     hovering_any = true;
                 },
                 .radio_button => |r| if (r.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                },
+                .slider => |s| if (s.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
                 },
                 .label => {},
@@ -404,6 +489,7 @@ pub fn main(init: std.process.Init) !void {
                 .checkbox => |cb| cb.drawDecorations(renderer),
                 .radio_button => |r| r.drawDecorations(renderer),
                 .progress_bar => |p| p.drawDecorations(renderer),
+                .slider => |s| s.drawDecorations(renderer),
                 // L2: containers are layout-only, nothing to draw -- see
                 // Container.zig's doc comment.
                 .container => {},

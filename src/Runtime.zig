@@ -170,7 +170,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
             },
             .label => {},
             .container => {},
-            .checkbox, .radio_button, .progress_bar => {},
+            .checkbox, .radio_button, .progress_bar, .slider => {},
         }
     }
 
@@ -324,14 +324,14 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
 
     // 16, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
-    // row labels (6 more) -- 12 widgets total. Same silent-truncation risk
-    // documented at W1's identical bump from 4 to 8 -- snapshot() caps at
-    // out.len with no error, so every clay-fixture-loading test's buffer
-    // needs auditing whenever natyv_init grows, not just the test being
-    // extended.
+    // row labels (6 more) + a W3 slider (1 more) -- 13 widgets total. Same
+    // silent-truncation risk documented at W1's identical bump from 4 to 8
+    // -- snapshot() caps at out.len with no error, so every
+    // clay-fixture-loading test's buffer needs auditing whenever
+    // natyv_init grows, not just the test being extended.
     var snap: [16]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 12), n);
+    try std.testing.expectEqual(@as(usize, 13), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -978,5 +978,40 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == prid) try std.testing.expectApproxEqAbs(@as(f32, 0.5), slot.widget.progress_bar.value, 0.001);
+    }
+}
+
+test "W3: slider created via natyv_clay_create_slider round-trips its value, and natyv_set_value/natyv_get_value work on it through a real guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [16]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var slider_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .slider) {
+            try std.testing.expectApproxEqAbs(@as(f32, 0.4), slot.widget.slider.value, 0.001);
+            slider_id = slot.id;
+        }
+    }
+    const sid = slider_id orelse return error.MissingSlider;
+
+    // Real guest-routed slider value change (natyv_set_value via
+    // natyv_dispatch), same shape as W1's SetProgressHalf case above.
+    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SetSliderQuarter\"}") orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == sid) try std.testing.expectApproxEqAbs(@as(f32, 0.25), slot.widget.slider.value, 0.001);
     }
 }
