@@ -176,7 +176,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
             },
             .label => {},
             .container => {},
-            .checkbox, .radio_button, .progress_bar, .slider, .textarea => {},
+            .checkbox, .radio_button, .progress_bar, .slider, .textarea, .divider => {},
         }
     }
 
@@ -435,25 +435,25 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 22, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 23, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
     // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
     // TextField (1 more) + a W7 toast trigger button and the persistent
     // toast-stack container (2 more) + a W9 menu trigger button (1 more) +
-    // a W10 TextArea and its char-count Label (2 more) -- 21 widgets total
-    // (the dropdown's floating panel, the modal's panel, the combobox's
-    // options panel, and the menu's panel/submenu are all only created on
-    // demand, not by natyv_init -- see the W4/W5/W6/W7/W9 tests below; the
-    // toast stack itself IS created here, unlike those, but individual
-    // toasts inside it aren't). Same silent-truncation risk documented at
-    // W1's identical bump from 4 to 8 -- snapshot() caps at out.len with
-    // no error, so every clay-fixture-loading test's buffer needs
-    // auditing whenever natyv_init grows, not just the test being
-    // extended.
-    var snap: [22]WidgetHost.Slot = undefined;
+    // a W11 divider (1 more) + a W10 TextArea and its char-count Label (2
+    // more) -- 22 widgets total (the dropdown's floating panel, the
+    // modal's panel, the combobox's options panel, and the menu's panel/
+    // submenu are all only created on demand, not by natyv_init -- see
+    // the W4/W5/W6/W7/W9 tests below; the toast stack itself IS created
+    // here, unlike those, but individual toasts inside it aren't). Same
+    // silent-truncation risk documented at W1's identical bump from 4 to
+    // 8 -- snapshot() caps at out.len with no error, so every
+    // clay-fixture-loading test's buffer needs auditing whenever
+    // natyv_init grows, not just the test being extended.
+    var snap: [23]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 21), n);
+    try std.testing.expectEqual(@as(usize, 22), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -516,7 +516,7 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     // W4: the fixture now creates a *second* button (the dropdown trigger,
     // "Select...", Fixed height 32) alongside "Grow Button" (GROW width,
@@ -573,7 +573,7 @@ test "W2: natyv_clay_create_container's scroll_vertical/scroll_horizontal round-
     runtime.initGuest(io);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // The scroll container is the only top-level (parent_id == null)
@@ -644,7 +644,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var scroll_container_id: ?u32 = null;
@@ -724,7 +724,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     var row1_id: ?u32 = null;
     var row1_base_y: f32 = undefined;
@@ -802,7 +802,7 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     // W4: two buttons exist now (the fixture's own "Grow Button" plus the
     // dropdown trigger) -- every button gets synced once on this first
@@ -888,7 +888,7 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     // W4: must be "Grow Button" specifically, not whichever button the
     // scan finds last -- a real click's widget_id now matters (the
@@ -1077,7 +1077,7 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
     runtime.initGuest(io);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var checkbox_id: ?u32 = null;
@@ -1150,7 +1150,7 @@ test "W3: slider created via natyv_clay_create_slider round-trips its value, and
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var slider_id: ?u32 = null;
@@ -1190,7 +1190,7 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
     // more) -- 21 at peak. Same silent-truncation risk documented at
     // every prior buffer bump in this file -- snapshot() caps at out.len
     // with no error.
-    var snap: [26]WidgetHost.Slot = undefined;
+    var snap: [27]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1291,7 +1291,7 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
     // this test opens the modal (panel + message + close button = 3 more)
     // -- 18 at peak. Same silent-truncation risk documented at every prior
     // buffer bump in this file.
-    var snap: [26]WidgetHost.Slot = undefined;
+    var snap: [27]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1394,7 +1394,7 @@ test "W6: a combobox's .text_changed re-filters, .key_nav moves the highlight an
     // this test opens the combobox's panel (up to 5 filtered options) --
     // well within headroom, same silent-truncation risk documented at
     // every prior buffer bump in this file.
-    var snap: [26]WidgetHost.Slot = undefined;
+    var snap: [27]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -1485,7 +1485,7 @@ test "W6: a real .blur event closes the combobox panel without selecting anythin
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [26]WidgetHost.Slot = undefined;
+    var snap: [27]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -1543,7 +1543,7 @@ test "W7: a toast round-trips duration_ms into a real expires_at_ms, and destroy
     // this test fires one toast (its own Container + a message Label = 2
     // more) -- 20 at peak. Same silent-truncation risk documented at
     // every prior buffer bump in this file.
-    var snap: [26]WidgetHost.Slot = undefined;
+    var snap: [27]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var stack_id: ?u32 = null;
@@ -1640,7 +1640,7 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     // the submenu (panel + 2 items = 3 more) -- 26 at peak. Same
     // silent-truncation risk documented at every prior buffer bump in
     // this file.
-    var snap: [32]WidgetHost.Slot = undefined;
+    var snap: [33]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1963,7 +1963,7 @@ test "W10: a textarea's multi-line content flows through host-level mutation, re
 
     // 22: natyv_init's 21 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [22]WidgetHost.Slot = undefined;
+    var snap: [23]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one TextArea exists in this fixture -- see natyv_init's own
@@ -2008,4 +2008,55 @@ test "W10: a textarea's multi-line content flows through host-level mutation, re
     var blur_dispatch_buf: [256]u8 = undefined;
     const blur_payload = try buildDispatchEnvelope(&blur_dispatch_buf, aid, "blur", "{\"new_focus_id\":0}");
     _ = runtime.call(io, "natyv_dispatch", blur_payload) orelse return error.CallFailed;
+}
+
+test "W11: a divider exists, is not focusable, and gets real Clay-computed geometry" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    // 23: natyv_init's 22 widgets (see the L3 test's comment above) --
+    // this test never opens anything else on top, well within headroom.
+    var snap: [23]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+
+    // Exactly one Divider exists in this fixture -- see natyv_init's own
+    // doc comments -- so matching by kind alone is unambiguous, same
+    // precedent the W6/W10 tests' own single-of-a-kind matches already
+    // established.
+    var divider_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .divider) divider_id = slot.id;
+    }
+    const did = divider_id orelse return error.MissingDivider;
+
+    for (snap[0..n]) |slot| {
+        if (slot.id == did) {
+            // Never focusable -- confirms Widget.isFocusable's .divider
+            // arm, not just that the widget exists.
+            try std.testing.expect(!slot.widget.isFocusable());
+            // Horizontal: fixed (thin) height, grow-width -- real
+            // Clay-computed geometry, not the zeroed rect it was created
+            // with (Clay-managed widgets start zeroed until a real
+            // layout pass runs, same precedent every other Clay-managed
+            // widget's own test already confirms).
+            try std.testing.expectApproxEqAbs(@as(f32, 2), slot.widget.divider.rect.h, 0.01);
+            try std.testing.expect(slot.widget.divider.rect.w > 100);
+        }
+    }
 }

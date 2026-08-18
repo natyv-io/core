@@ -103,7 +103,7 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         .button => widgets.flashButton(io, id),
         .checkbox => widgets.toggleCheckbox(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
-        .textfield, .textarea, .label, .container, .progress_bar, .slider => return,
+        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -158,7 +158,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .textfield => |t| t.containsPoint(mx, my),
         .textarea => |ta| ta.containsPoint(mx, my),
         .slider => |s| s.containsPoint(mx, my),
-        .label, .container, .progress_bar => false,
+        .label, .container, .progress_bar, .divider => false,
     };
 }
 
@@ -195,7 +195,7 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             dragging_slider_id.* = slot.id;
             return slot.id;
         },
-        .label, .container, .progress_bar => {},
+        .label, .container, .progress_bar, .divider => {},
     }
     return null;
 }
@@ -217,6 +217,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         // W5: draws a border only when `background` is set -- see
         // Container.zig's doc comment.
         .container => |cont| cont.drawDecorations(renderer),
+        .divider => |d| d.drawDecorations(renderer),
     }
 }
 
@@ -741,6 +742,7 @@ pub fn main(init: std.process.Init) !void {
                 .label => {},
                 .container => {},
                 .progress_bar => {},
+                .divider => {},
             }
         }
         if (hovering_any != cursor_is_pointer) {
