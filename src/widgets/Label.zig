@@ -3,6 +3,17 @@
 //! rows (previously drawn directly by the host's main.zig via
 //! SDL_RenderDebugText, which is exactly the kind of app-specific knowledge
 //! the host isn't supposed to have anymore).
+//!
+//! W15 follow-up (surfaced by Quinn's real click-through of the Tooltip
+//! demo, whose fixed copy is longer than the tooltip's 220px box): a Label
+//! never wrapped its text to its own width -- it drew at whatever pixel
+//! width the string naturally measures to, silently overflowing past its
+//! Clay-assigned rect whenever content was longer than the box. Fixed the
+//! same way TextArea.zig's own real word-wrap follow-up was: real
+//! pixel-width wrap via `TTF_SetTextWrapWidth`, tracked against `rect.w`
+//! through `wrapped_width` (see TextArea.syncText's doc comment for the
+//! full "why not just set it once at creation" reasoning -- a Clay-managed
+//! Label starts with a zeroed rect until the first real layout pass runs).
 
 const c = @import("../c.zig").c;
 
@@ -17,6 +28,8 @@ len: usize = 0,
 text_obj: ?*c.TTF_Text = null,
 text_generation: u32 = 0,
 text_obj_generation: u32 = 0,
+// W15 follow-up: see TextArea.zig's field of the same name/purpose.
+wrapped_width: i32 = -1,
 
 pub fn init(rect: c.SDL_FRect, initial_text: []const u8) Self {
     var self: Self = .{ .rect = rect };
@@ -50,18 +63,29 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
     }
 }
 
-/// F3: see `Button.syncText`'s doc comment.
+/// F3: see `Button.syncText`'s doc comment for the text-content sync shape.
+/// W15 follow-up: see this file's own doc comment and
+/// `TextArea.syncText`'s for the wrap-width tracking shape -- `- 8` leaves
+/// a small margin so wrapped text doesn't sit flush against the box edge
+/// (TextArea uses `- 12` for its own, slightly larger, padding).
 pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font) void {
+    const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - 8);
+    const wrap_changed = target_wrap != self.wrapped_width;
+
     if (self.text_obj) |obj| {
         if (self.text_obj_generation != self.text_generation) {
             _ = c.TTF_SetTextString(obj, self.text().ptr, self.len);
             self.text_obj_generation = self.text_generation;
         }
+        if (wrap_changed) _ = c.TTF_SetTextWrapWidth(obj, target_wrap);
     } else if (c.TTF_CreateText(engine, font, self.text().ptr, self.len)) |obj| {
         _ = c.TTF_SetTextColor(obj, 220, 220, 220, 255);
+        _ = c.TTF_SetTextWrapWidth(obj, target_wrap);
         self.text_obj = obj;
         self.text_obj_generation = self.text_generation;
     }
+
+    if (wrap_changed) self.wrapped_width = target_wrap;
 }
 
 /// Must be called before this widget is dropped from the registry -- see

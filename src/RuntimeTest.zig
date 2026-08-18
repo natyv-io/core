@@ -430,7 +430,7 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 29, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 30, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
     // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
@@ -438,18 +438,19 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // toast-stack container (2 more) + a W9 menu trigger button (1 more) +
     // a W11 divider (1 more) + a W10 TextArea and its char-count Label (2
     // more) + a W12 toggle and its status Label (2 more) + a W14 badge row
-    // and its 3 Badges (4 more) -- 28 widgets total (the dropdown's
-    // floating panel, the modal's panel, the combobox's options panel, and
-    // the menu's panel/submenu are all only created on demand, not by
-    // natyv_init -- see the W4/W5/W6/W7/W9 tests below; the toast stack
+    // and its 3 Badges (4 more) + a W15 "?" help Button (1 more) -- 29
+    // widgets total (the dropdown's floating panel, the modal's panel, the
+    // combobox's options panel, the menu's panel/submenu, and the W15
+    // tooltip panel/label are all only created on demand, not by
+    // natyv_init -- see the W4/W5/W6/W7/W9/W15 tests below; the toast stack
     // itself IS created here, unlike those, but individual toasts inside
     // it aren't). Same silent-truncation risk documented at W1's identical
     // bump from 4 to 8 -- snapshot() caps at out.len with no error, so
     // every clay-fixture-loading test's buffer needs auditing whenever
     // natyv_init grows, not just the test being extended.
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [30]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 28), n);
+    try std.testing.expectEqual(@as(usize, 29), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1966,9 +1967,9 @@ test "W10: a textarea's multi-line content flows through host-level mutation, re
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 29: natyv_init's 28 widgets (see the L3 test's comment above) --
+    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [30]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one TextArea exists in this fixture -- see natyv_init's own
@@ -2035,9 +2036,9 @@ test "W11: a divider exists, is not focusable, and gets real Clay-computed geome
     defer clay_layout.deinit(allocator);
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
 
-    // 29: natyv_init's 28 widgets (see the L3 test's comment above) --
+    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [30]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Divider exists in this fixture -- see natyv_init's own
@@ -2080,9 +2081,9 @@ test "W12: a toggle exists, is focusable, activates via a real click, and natyv_
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 29: natyv_init's 28 widgets (see the L3 test's comment above) --
+    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [30]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Toggle exists in this fixture -- see natyv_init's own
@@ -2139,9 +2140,9 @@ test "W14: three badges exist with their real tones/labels, are not focusable, a
     defer clay_layout.deinit(allocator);
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
 
-    // 29: natyv_init's 28 widgets (see the L3 test's comment above) --
+    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [30]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Badge per tone exists in this fixture -- see
@@ -2170,4 +2171,92 @@ test "W14: three badges exist with their real tones/labels, are not focusable, a
     try std.testing.expect(success_found);
     try std.testing.expect(warning_found);
     try std.testing.expect(danger_found);
+}
+
+test "W15: a real .hover event creates a floating tooltip through a real guest, and hover-out destroys it, idempotently" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    // 31: natyv_init's 29 widgets (28 from W14 plus the new "?" help
+    // Button), plus this test opens the tooltip (Container + Label = 2
+    // more) -- 31 at peak. Same silent-truncation risk documented at every
+    // prior buffer bump in this file.
+    var snap: [40]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var help_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        // Exactly one Button labeled "?" exists in this fixture, unlike
+        // every other Button label here -- unambiguous match.
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "?")) help_id = slot.id;
+    }
+    const hid = help_id orelse return error.MissingHelpButton;
+    // Not yet shown -- natyv_init only ever creates the help Button itself.
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != hid);
+    }
+
+    // Real guest-routed hover-in (a real `.hover` event with
+    // `{"hovering":true}`, exactly as main.zig's hover-hold timer fires it
+    // -- not a hand-built event type) -- proves the guest's own choice
+    // (the "hover" dispatch case) is what creates the tooltip's
+    // Container+Label, not the host doing it on the guest's behalf.
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try buildDispatchEnvelope(&dispatch_buf, hid, "hover", "{\"hovering\":true}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == hid and slot.widget == .container) {
+            // W15 wire round-trip: floating landed in ClayStyle, same as
+            // every other on-demand floating panel in this fixture.
+            try std.testing.expect(slot.clay_style.floating);
+            panel_id = slot.id;
+        }
+    }
+    const pid = panel_id orelse return error.MissingTooltipPanel;
+
+    var label_count: usize = 0;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .label) label_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), label_count);
+
+    // Real guest-routed hover-out (`{"hovering":false}`) -- destroys the
+    // panel (and its label child cascades with it, same as every other
+    // floating-panel teardown in this fixture).
+    payload = try buildDispatchEnvelope(&dispatch_buf, hid, "hover", "{\"hovering\":false}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    for (snap[0..n]) |slot| {
+        // Gone entirely, not just hidden -- natyv has no "visible" concept,
+        // only exists/doesn't (same precedent every other floating-panel
+        // teardown test in this file already established).
+        try std.testing.expect(slot.id != pid);
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != hid);
+    }
+
+    // A second, redundant `{"hovering":false}` -- simulates the coalesced
+    // "hover-out arrives with no matching hover-in" edge case EventQueue's
+    // own `.hover` doc comment describes. Must be a harmless no-op (the
+    // guest's own `tooltipPanelID != 0` guard), not a crash or a spurious
+    // destroy-widget error surfacing through natyv_dispatch's response.
+    payload = try buildDispatchEnvelope(&dispatch_buf, hid, "hover", "{\"hovering\":false}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != hid);
+    }
 }

@@ -27,7 +27,22 @@ const Self = @This();
 /// widget just lost focus) and `.key_nav` (fired to a focused TextField on
 /// Up/Down/Enter, payload `{"key":"up"|"down"|"enter"}`) are both discrete
 /// like `.click`/`.dismiss` -- never coalesced, every one matters.
-pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav };
+///
+/// W15: `.hover` (payload `{"hovering":bool}`) is fired to a widget when
+/// main.zig's hover-hold timer crosses its threshold (true) and again the
+/// moment that widget stops being hovered (false) -- see main.zig's own
+/// doc comment on the timer for why the *state transition* is what's
+/// reported, not a continuous stream. Coalesced like `.change`/
+/// `.text_changed` rather than discrete like `.blur`/`.key_nav`: a hover
+/// that starts and ends within the same undrained frame (a fast mouse
+/// flick) should coalesce down to just the final `false`, since a guest
+/// reacting to an intermediate `true` would only create a tooltip it'd
+/// immediately have to tear back down. The guest still guards its
+/// hover-off handling on "was a tooltip actually created" (same `!= 0`
+/// idiom `closeDropdown`/`closeModal` already use for their own panel
+/// ids) since coalescing narrows this edge case rather than eliminating
+/// it entirely.
+pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover };
 
 pub const Entry = struct {
     widget_id: u32,
@@ -78,8 +93,9 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
     // appending a second one. W6: `.text_changed` joins `.change` as a
     // second continuous type -- matched against `event_type` itself (not
     // hardcoded to `.change`) so the two families never cross-coalesce
-    // with each other.
-    if (event_type == .change or event_type == .text_changed) {
+    // with each other. W15: `.hover` joins the same coalesced family --
+    // see its own EventType doc comment for why.
+    if (event_type == .change or event_type == .text_changed or event_type == .hover) {
         for (self.items.items) |*existing| {
             if (existing.widget_id == widget_id and existing.event_type == event_type) {
                 self.allocator.free(existing.payload);
@@ -242,6 +258,49 @@ test "change and text_changed for the same widget id don't cross-coalesce with e
 
     queue.push(io, 1, .change, "a", 0);
     queue.push(io, 1, .text_changed, "b", 0);
+    try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
+}
+
+test "hover events for the same widget coalesce to the latest payload" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .hover, "{\"hovering\":true}", 0);
+    queue.push(io, 1, .hover, "{\"hovering\":false}", 0);
+    try std.testing.expectEqual(@as(usize, 1), queue.items.items.len);
+    try std.testing.expectEqualStrings("{\"hovering\":false}", queue.items.items[0].payload);
+}
+
+test "hover events for different widgets don't coalesce with each other" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .hover, "{\"hovering\":true}", 0);
+    queue.push(io, 2, .hover, "{\"hovering\":true}", 0);
+    try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
+}
+
+test "hover and click for the same widget are independent, not coalesced with each other" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .click, "a", 0);
+    queue.push(io, 1, .hover, "{\"hovering\":true}", 0);
     try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
 }
 

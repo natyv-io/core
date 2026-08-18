@@ -26,6 +26,15 @@ const max_widgets_on_screen = WidgetHost.max_widgets;
 /// @max rather than hardcoded so this stays correct if that ever changes.
 const max_text_widget_len = @max(TextField.max_len, TextArea.max_len);
 
+/// W15: how long the mouse has to sit continuously over the same widget
+/// before a `.hover` `{"hovering":true}` event fires for it. Fixed, not
+/// guest-configurable in v1 -- same treatment Slider's `nudge_step` got.
+/// 100ms (not a more typical OS tooltip delay like 500ms) per Quinn's real
+/// click-through feedback: at 500ms the tooltip felt laggy rather than
+/// responsive; 100ms reads as near-instant while still being long enough
+/// to not fire on a mouse merely passing over the widget in transit.
+const tooltip_hover_threshold_ms: i64 = 100;
+
 /// Keyboard interaction model: the one place focus actually changes (mouse
 /// click, Tab/Shift+Tab, Escape all route through this) -- updates the
 /// registry, the caller's local tracking var, and starts/stops
@@ -379,6 +388,16 @@ pub fn main(init: std.process.Init) !void {
     // split `focused_widget_id` already establishes.
     var dragging_slider_id: ?u32 = null;
 
+    // W15: which widget (if any) the mouse is currently continuously over,
+    // when that hover started, and which widget (if any) we've already
+    // fired `.hover true` for -- `tooltip_active_for` is tracked
+    // separately from `hovered_widget_id` so hover-out only ever fires
+    // `.hover false` for a widget that actually crossed the threshold and
+    // got a `true` sent, never for one the mouse merely brushed past.
+    var hovered_widget_id: ?u32 = null;
+    var hover_start_ms: ?i64 = null;
+    var tooltip_active_for: ?u32 = null;
+
     std.debug.print("[main] window open -- close it to quit.\n", .{});
 
     var running = true;
@@ -722,6 +741,12 @@ pub fn main(init: std.process.Init) !void {
         }
 
         var hovering_any = false;
+        // W15: which widget (if any) the mouse is over this frame, for the
+        // hover-hold timer below -- only the kinds that already have a
+        // `containsPoint` (the same set `hovering_any` already covers) can
+        // be a tooltip anchor; other kinds (Label/Container/ProgressBar/
+        // Divider/Badge) don't have one yet, a deliberate v1 scope limit.
+        var hovered_widget_id_this_frame: ?u32 = null;
         for (widget_snapshot[0..widget_count]) |slot| {
             // W5 follow-up (Quinn's real click-through feedback,
             // 2026-08-17): when a modal is open, a widget outside its
@@ -735,24 +760,31 @@ pub fn main(init: std.process.Init) !void {
             switch (slot.widget) {
                 .button => |b| if (b.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
                 },
                 .textfield => |t| if (t.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
                 },
                 .textarea => |ta| if (ta.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
                 },
                 .checkbox => |cb| if (cb.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
                 },
                 .toggle => |tg| if (tg.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
                 },
                 .radio_button => |r| if (r.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
                 },
                 .slider => |s| if (s.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
                 },
                 .label => {},
                 .container => {},
@@ -764,6 +796,35 @@ pub fn main(init: std.process.Init) !void {
         if (hovering_any != cursor_is_pointer) {
             cursor_is_pointer = hovering_any;
             _ = c.SDL_SetCursor(if (hovering_any) pointer_cursor else arrow_cursor);
+        }
+
+        // W15: hover-hold timer -- reports a `.hover` state transition to
+        // the guest, not a continuous stream. If the hovered widget
+        // changed (including becoming/leaving null), close out any
+        // tooltip we'd actually opened for the *previous* one and reset
+        // the timer for the new one. Otherwise, once the same widget has
+        // been hovered continuously past the threshold, fire `.hover true`
+        // exactly once (guarded by `tooltip_active_for` so it doesn't
+        // refire every subsequent frame).
+        if (hovered_widget_id_this_frame != hovered_widget_id) {
+            if (tooltip_active_for) |active_id| {
+                if (hovered_widget_id) |prev_id| {
+                    if (active_id == prev_id) {
+                        queue.push(io, prev_id, .hover, "{\"hovering\":false}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], prev_id));
+                    }
+                }
+                tooltip_active_for = null;
+            }
+            hovered_widget_id = hovered_widget_id_this_frame;
+            hover_start_ms = if (hovered_widget_id_this_frame != null) timing.nowMs() else null;
+        } else if (hovered_widget_id_this_frame) |id| {
+            if (hover_start_ms) |start| {
+                const already_active = if (tooltip_active_for) |active_id| active_id == id else false;
+                if (timing.nowMs() - start >= tooltip_hover_threshold_ms and !already_active) {
+                    queue.push(io, id, .hover, "{\"hovering\":true}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                    tooltip_active_for = id;
+                }
+            }
         }
 
         // W2: computed once per frame -- for each widget, the rect it must
