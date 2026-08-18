@@ -149,16 +149,32 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
+    // W13: natyv_init now lands on the Home page (a real navigation
+    // landing screen, not the book-management UI directly) -- navigate to
+    // Books first via a real "Go to Books" click, same as a user would,
+    // before any of this test's book-management assertions apply.
+    // 45, not 32: W8's delete-confirm Dialog adds up to 5 more widgets
+    // (root + message Label + button row + 2 buttons) on top of what this
+    // test already exercises, and W13's breadcrumb trail adds up to 4 more
+    // of its own on the Books page (root + "Home" Button + "/" separator
+    // Label + "Books" Label) -- same silent-truncation risk documented at
+    // every prior buffer bump in this file.
+    var snap: [45]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var go_to_books_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Go to Books")) go_to_books_id = slot.id;
+    }
+    var dispatch_buf: [128]u8 = undefined;
+    var click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{go_to_books_id orelse return error.MissingGoToBooksButton});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
     // Drive it exactly the way main.zig's real event loop does: locate the
     // widgets the guest created (by placeholder/label, not by assuming
     // fixed ids), type into them via the same WidgetHost methods SDL text
     // input calls, and push a click the same way a real mouse click would.
-    // 40, not 32: W8's delete-confirm Dialog adds up to 5 more widgets
-    // (root + message Label + button row + 2 buttons) on top of what this
-    // test already exercises -- same silent-truncation risk documented at
-    // every prior buffer bump in this file.
-    var snap: [40]WidgetHost.Slot = undefined;
-    var n = runtime.widgets.snapshot(io, &snap);
+    n = runtime.widgets.snapshot(io, &snap);
 
     var author_id: ?u32 = null;
     var title_id: ?u32 = null;
@@ -185,8 +201,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
     _ = runtime.widgets.appendTextTo(io, title_id orelse return error.MissingTitleField, "Dune", &text_scratch);
     _ = runtime.widgets.appendTextTo(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
 
-    var dispatch_buf: [128]u8 = undefined;
-    var click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
+    click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
     _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
 
     n = runtime.widgets.snapshot(io, &snap);
@@ -259,8 +274,20 @@ test "bookstore: cancelling the delete-confirm dialog leaves the book untouched"
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [40]WidgetHost.Slot = undefined;
+    var snap: [45]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
+
+    // W13: navigate off the Home landing page first, same as the test
+    // above.
+    var go_to_books_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Go to Books")) go_to_books_id = slot.id;
+    }
+    var dispatch_buf: [128]u8 = undefined;
+    var click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{go_to_books_id orelse return error.MissingGoToBooksButton});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
 
     var author_id: ?u32 = null;
     var title_id: ?u32 = null;
@@ -285,8 +312,7 @@ test "bookstore: cancelling the delete-confirm dialog leaves the book untouched"
     _ = runtime.widgets.appendTextTo(io, title_id orelse return error.MissingTitleField, "The Dispossessed", &text_scratch);
     _ = runtime.widgets.appendTextTo(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
 
-    var dispatch_buf: [128]u8 = undefined;
-    var click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
+    click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
     _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
 
     n = runtime.widgets.snapshot(io, &snap);
@@ -320,6 +346,78 @@ test "bookstore: cancelling the delete-confirm dialog leaves the book untouched"
     // runs unconditionally in OnResult before the button-specific check).
     try std.testing.expect(found_book);
     try std.testing.expect(!dialog_widgets_remain);
+}
+
+// Small helper for the W13 test below: does any widget in `snap[0..n]`
+// match `kind`/`text`? Kept generic over Button/Label (both expose their
+// text via `.label()`/`.text()`) rather than duplicating this scan four
+// times over per assertion.
+fn findBreadcrumbWidget(snap: []const WidgetHost.Slot, comptime kind: WidgetHost.WidgetKind, text: []const u8) ?u32 {
+    for (snap) |slot| {
+        switch (kind) {
+            .button => if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), text)) return slot.id,
+            .label => if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), text)) return slot.id,
+            else => unreachable,
+        }
+    }
+    return null;
+}
+
+test "W13: a breadcrumb trail reflects the real navigation path and OnCrumbClick actually navigates through a real guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/bookstore/guest/bookstore.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try init(allocator, ":memory:");
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [45]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    // Lands on Home: a single "Home" crumb -- the current page, so it's a
+    // plain Label (CreateBreadcrumbs' own last-crumb-is-non-clickable
+    // contract, same "not a Button" precedent Divider/Toggle established
+    // for "this widget doesn't do X"), not yet a Button anywhere. The
+    // Books page's own widgets don't exist yet.
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .label, "Home") != null);
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .button, "Home") == null);
+    const go_to_books_id = findBreadcrumbWidget(snap[0..n], .button, "Go to Books") orelse return error.MissingGoToBooksButton;
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .button, "Add Book") == null);
+
+    var dispatch_buf: [128]u8 = undefined;
+    var click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{go_to_books_id});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    // Now on Books: the trail grew to "Home" (now a real, clickable Button
+    // -- no longer the current page) / "Books" (the new current page, a
+    // Label). Home's own widgets (the welcome message, "Go to Books") are
+    // gone -- destroyHomePage() ran, not just a visual change -- and the
+    // Books page's own widgets exist.
+    const home_button_id = findBreadcrumbWidget(snap[0..n], .button, "Home") orelse return error.MissingHomeCrumbButton;
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .label, "Books") != null);
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .button, "Go to Books") == null);
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .button, "Add Book") != null);
+
+    click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{home_button_id});
+    _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    // Back on Home: the trail shrank back to a single non-clickable "Home"
+    // Label -- the old "Books" crumb doesn't linger as a clickable link
+    // back to it (per Quinn's own framing of the real navigation model),
+    // and the Books page's own widgets are gone again.
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .label, "Home") != null);
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .button, "Home") == null);
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .label, "Books") == null);
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .button, "Go to Books") != null);
+    try std.testing.expect(findBreadcrumbWidget(snap[0..n], .button, "Add Book") == null);
 }
 
 test "widget host functions: create/get/set/destroy round trip through a trivial guest" {
