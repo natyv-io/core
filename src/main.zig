@@ -104,7 +104,7 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         .checkbox => widgets.toggleCheckbox(io, id),
         .toggle => widgets.toggleToggle(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
-        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider => return,
+        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider, .badge => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -160,7 +160,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .textfield => |t| t.containsPoint(mx, my),
         .textarea => |ta| ta.containsPoint(mx, my),
         .slider => |s| s.containsPoint(mx, my),
-        .label, .container, .progress_bar, .divider => false,
+        .label, .container, .progress_bar, .divider, .badge => false,
     };
 }
 
@@ -201,7 +201,7 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             dragging_slider_id.* = slot.id;
             return slot.id;
         },
-        .label, .container, .progress_bar, .divider => {},
+        .label, .container, .progress_bar, .divider, .badge => {},
     }
     return null;
 }
@@ -225,6 +225,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         // Container.zig's doc comment.
         .container => |cont| cont.drawDecorations(renderer),
         .divider => |d| d.drawDecorations(renderer),
+        .badge => |bd| bd.drawDecorations(renderer),
     }
 }
 
@@ -320,6 +321,7 @@ pub fn main(init: std.process.Init) !void {
         .progress_bar = config.value.widgets.progress_bar,
         .slider = config.value.widgets.slider,
         .divider = config.value.widgets.divider,
+        .badge = config.value.widgets.badge,
     };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
     try runtime.loadPlugin(wasm, manifest, widget_kinds, clay_enabled);
@@ -756,6 +758,7 @@ pub fn main(init: std.process.Init) !void {
                 .container => {},
                 .progress_bar => {},
                 .divider => {},
+                .badge => {},
             }
         }
         if (hovering_any != cursor_is_pointer) {

@@ -113,6 +113,7 @@ const RadioButton = @import("RadioButton.zig");
 const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
 const Divider = @import("Divider.zig");
+const Badge = @import("Badge.zig");
 
 const Self = @This();
 
@@ -126,9 +127,10 @@ pub const max_widgets = 64;
 // + toggle create (1) -- W12, same natyv_clay_create_toggle split. Reuses
 // the existing natyv_set_checked/natyv_get_checked host functions (no new
 // ones needed for those), same as radio_button already does.
-pub const host_function_count = 17;
+// + badge create (1) -- W14, same natyv_clay_create_badge split.
+pub const host_function_count = 18;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -141,6 +143,7 @@ pub const Widget = union(WidgetKind) {
     progress_bar: ProgressBar,
     slider: Slider,
     divider: Divider,
+    badge: Badge,
 
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
@@ -159,6 +162,7 @@ pub const Widget = union(WidgetKind) {
             .progress_bar => |*p| &p.rect,
             .slider => |*s| &s.rect,
             .divider => |*d| &d.rect,
+            .badge => |*bd| &bd.rect,
         };
     }
 
@@ -193,6 +197,9 @@ pub const Widget = union(WidgetKind) {
             // W11: unlike Container's opt-in background, a divider always
             // fills -- see Divider.zig's doc comment.
             .divider => |d| .{ .color = d.fillColor(), .rect = d.rect },
+            // W14: same "always fills" precedent as Divider -- a Badge is
+            // a pill, not a checkmark-on-demand.
+            .badge => |bd| .{ .color = bd.fillColor(), .rect = bd.rect },
         };
     }
 
@@ -203,7 +210,7 @@ pub const Widget = union(WidgetKind) {
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
             .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider => true,
-            .label, .container, .progress_bar, .divider => false,
+            .label, .container, .progress_bar, .divider, .badge => false,
         };
     }
 
@@ -220,7 +227,7 @@ pub const Widget = union(WidgetKind) {
             .toggle => |*tg| tg.focused = focused,
             .radio_button => |*r| r.focused = focused,
             .slider => |*s| s.focused = focused,
-            .label, .container, .progress_bar, .divider => {},
+            .label, .container, .progress_bar, .divider, .badge => {},
         }
     }
 };
@@ -348,6 +355,7 @@ pub const EnabledKinds = struct {
     progress_bar: bool = true,
     slider: bool = true,
     divider: bool = true,
+    badge: bool = true,
 };
 
 /// Registers only the create-functions for widget kinds `enabled` declares
@@ -403,6 +411,10 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
         funcs_out[n] = c.extism_function_new("natyv_create_divider", &in_types[0], 1, &out_types[0], 1, createDividerHostFn, self, null);
         n += 1;
     }
+    if (enabled.badge) {
+        funcs_out[n] = c.extism_function_new("natyv_create_badge", &in_types[0], 1, &out_types[0], 1, createBadgeHostFn, self, null);
+        n += 1;
+    }
     funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, setTextHostFn, self, null);
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, getTextHostFn, self, null);
@@ -424,7 +436,7 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     return n;
 }
 
-pub const clay_host_function_count = 11;
+pub const clay_host_function_count = 12;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -447,6 +459,7 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[8] = c.extism_function_new("natyv_clay_create_textarea", &in_types[0], 1, &out_types[0], 1, createClayTextAreaHostFn, self, null);
     funcs_out[9] = c.extism_function_new("natyv_clay_create_divider", &in_types[0], 1, &out_types[0], 1, createClayDividerHostFn, self, null);
     funcs_out[10] = c.extism_function_new("natyv_clay_create_toggle", &in_types[0], 1, &out_types[0], 1, createClayToggleHostFn, self, null);
+    funcs_out[11] = c.extism_function_new("natyv_clay_create_badge", &in_types[0], 1, &out_types[0], 1, createClayBadgeHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -553,6 +566,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .checkbox => |*cb| cb.syncText(engine, font),
                 .toggle => |*tg| tg.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),
+                .badge => |*bd| bd.syncText(engine, font),
                 .container, .progress_bar, .slider, .divider => {},
             }
         }
@@ -577,6 +591,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .checkbox => |*cb| cb.destroyText(),
                 .toggle => |*tg| tg.destroyText(),
                 .radio_button => |*r| r.destroyText(),
+                .badge => |*bd| bd.destroyText(),
                 .container, .progress_bar, .slider, .divider => {},
             }
         }
@@ -652,6 +667,7 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                         .checkbox => |*cb| cb.destroyText(),
                         .toggle => |*tg| tg.destroyText(),
                         .radio_button => |*r| r.destroyText(),
+                        .badge => |*bd| bd.destroyText(),
                         .container, .progress_bar, .slider, .divider => {},
                     }
                     if (s.clay_managed) self.layout_generation +%= 1;
@@ -714,6 +730,7 @@ fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .checkbox => |*cb| self.queuePendingTextDestroy(&cb.text_obj),
         .toggle => |*tg| self.queuePendingTextDestroy(&tg.text_obj),
         .radio_button => |*r| self.queuePendingTextDestroy(&r.text_obj),
+        .badge => |*bd| self.queuePendingTextDestroy(&bd.text_obj),
         .container, .progress_bar, .slider, .divider => {},
     }
 }
@@ -975,6 +992,11 @@ const CreateButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []co
 const CreateTextFieldRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
 const CreateTextAreaRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
 const CreateDividerRequest = struct { x: f32, y: f32, w: f32, h: f32 };
+// W14: `tone`'s JSON string parses directly into `Badge.Tone` -- its tags
+// ("primary", "success", etc.) already are the wire names, unlike Clay's
+// own C-enum-value-vs-JSON-string split (see ClayDirectionRequest above),
+// so no separate wire-format enum is needed here.
+const CreateBadgeRequest = struct { x: f32, y: f32, w: f32, h: f32, tone: Badge.Tone = .neutral, label: []const u8 = "" };
 const WidgetIdRequest = struct { widget_id: u32 };
 const CreateLabelRequest = struct { x: f32, y: f32, w: f32 = 0, h: f32 = 20, text: []const u8 = "" };
 const SetTextRequest = struct { widget_id: u32, text: []const u8 };
@@ -1027,6 +1049,7 @@ const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []con
 const ClayTextFieldRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
 const ClayTextAreaRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
 const ClayDividerRequest = struct { layout: ClayLayoutRequest = .{} };
+const ClayBadgeRequest = struct { layout: ClayLayoutRequest = .{}, tone: Badge.Tone = .neutral, label: []const u8 = "" };
 const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const u8 = "" };
 const ClayCheckboxRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
 const ClayToggleRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
@@ -1207,6 +1230,29 @@ fn createDividerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Exti
 
     self.mutex.lockUncancelable(self.io());
     const id = self.insertLocked(.{ .divider = divider });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+fn createBadgeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateBadgeRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const badge = Badge.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.tone, req.label);
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .badge = badge });
     self.mutex.unlock(self.io());
 
     const widget_id = id orelse {
@@ -1413,6 +1459,16 @@ fn createClayDividerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     insertClayWidget(self, plugin, &outputs[0], .{ .divider = divider }, parsed.value.layout, null);
 }
 
+fn createClayBadgeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayBadgeRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const badge = Badge.init(std.mem.zeroes(c.SDL_FRect), parsed.value.tone, parsed.value.label);
+    insertClayWidget(self, plugin, &outputs[0], .{ .badge = badge }, parsed.value.layout, null);
+}
+
 fn createClayLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -1498,6 +1554,7 @@ fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .checkbox => |*cb| cb.setLabel(req.text),
         .toggle => |*tg| tg.setLabel(req.text),
         .radio_button => |*r| r.setLabel(req.text),
+        .badge => |*bd| bd.setLabel(req.text),
         .container, .progress_bar, .slider, .divider => {},
     }
     if (slot.clay_managed) self.layout_generation +%= 1;
@@ -1526,6 +1583,7 @@ fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .checkbox => |cb| cb.label(),
         .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
+        .badge => |bd| bd.label(),
         .container, .progress_bar, .slider, .divider => "",
     };
 
