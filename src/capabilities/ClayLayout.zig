@@ -241,6 +241,53 @@ fn containsId(ids: []const u32, id: u32) bool {
     return false;
 }
 
+/// W18 follow-up: walks `parent_id` up from `slot` to the nearest ancestor
+/// whose *scrollbar* would sit on the edge this axis cares about, and
+/// returns that ancestor's own resolved right/bottom edge minus
+/// `ScrollBar.thickness + ScrollBar.inset` -- the scrollbar always reserves
+/// that much space at the ancestor's own edge (see `ScrollBar.zig`'s
+/// `verticalThumb`/`horizontalThumb`), whether or not one happens to be
+/// visible right now. The mapping is deliberately the *opposite* of what
+/// it might look like at first: a `scroll_vertical` container's scrollbar
+/// is a vertical bar drawn along its own *right* edge (reserves X-axis
+/// space), while a `scroll_horizontal` container's is a horizontal bar
+/// along its own *bottom* edge (reserves Y-axis space) -- confirmed
+/// directly against `ScrollBar.zig`'s real thumb-rect math before writing
+/// this, not assumed. Returns `null` when no scrolling ancestor exists on
+/// this axis, in which case the caller falls back to the plain window
+/// edge, same as before this existed. A scrolling ancestor is typically
+/// narrower/shorter than the whole window (e.g. a fixed-width scrollable
+/// content column), so a floating panel anchored inside one can pass a
+/// whole-window overflow check while still overlapping *that ancestor's*
+/// own scrollbar -- exactly the bug this fixes (found via Quinn's real
+/// click-through on the Tooltip, though the fix applies to every floating
+/// widget generically, not just that one kind).
+fn nearestScrollBoundary(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, vertical: bool) ?f32 {
+    var current_parent = slot.parent_id;
+    while (current_parent) |pid| {
+        var parent: ?WidgetHost.Slot = null;
+        for (slots) |s| {
+            if (s.id == pid) {
+                parent = s;
+                break;
+            }
+        }
+        const p = parent orelse return null;
+        const scrolls = if (vertical) p.clay_style.scroll_horizontal else p.clay_style.scroll_vertical;
+        if (scrolls) {
+            const data = c.Clay_GetElementData(elementId(p.id));
+            if (!data.found) return null;
+            const reserve = ScrollBar.thickness + ScrollBar.inset;
+            return if (vertical)
+                data.boundingBox.y + data.boundingBox.height - reserve
+            else
+                data.boundingBox.x + data.boundingBox.width - reserve;
+        }
+        current_parent = p.parent_id;
+    }
+    return null;
+}
+
 fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet) void {
     for (slots) |slot| {
         if (!slot.clay_managed or !std.meta.eql(slot.parent_id, parent_id)) continue;
@@ -450,11 +497,20 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         if (!slot.clay_managed or !slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) continue;
         const data = c.Clay_GetElementData(elementId(slot.id));
         if (!data.found) continue;
-        if (data.boundingBox.y + data.boundingBox.height > window_h) {
+        // W18 follow-up (Quinn's real click-through feedback, Tooltip):
+        // the whole-window check alone lets a floating panel pass while
+        // still overlapping a *scrollable ancestor's own* scrollbar, if
+        // that ancestor is narrower/shorter than the window itself (this
+        // fixture's own root column is 300px in a 900px window) --
+        // `nearestScrollBoundary` tightens the effective edge to whichever
+        // is closer.
+        const v_bound = if (nearestScrollBoundary(slots, slot, true)) |b| @min(window_h, b) else window_h;
+        if (data.boundingBox.y + data.boundingBox.height > v_bound) {
             v_flip_ids[v_flip_count] = slot.id;
             v_flip_count += 1;
         }
-        if (data.boundingBox.x + data.boundingBox.width > window_w) {
+        const h_bound = if (nearestScrollBoundary(slots, slot, false)) |b| @min(window_w, b) else window_w;
+        if (data.boundingBox.x + data.boundingBox.width > h_bound) {
             h_flip_ids[h_flip_count] = slot.id;
             h_flip_count += 1;
         }
@@ -469,11 +525,87 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         self.recompute_count += 1;
     }
 
+    // W18 follow-up (Quinn's real click-through feedback, round 2): the
+    // flip logic above only ever checks the right/bottom edges -- it
+    // exists purely to pick *which* attach point to use, not to guarantee
+    // the result actually fits. Flipping to right-align (say, to clear a
+    // scroll ancestor's own scrollbar on the right) can just as easily
+    // push a panel wider than its trigger past the *left* edge instead,
+    // which nothing above ever checked -- fixed with a clamp pass here,
+    // after both possible Clay passes have already resolved real geometry.
+    //
+    // Round 1 of this same fix only clamped the floating widget's *own*
+    // box, which visibly moved its background/border but left its
+    // children (e.g. the Tooltip's own text Label) rendering at Clay's
+    // original, unclamped position -- Clay resolves every descendant's
+    // absolute position during its own real layout pass, based on wherever
+    // the parent *actually* ended up per Clay's own math, and has no idea
+    // this clamp exists. So this is genuinely two passes: first compute
+    // each clamped floating widget's correction delta, then apply that
+    // same delta to it *and every one of its descendants* -- walking each
+    // slot's own `parent_id` chain up to find the nearest clamped
+    // ancestor (if any) covers arbitrary nesting depth, not just direct
+    // children.
+    var clamp_ids: [WidgetHost.max_widgets]u32 = undefined;
+    var clamp_dx: [WidgetHost.max_widgets]f32 = undefined;
+    var clamp_dy: [WidgetHost.max_widgets]f32 = undefined;
+    var clamp_count: usize = 0;
+    for (slots) |slot| {
+        if (!slot.clay_managed or !slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) continue;
+        const data = c.Clay_GetElementData(elementId(slot.id));
+        if (!data.found) continue;
+        const box = data.boundingBox;
+        const right_bound = if (nearestScrollBoundary(slots, slot, false)) |b| @min(window_w, b) else window_w;
+        const bottom_bound = if (nearestScrollBoundary(slots, slot, true)) |b| @min(window_h, b) else window_h;
+        // `@max(0, bound - size)` covers the pathological case where the
+        // panel is wider/taller than the space available at all -- pins it
+        // to the left/top edge (still overflowing the far side) rather
+        // than an inverted clamp range with no valid position.
+        const clamped_x = std.math.clamp(box.x, 0, @max(0, right_bound - box.width));
+        const clamped_y = std.math.clamp(box.y, 0, @max(0, bottom_bound - box.height));
+        const dx = clamped_x - box.x;
+        const dy = clamped_y - box.y;
+        if (dx != 0 or dy != 0) {
+            clamp_ids[clamp_count] = slot.id;
+            clamp_dx[clamp_count] = dx;
+            clamp_dy[clamp_count] = dy;
+            clamp_count += 1;
+        }
+    }
+
     for (slots) |slot| {
         if (!slot.clay_managed) continue;
         const data = c.Clay_GetElementData(elementId(slot.id));
         if (data.found) {
-            const box = data.boundingBox;
+            var box = data.boundingBox;
+            // Walk up from this slot itself (covers the clamped floating
+            // widget's own box) through its ancestors (covers every
+            // descendant of one) until a clamped id is found or the chain
+            // ends. `clamp_count` is small in practice (0-2 open floating
+            // panels at once), so a linear scan per level is cheap.
+            var current: ?u32 = slot.id;
+            while (current) |cid| {
+                var found: ?usize = null;
+                for (0..clamp_count) |i| {
+                    if (clamp_ids[i] == cid) {
+                        found = i;
+                        break;
+                    }
+                }
+                if (found) |i| {
+                    box.x += clamp_dx[i];
+                    box.y += clamp_dy[i];
+                    break;
+                }
+                var next_parent: ?u32 = null;
+                for (slots) |s| {
+                    if (s.id == cid) {
+                        next_parent = s.parent_id;
+                        break;
+                    }
+                }
+                current = next_parent;
+            }
             widgets.setRect(io, slot.id, .{ .x = box.x, .y = box.y, .w = box.width, .h = box.height });
         }
     }

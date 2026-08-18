@@ -724,6 +724,196 @@ test "W16: a floating widget that would overflow the right edge of the window fl
     try std.testing.expectApproxEqAbs(trigger_rect.x + trigger_rect.w, panel_rect.x + panel_rect.w, 0.5);
 }
 
+test "W18 follow-up: a floating widget anchored inside a scrolling ancestor flips before it overlaps that ancestor's own scrollbar, even though it'd still fit the whole window" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Mirrors the real bug (Quinn's click-through on the Tooltip): the
+    // scrolling ancestor (200px wide) is far narrower than the 900px
+    // window. A 60px leading spacer pushes the trigger to x=60 (spans
+    // [60,160]) before a 150px floating panel attached left-aligned to it
+    // (spans [60,210]) -- comfortably within the *window* (210 < 900, the
+    // old check alone would never flip this) but its right edge still
+    // passes the ancestor's own effective boundary (200 -
+    // ScrollBar.thickness - ScrollBar.inset = 192) -- i.e. it'd overlap
+    // where that ancestor's own scrollbar sits. The trigger is positioned
+    // with enough room to its right (60..160, room to spare before 192)
+    // that flipping alone fully resolves it without needing the separate
+    // left-edge clamp below -- see the next test for that case.
+    const root_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(900), .height = fixedAxis(700) },
+        .direction = c.CLAY_LEFT_TO_RIGHT,
+    }) orelse return error.RegistryFull;
+    const scroll_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(700) },
+        .scroll_vertical = true,
+    }) orelse return error.RegistryFull;
+    _ = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, scroll_id, .{
+        .sizing = .{ .width = fixedAxis(60), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const trigger_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, scroll_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, trigger_id, .{
+        .sizing = .{ .width = fixedAxis(150), .height = fixedAxis(50) },
+        .floating = true,
+    }) orelse return error.RegistryFull;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    // A flip event means two real Clay_EndLayout calls this recompute.
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var trigger_rect: c.SDL_FRect = undefined;
+    var panel_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == trigger_id) trigger_rect = slot.widget.container.rect;
+        if (slot.id == panel_id) panel_rect = slot.widget.container.rect;
+    }
+
+    // Opened right-aligned to the trigger, not left-aligned -- proves this
+    // is a real flip triggered by the scrolling ancestor's own boundary
+    // (window_w=900 alone would never have flipped a 150px-wide panel).
+    try std.testing.expect(panel_rect.x < trigger_rect.x);
+    try std.testing.expectApproxEqAbs(trigger_rect.x + trigger_rect.w, panel_rect.x + panel_rect.w, 0.5);
+    // Fully clear of the scrollbar now, and never needed clamping to do
+    // it (there was room -- see the doc comment above).
+    try std.testing.expect(panel_rect.x >= 0);
+    try std.testing.expect(panel_rect.x + panel_rect.w <= 192.01);
+}
+
+test "W18 follow-up: a floating widget too wide to clear a scrolling ancestor's scrollbar even after flipping gets clamped to the window's left edge instead of overflowing it" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Exactly Quinn's own follow-up report: flipping alone isn't always
+    // enough -- the flip logic only ever checks the right/bottom edges it
+    // exists to fix, never the opposite edge the flip itself might now
+    // cross. Here the trigger sits flush at the scroll ancestor's own left
+    // edge (x=0) and the panel (195px) is wider than the room flipping can
+    // recover (trigger is only 100px wide), so the flipped position would
+    // land at x=-95 -- past the *window's* own left edge. The final clamp
+    // step pins it to x=0 instead of leaving it negative. This is
+    // explicitly the "not achievable either way" case Quinn accepted as
+    // fine for now (real tooltip/popover content is usually far narrower
+    // than its own scroll column).
+    const root_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(900), .height = fixedAxis(700) },
+        .direction = c.CLAY_LEFT_TO_RIGHT,
+    }) orelse return error.RegistryFull;
+    const scroll_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(700) },
+        .scroll_vertical = true,
+    }) orelse return error.RegistryFull;
+    const trigger_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, scroll_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, trigger_id, .{
+        .sizing = .{ .width = fixedAxis(195), .height = fixedAxis(50) },
+        .floating = true,
+    }) orelse return error.RegistryFull;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var panel_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == panel_id) panel_rect = slot.widget.container.rect;
+    }
+
+    // Never negative -- clamped to the window's own left edge, not left
+    // to overflow it the way the flip alone would have.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), panel_rect.x, 0.01);
+}
+
+test "W18 follow-up (round 2): clamping a floating widget also moves its own children by the same amount, not just its own background" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Exactly the real bug (Quinn's follow-up round): round 1 of the fix
+    // clamped the panel's own rect but left a *child* of the panel (here,
+    // a plain Container standing in for the Tooltip's real Label) at
+    // Clay's original, unclamped resolved position -- Clay computed the
+    // child's absolute position during its own real layout pass, based on
+    // wherever the panel actually landed per Clay's math, with no idea a
+    // clamp would be applied afterward. Same geometry as the previous
+    // test (panel wider than the room flipping can recover), but this one
+    // also has a child 10px in from the panel's own left edge and checks
+    // that the child moved by the exact same delta as the panel did.
+    const root_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(900), .height = fixedAxis(700) },
+        .direction = c.CLAY_LEFT_TO_RIGHT,
+    }) orelse return error.RegistryFull;
+    const scroll_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(700) },
+        .scroll_vertical = true,
+    }) orelse return error.RegistryFull;
+    const trigger_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, scroll_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, trigger_id, .{
+        .sizing = .{ .width = fixedAxis(195), .height = fixedAxis(50) },
+        .padding = .{ .left = 10, .right = 0, .top = 0, .bottom = 0 },
+        .floating = true,
+    }) orelse return error.RegistryFull;
+    const child_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, panel_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(20) },
+    }) orelse return error.RegistryFull;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var panel_rect: c.SDL_FRect = undefined;
+    var child_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == panel_id) panel_rect = slot.widget.container.rect;
+        if (slot.id == child_id) child_rect = slot.widget.container.rect;
+    }
+
+    // The panel itself is clamped to the window's left edge, same as the
+    // previous test.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), panel_rect.x, 0.01);
+    // The child moved along with it, by the exact same amount -- its
+    // 10px left padding offset from the panel is preserved, it isn't
+    // still sitting wherever Clay originally (and wrongly) resolved it.
+    try std.testing.expectApproxEqAbs(panel_rect.x + 10, child_rect.x, 0.01);
+}
+
 // W17: pure host-level tests proving `WidgetHost.setStepperValue`/
 // `setSegmentedIndex` are wired correctly (finds the right slot by id,
 // rejects a mismatched kind, reports the actual resolved value) -- the
