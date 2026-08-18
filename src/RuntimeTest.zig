@@ -432,7 +432,7 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 37, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 38, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
     // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
@@ -443,19 +443,21 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // and its 3 Badges (4 more) + a W15 "?" help Button (1 more) + a W16
     // date/time picker trigger and its result Label (2 more) + a W17
     // Quantity row/label/NumericStepper and a View row/label/
-    // SegmentedControl (6 more) -- 37 widgets total (the dropdown's
-    // floating panel, the modal's panel, the combobox's options panel, the
-    // menu's panel/submenu, the W15 tooltip panel/label, and the W16
-    // picker's own panel/grid/steppers are all only created on demand, not
-    // by natyv_init -- see the W4/W5/W6/W7/W9/W15/W16 tests below; the
-    // toast stack itself IS created here, unlike those, but individual
-    // toasts inside it aren't). Same silent-truncation risk documented at
-    // W1's identical bump from 4 to 8 -- snapshot() caps at out.len with no
-    // error, so every clay-fixture-loading test's buffer needs auditing
-    // whenever natyv_init grows, not just the test being extended.
+    // SegmentedControl (6 more) + a W18 popover trigger (1 more) -- 38
+    // widgets total (the dropdown's floating panel, the modal's panel, the
+    // combobox's options panel, the menu's panel/submenu, the W15 tooltip
+    // panel/label, the W16 picker's own panel/grid/steppers, and the W18
+    // popover's own panel/label/checkbox/close-button are all only created
+    // on demand, not by natyv_init -- see the W4/W5/W6/W7/W9/W15/W16/W18
+    // tests below; the toast stack itself IS created here, unlike those,
+    // but individual toasts inside it aren't). Same silent-truncation risk
+    // documented at W1's identical bump from 4 to 8 -- snapshot() caps at
+    // out.len with no error, so every clay-fixture-loading test's buffer
+    // needs auditing whenever natyv_init grows, not just the test being
+    // extended.
     var snap: [48]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 37), n);
+    try std.testing.expectEqual(@as(usize, 38), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -2705,4 +2707,93 @@ test "W16: month navigation regenerates the grid for the real target month, and 
     }
     const ti = trigger_index orelse return error.MissingTrigger;
     try std.testing.expectEqualStrings("2026-09-10 13:00", snap[ti].widget.button.label());
+}
+
+test "W18: a popover opens with real content, its own Checkbox toggles, its own Close button closes it, and click-away also closes it" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [48]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Show Popover")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+    // Not yet open -- natyv_init only ever creates the trigger itself.
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != tid);
+    }
+    const baseline = n;
+
+    // Real guest-routed open (a real click on the trigger, via
+    // natyv_dispatch -- openPopover).
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    // panel + label + checkbox + close button = 4 new widgets.
+    try std.testing.expectEqual(@as(usize, 4), n - baseline);
+
+    var checkbox_id: ?u32 = null;
+    var close_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .checkbox and std.mem.eql(u8, slot.widget.checkbox.label(), "Don't show this again")) checkbox_id = slot.id;
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Close")) close_id = slot.id;
+    }
+    const cbid = checkbox_id orelse return error.MissingCheckbox;
+    const clid = close_id orelse return error.MissingCloseButton;
+
+    // Host-authoritative click activation -- WidgetHost.toggleCheckbox
+    // itself (not routed through the guest, same precedent the W12 toggle
+    // test already establishes for Toggle) -- confirms the popover's own
+    // Checkbox is genuinely interactive, not just static text like a
+    // Tooltip's. A real mouse click runs this same function via
+    // activateWidget before natyv_dispatch's own "click" event is ever
+    // pushed to the guest, so calling it directly here is what a real
+    // click on this widget actually does, not a bypass of it.
+    for (snap[0..n]) |slot| {
+        if (slot.id == cbid) try std.testing.expect(!slot.widget.checkbox.checked);
+    }
+    runtime.widgets.toggleCheckbox(io, cbid);
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == cbid) try std.testing.expect(slot.widget.checkbox.checked);
+    }
+
+    // A real click on the popover's own Close button closes it.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{clid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    try std.testing.expectEqual(baseline, n);
+
+    // Reopen, then close via click-away instead -- a real `.blur` event
+    // naming some widget id that isn't part of the popover (the "Grow
+    // Button" from W1, unambiguous elsewhere in this fixture), the same
+    // shape main.zig's updateFocus fires on a real click outside.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    try std.testing.expectEqual(@as(usize, 4), n - baseline);
+
+    var grow_button_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Grow Button")) grow_button_id = slot.id;
+    }
+    const gbid = grow_button_id orelse return error.MissingGrowButton;
+    payload = try buildDispatchEnvelope(&dispatch_buf, gbid, "blur", "{\"new_focus_id\":0}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    try std.testing.expectEqual(baseline, n);
 }
