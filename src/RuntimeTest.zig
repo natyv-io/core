@@ -430,7 +430,7 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 30, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 32, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
     // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
@@ -438,19 +438,21 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // toast-stack container (2 more) + a W9 menu trigger button (1 more) +
     // a W11 divider (1 more) + a W10 TextArea and its char-count Label (2
     // more) + a W12 toggle and its status Label (2 more) + a W14 badge row
-    // and its 3 Badges (4 more) + a W15 "?" help Button (1 more) -- 29
-    // widgets total (the dropdown's floating panel, the modal's panel, the
-    // combobox's options panel, the menu's panel/submenu, and the W15
-    // tooltip panel/label are all only created on demand, not by
-    // natyv_init -- see the W4/W5/W6/W7/W9/W15 tests below; the toast stack
-    // itself IS created here, unlike those, but individual toasts inside
-    // it aren't). Same silent-truncation risk documented at W1's identical
+    // and its 3 Badges (4 more) + a W15 "?" help Button (1 more) + a W16
+    // date/time picker trigger and its result Label (2 more) -- 31 widgets
+    // total (the dropdown's floating panel, the modal's panel, the
+    // combobox's options panel, the menu's panel/submenu, the W15 tooltip
+    // panel/label, and the W16 picker's own panel/grid/steppers are all
+    // only created on demand, not by natyv_init -- see the
+    // W4/W5/W6/W7/W9/W15/W16 tests below; the toast stack itself IS
+    // created here, unlike those, but individual toasts inside it
+    // aren't). Same silent-truncation risk documented at W1's identical
     // bump from 4 to 8 -- snapshot() caps at out.len with no error, so
     // every clay-fixture-loading test's buffer needs auditing whenever
     // natyv_init grows, not just the test being extended.
-    var snap: [30]WidgetHost.Slot = undefined;
+    var snap: [32]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 29), n);
+    try std.testing.expectEqual(@as(usize, 31), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -553,6 +555,168 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
 
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+}
+
+fn fixedAxis(v: f32) c.Clay_SizingAxis {
+    return .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = v, .max = v } } };
+}
+
+test "W16: a floating widget that would overflow the bottom of the window flips to open above its trigger instead" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // A top_to_bottom root -- a tall spacer pushes the trigger down near
+    // the bottom of a 700px-tall window (620 + 30 = 650), leaving only
+    // 50px below it. The floating panel is 200px tall, so attaching below
+    // (the default) would put its bottom at 850 -- 150px past the window.
+    const root_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(700) },
+        .direction = c.CLAY_TOP_TO_BOTTOM,
+    }) orelse return error.RegistryFull;
+    _ = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(620) },
+    }) orelse return error.RegistryFull;
+    const trigger_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, trigger_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(200) },
+        .floating = true,
+    }) orelse return error.RegistryFull;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    // A flip event means two real Clay_EndLayout calls this recompute.
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var trigger_rect: c.SDL_FRect = undefined;
+    var panel_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == trigger_id) trigger_rect = slot.widget.container.rect;
+        if (slot.id == panel_id) panel_rect = slot.widget.container.rect;
+    }
+
+    // Fully visible within the window now, not overflowing past it.
+    try std.testing.expect(panel_rect.y + panel_rect.h <= 700.01);
+    // Opened *above* the trigger, not below -- proves this is a real flip,
+    // not just an incidental clamp to some other position.
+    try std.testing.expect(panel_rect.y < trigger_rect.y);
+    try std.testing.expectApproxEqAbs(trigger_rect.y, panel_rect.y + panel_rect.h, 0.5);
+}
+
+test "W16: a floating widget that already fits below its trigger is not flipped" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Same shape as the flip test above, but the trigger sits near the
+    // *top* this time (a 50px spacer, not 620px) -- plenty of room below
+    // for a 200px panel within the 700px window, so this must behave
+    // exactly as it did before this fix existed.
+    const root_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(700) },
+        .direction = c.CLAY_TOP_TO_BOTTOM,
+    }) orelse return error.RegistryFull;
+    _ = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(50) },
+    }) orelse return error.RegistryFull;
+    const trigger_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, trigger_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(200) },
+        .floating = true,
+    }) orelse return error.RegistryFull;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    // No overflow anywhere -- exactly one real Clay_EndLayout, same as
+    // every other unflipped-floating test in this file.
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var trigger_rect: c.SDL_FRect = undefined;
+    var panel_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == trigger_id) trigger_rect = slot.widget.container.rect;
+        if (slot.id == panel_id) panel_rect = slot.widget.container.rect;
+    }
+
+    try std.testing.expectApproxEqAbs(trigger_rect.y + trigger_rect.h, panel_rect.y, 0.5);
+}
+
+test "W16: a floating widget that would overflow the right edge of the window flips to open right-aligned instead" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // A left_to_right root -- a wide spacer pushes the trigger over near
+    // the right edge of a 900px-wide window (750 + 100 = 850), leaving
+    // only 50px to its right. The floating panel is 200px wide, so
+    // attaching left-aligned (the default) would put its right edge at
+    // 1050 -- 150px past the window.
+    const root_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(900), .height = fixedAxis(700) },
+        .direction = c.CLAY_LEFT_TO_RIGHT,
+    }) orelse return error.RegistryFull;
+    _ = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(750), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const trigger_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, root_id, .{
+        .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(30) },
+    }) orelse return error.RegistryFull;
+    const panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, trigger_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(50) },
+        .floating = true,
+    }) orelse return error.RegistryFull;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var trigger_rect: c.SDL_FRect = undefined;
+    var panel_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == trigger_id) trigger_rect = slot.widget.container.rect;
+        if (slot.id == panel_id) panel_rect = slot.widget.container.rect;
+    }
+
+    // Fully visible within the window now, not overflowing past it.
+    try std.testing.expect(panel_rect.x + panel_rect.w <= 900.01);
+    // Opened right-aligned to the trigger, not left-aligned -- proves
+    // this is a real flip, not an incidental clamp.
+    try std.testing.expect(panel_rect.x < trigger_rect.x);
+    try std.testing.expectApproxEqAbs(trigger_rect.x + trigger_rect.w, panel_rect.x + panel_rect.w, 0.5);
 }
 
 test "W2: natyv_clay_create_container's scroll_vertical/scroll_horizontal round-trip into ClayStyle" {
@@ -1192,11 +1356,15 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
     runtime.initGuest(io);
 
     // 24, not 16: natyv_init's 18 widgets (see the L3 test's comment
-    // above), plus this test opens the dropdown (panel + 2 options = 3
-    // more) -- 21 at peak. Same silent-truncation risk documented at
-    // every prior buffer bump in this file -- snapshot() caps at out.len
-    // with no error.
-    var snap: [33]WidgetHost.Slot = undefined;
+    // above, now 31), plus this test opens the dropdown (panel + 2
+    // options = 3 more) -- 34 at peak, comfortably under this buffer's
+    // 50. Same silent-truncation risk documented at every prior buffer
+    // bump in this file -- snapshot() caps at out.len with no error, and
+    // this exact test was the one that caught W16's baseline bump not
+    // being propagated here (option_count came back 1, not 2 -- one real
+    // option button silently truncated away by what was then a
+    // too-small [33] buffer).
+    var snap: [50]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1293,11 +1461,13 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
     defer clay_layout.deinit(allocator);
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
 
-    // 24: natyv_init's 15 widgets (see the L3 test's comment above), plus
-    // this test opens the modal (panel + message + close button = 3 more)
-    // -- 18 at peak. Same silent-truncation risk documented at every prior
-    // buffer bump in this file.
-    var snap: [33]WidgetHost.Slot = undefined;
+    // natyv_init's baseline is now 31 (see the L3 test's comment above),
+    // plus this test opens the modal (panel + message + close button = 3
+    // more) -- 34 at peak, comfortably under this buffer's 50. Same
+    // silent-truncation risk documented at every prior buffer bump in
+    // this file (this exact class of bug is what W16's own dropdown test
+    // caught when its buffer went stale -- see that test's comment).
+    var snap: [50]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1396,11 +1566,12 @@ test "W6: a combobox's .text_changed re-filters, .key_nav moves the highlight an
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 24: natyv_init's 16 widgets (see the L3 test's comment above), plus
-    // this test opens the combobox's panel (up to 5 filtered options) --
-    // well within headroom, same silent-truncation risk documented at
-    // every prior buffer bump in this file.
-    var snap: [33]WidgetHost.Slot = undefined;
+    // natyv_init's baseline is now 31 (see the L3 test's comment above),
+    // plus this test opens the combobox's panel (up to 5 filtered options
+    // + the panel itself = 6 more) -- 37 at peak, comfortably under this
+    // buffer's 50. Same silent-truncation risk documented at every prior
+    // buffer bump in this file.
+    var snap: [50]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -1491,7 +1662,10 @@ test "W6: a real .blur event closes the combobox panel without selecting anythin
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [33]WidgetHost.Slot = undefined;
+    // natyv_init's baseline is now 31 (see the L3 test's comment above),
+    // plus this test opens the combobox's panel with up to 5 filtered
+    // options -- comfortably under this buffer's 50.
+    var snap: [50]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -1545,11 +1719,12 @@ test "W7: a toast round-trips duration_ms into a real expires_at_ms, and destroy
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 24: natyv_init's 18 widgets (see the L3 test's comment above), plus
-    // this test fires one toast (its own Container + a message Label = 2
-    // more) -- 20 at peak. Same silent-truncation risk documented at
-    // every prior buffer bump in this file.
-    var snap: [33]WidgetHost.Slot = undefined;
+    // natyv_init's baseline is now 31 (see the L3 test's comment above),
+    // plus this test fires one toast (its own Container + a message Label
+    // = 2 more) -- 33 at peak, comfortably under this buffer's 50. Same
+    // silent-truncation risk documented at every prior buffer bump in
+    // this file.
+    var snap: [50]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var stack_id: ?u32 = null;
@@ -1641,12 +1816,12 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     defer clay_layout.deinit(allocator);
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
 
-    // 30: natyv_init's 19 widgets (see the L3 test's comment above), plus
-    // this test opens the top-level menu (panel + 3 items = 4 more) and
-    // the submenu (panel + 2 items = 3 more) -- 26 at peak. Same
-    // silent-truncation risk documented at every prior buffer bump in
-    // this file.
-    var snap: [39]WidgetHost.Slot = undefined;
+    // natyv_init's baseline is now 31 (see the L3 test's comment above),
+    // plus this test opens the top-level menu (panel + 3 items = 4 more)
+    // and the submenu (panel + 2 items = 3 more) -- 38 at peak,
+    // comfortably under this buffer's 50. Same silent-truncation risk
+    // documented at every prior buffer bump in this file.
+    var snap: [50]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1967,9 +2142,9 @@ test "W10: a textarea's multi-line content flows through host-level mutation, re
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
+    // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [30]WidgetHost.Slot = undefined;
+    var snap: [32]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one TextArea exists in this fixture -- see natyv_init's own
@@ -2036,9 +2211,9 @@ test "W11: a divider exists, is not focusable, and gets real Clay-computed geome
     defer clay_layout.deinit(allocator);
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
 
-    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
+    // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [30]WidgetHost.Slot = undefined;
+    var snap: [32]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Divider exists in this fixture -- see natyv_init's own
@@ -2081,9 +2256,9 @@ test "W12: a toggle exists, is focusable, activates via a real click, and natyv_
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
+    // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [30]WidgetHost.Slot = undefined;
+    var snap: [32]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Toggle exists in this fixture -- see natyv_init's own
@@ -2140,9 +2315,9 @@ test "W14: three badges exist with their real tones/labels, are not focusable, a
     defer clay_layout.deinit(allocator);
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
 
-    // 30: natyv_init's 29 widgets (see the L3 test's comment above) --
+    // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [30]WidgetHost.Slot = undefined;
+    var snap: [32]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Badge per tone exists in this fixture -- see
@@ -2187,10 +2362,12 @@ test "W15: a real .hover event creates a floating tooltip through a real guest, 
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 31: natyv_init's 29 widgets (28 from W14 plus the new "?" help
-    // Button), plus this test opens the tooltip (Container + Label = 2
-    // more) -- 31 at peak. Same silent-truncation risk documented at every
-    // prior buffer bump in this file.
+    // natyv_init's baseline was 29 when this test was first written (28
+    // from W14 plus the new "?" help Button); now 31 after W16 added its
+    // own trigger+result Label, plus this test opens the tooltip
+    // (Container + Label = 2 more) -- 33 at peak, comfortably under this
+    // buffer's 40. Same silent-truncation risk documented at every prior
+    // buffer bump in this file.
     var snap: [40]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
@@ -2259,4 +2436,200 @@ test "W15: a real .hover event creates a floating tooltip through a real guest, 
     for (snap[0..n]) |slot| {
         try std.testing.expect(slot.parent_id == null or slot.parent_id.? != hid);
     }
+}
+
+test "W16: a date/time picker's calendar grid matches the real month, and selecting a day closes it with the correct picked value" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    // 100: natyv_init's 31 widgets (see the L3 test's comment above), plus
+    // opening the picker at its fixed default (August 2026) -- a real
+    // month, not a hand-picked round number, confirmed independently via
+    // `python3 -c "import datetime; print(datetime.date(2026,8,1).weekday())"`
+    // (Saturday, weekday 5 in Python's Monday=0 scheme -- 6 in Go's own
+    // Sunday=0 `time.Weekday` scheme firstWeekdayOfMonth actually uses)
+    // and 31 real days. Peak widget count for the panel: 1 (panel) + 1
+    // (header row) + 2 (prev/next) + 1 (month/year label) + 1 (weekday
+    // row) + 7 (weekday labels) + 6 (grid rows -- 6 leading blanks + 31
+    // days = 37 cells, ceil(37/7)) + 6 (leading blank spacers) + 31 (day
+    // buttons) + 1 (time row) + 6 (hour/minute steppers+labels) = 63 --
+    // 31 + 63 = 94 at peak, comfortably under this buffer's 100.
+    var snap: [100]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    var result_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Select date/time...")) trigger_id = slot.id;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Picked: (none yet)")) result_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+    const rid = result_id orelse return error.MissingResultLabel;
+    // Not yet open -- natyv_init only ever creates the trigger itself.
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != tid);
+    }
+    const baseline = n;
+
+    // Real guest-routed open (a real click on the trigger, via
+    // natyv_dispatch -- renderDatePickerPanel).
+    var dispatch_buf: [64]u8 = undefined;
+    var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    try std.testing.expectEqual(@as(usize, 63), n - baseline);
+
+    // Exactly one Button labeled "15" exists in this fixture (no other
+    // widget anywhere in it shares that bare-number label) -- the day-15
+    // button, unambiguous to match directly.
+    var day15_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "15")) day15_id = slot.id;
+    }
+    const d15 = day15_id orelse return error.MissingDay15;
+
+    // Real guest-routed selection (a real click on the day-15 button) --
+    // proves selectDay commits {year, month, day, hour, minute} into both
+    // the trigger's own label and the separate result Label (this is
+    // exactly what answers Quinn's "prints out the selected date and
+    // time" ask), and closes the whole panel in one step, same precedent
+    // Dropdown's option click already established.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{d15});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    try std.testing.expectEqual(baseline, n);
+    for (snap[0..n]) |slot| {
+        if (slot.id == tid) try std.testing.expectEqualStrings("2026-08-15 12:00", slot.widget.button.label());
+        if (slot.id == rid) try std.testing.expectEqualStrings("Picked: 2026-08-15 12:00", slot.widget.label.text());
+        // The panel and every one of its descendants must be gone
+        // entirely, not just hidden -- natyv has no "visible" concept,
+        // only exists/doesn't (same precedent every other floating-panel
+        // teardown test in this file already established).
+        try std.testing.expect(slot.parent_id == null or slot.parent_id.? != tid);
+    }
+}
+
+test "W16: month navigation regenerates the grid for the real target month, and a time-stepper click adjusts exactly one of hour/minute" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [100]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Select date/time...")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+
+    var dispatch_buf: [64]u8 = undefined;
+    var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    // Exactly one Button labeled "›" exists while the panel is open --
+    // the next-month button.
+    var next_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "›")) next_id = slot.id;
+    }
+    const nid = next_id orelse return error.MissingNextButton;
+
+    // Real guest-routed month navigation (a real click on "›") -- August
+    // 2026 -> September 2026. September 1 2026 is a Tuesday (confirmed
+    // independently the same way August's was, above) -- 2 leading
+    // blanks, 30 real days.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{nid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var header_found = false;
+    var day10_id: ?u32 = null;
+    var day31_found = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "September 2026")) header_found = true;
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "10")) day10_id = slot.id;
+        // September has only 30 days -- a "31" day button must NOT exist
+        // in this month's real grid (proves the grid actually
+        // regenerated against the new month, not just relabeled the
+        // header while leaving August's 31-day grid in place).
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "31")) day31_found = true;
+    }
+    try std.testing.expect(header_found);
+    try std.testing.expect(!day31_found);
+    _ = day10_id orelse return error.MissingDay10;
+
+    // Real guest-routed time-stepper click. Both the hour-plus and
+    // minute-plus buttons share the label "+" (see renderDatePickerPanel's
+    // own doc comment on why natyv's widget registry gives no reliable
+    // way to tell same-labeled siblings apart by snapshot order alone) --
+    // clicking whichever one is found first still proves the mechanism
+    // generically: exactly one of the two default values (hour 12,
+    // minute 00) must have moved by exactly one step afterward.
+    var plus_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "+")) plus_id = slot.id;
+    }
+    const pid = plus_id orelse return error.MissingPlusButton;
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{pid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var saw_13 = false;
+    var saw_05 = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .label) continue;
+        if (std.mem.eql(u8, slot.widget.label.text(), "13")) saw_13 = true;
+        if (std.mem.eql(u8, slot.widget.label.text(), "05")) saw_05 = true;
+    }
+    // Exactly one of the two steppers advanced -- either hour 12->13
+    // (minute stays 00, "05" never appears) or minute 00->05 (hour stays
+    // 12, "13" never appears), never both, never neither.
+    try std.testing.expect(saw_13 != saw_05);
+
+    // Re-find the day-10 button -- renderDatePickerPanel rebuilds the
+    // *entire* panel on every interaction, including a stepper click (see
+    // its own doc comment for why), so the id found above no longer
+    // exists; a fresh scan is required, not reuse.
+    day10_id = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "10")) day10_id = slot.id;
+    }
+    const d10_after = day10_id orelse return error.MissingDay10;
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{d10_after});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    // Indexed directly into `snap` (not through a `for (...) |slot|`
+    // by-value copy) so the retained label slice still points into the
+    // real, still-alive snapshot array below, not a loop-local copy that
+    // goes out of scope at the end of its own iteration.
+    var trigger_index: ?usize = null;
+    for (0..n) |i| {
+        if (snap[i].id == tid) trigger_index = i;
+    }
+    const ti = trigger_index orelse return error.MissingTrigger;
+    const expected = if (saw_13) "2026-09-10 13:00" else "2026-09-10 12:05";
+    try std.testing.expectEqualStrings(expected, snap[ti].widget.button.label());
 }

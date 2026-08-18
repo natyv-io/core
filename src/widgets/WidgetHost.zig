@@ -124,7 +124,19 @@ const HostFunctions = @import("WidgetHostFunctions.zig");
 
 const Self = @This();
 
-pub const max_widgets = 64;
+/// W16: bumped from 64 -- a real calendar grid (Date & time picker) can
+/// have ~60 widgets live at once at peak (week rows, day-number buttons,
+/// leading blank spacer cells, weekday/month headers, time steppers), and
+/// clay-fixture's own natyv_init already creates ~29 on top of that before
+/// the picker is even opened. Every other fixed-size array in the codebase
+/// keyed to widget count (DrawBatcher.zig, ClayLayout.zig's snapshot
+/// buffer, the expiry-cascade buffers below) derives from this one
+/// constant, so this is the only line that needs to change. Memory cost is
+/// trivial (a few more KB across small fixed-size arrays of small
+/// structs) -- a deliberate, explained bump per
+/// feedback_natyv_memory_efficiency's own "as new widgets/capabilities
+/// land" anticipation, not organic creep.
+pub const max_widgets = 128;
 // button/textfield/label create, set_text, get_text, destroy_widget (6) +
 // checkbox/radio_button/progress_bar create (3) + get_checked/set_checked/
 // get_value/set_value (4) -- W1 widget breadth. + slider create (1) -- W3.
@@ -500,10 +512,20 @@ fn insertLockedWithLayout(self: *Self, widget: Widget, parent_id: ?u32, clay_sty
 /// for now it's exercised by Runtime.zig's own L2 test, since only a test
 /// file's own root gets its `test` blocks reliably discovered under Zig's
 /// lazy analysis (same lesson as the ClayLayout import above).
+///
+/// W16: also marks the inserted widget `clay_managed` (same as
+/// `insertLockedWithLayoutValidated` below always does) -- L2's own test
+/// never needed a real Clay layout pass over what this inserts, but
+/// `openChildren` skips anything not `clay_managed`, so a test that *does*
+/// want one (see RuntimeTest.zig's W16 flip-above test, which constructs
+/// a scenario directly rather than through a compiled guest) needs this
+/// set to get real computed geometry back at all.
 pub fn insertWithLayout(self: *Self, call_io: Io, widget: Widget, parent_id: ?u32, clay_style: ClayStyle) ?u32 {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
-    return self.insertLockedWithLayout(widget, parent_id, clay_style);
+    const id = self.insertLockedWithLayout(widget, parent_id, clay_style) orelse return null;
+    if (self.findLocked(id)) |slot| slot.clay_managed = true;
+    return id;
 }
 
 const InsertClayError = error{ NoSuchParent, RegistryFull };

@@ -219,7 +219,29 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
 /// open/configure/(recurse)/close nesting Clay's macros would produce, but
 /// driven from the flat parent_id-linked registry snapshot instead of
 /// nested source-level scopes.
-fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
+/// W16: names plain-`floating` widgets (never `modal`/`toast`, see the
+/// `floating` branch below) that should flip along one axis this pass --
+/// `v_ids` opens *above* the parent instead of below, `h_ids` opens
+/// *right-aligned* to the parent instead of left-aligned. Both empty on
+/// `layoutIfNeeded`'s first, optimistic pass; populated only for a rare
+/// second pass, when the first pass's results showed one or more
+/// overflowing the window on that axis. A widget can appear in both sets
+/// at once (e.g. a panel that overflows both the bottom and the right
+/// edge). See `layoutIfNeeded`'s own doc comment for the full
+/// measure-then-decide story -- a floating element's real resolved
+/// position isn't known until *after* a real `Clay_EndLayout()`, so this
+/// can never be decided during a single declare pass.
+const FlipSet = struct {
+    v_ids: []const u32 = &.{},
+    h_ids: []const u32 = &.{},
+};
+
+fn containsId(ids: []const u32, id: u32) bool {
+    for (ids) |x| if (x == id) return true;
+    return false;
+}
+
+fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet) void {
     for (slots) |slot| {
         if (!slot.clay_managed or !std.meta.eql(slot.parent_id, parent_id)) continue;
 
@@ -287,14 +309,40 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32) void {
                 .zIndex = 1,
             };
         } else if (slot.clay_style.floating) {
+            // W16: flips vertically (element's own bottom touches the
+            // parent's top instead of the reverse) and/or horizontally
+            // (element's own right edge touches the parent's right edge
+            // instead of left-to-left) when this pass's `flips` says this
+            // widget's normal "open below-left" position would overflow
+            // the window on that axis -- see layoutIfNeeded's two-pass
+            // doc comment. The two axes are independent -- a widget can
+            // flip both at once (bottom-right corner case).
+            const flip_v = containsId(flips.v_ids, slot.id);
+            const flip_h = containsId(flips.h_ids, slot.id);
+            const parent_point = if (flip_v and flip_h)
+                c.CLAY_ATTACH_POINT_RIGHT_TOP
+            else if (flip_v)
+                c.CLAY_ATTACH_POINT_LEFT_TOP
+            else if (flip_h)
+                c.CLAY_ATTACH_POINT_RIGHT_BOTTOM
+            else
+                c.CLAY_ATTACH_POINT_LEFT_BOTTOM;
+            const element_point = if (flip_v and flip_h)
+                c.CLAY_ATTACH_POINT_RIGHT_BOTTOM
+            else if (flip_v)
+                c.CLAY_ATTACH_POINT_LEFT_BOTTOM
+            else if (flip_h)
+                c.CLAY_ATTACH_POINT_RIGHT_TOP
+            else
+                c.CLAY_ATTACH_POINT_LEFT_TOP;
             decl.floating = .{
                 .attachTo = c.CLAY_ATTACH_TO_PARENT,
-                .attachPoints = .{ .parent = c.CLAY_ATTACH_POINT_LEFT_BOTTOM, .element = c.CLAY_ATTACH_POINT_LEFT_TOP },
+                .attachPoints = .{ .parent = @intCast(parent_point), .element = @intCast(element_point) },
                 .zIndex = 1,
             };
         }
         c.Clay__ConfigureOpenElement(decl);
-        openChildren(slots, slot.id);
+        openChildren(slots, slot.id, flips);
         c.Clay__CloseElement();
     }
 }
@@ -367,11 +415,59 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
     root_decl.layout.sizing.height = .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = window_h, .max = window_h } } };
     c.Clay__OpenElementWithId(rootElementId());
     c.Clay__ConfigureOpenElement(root_decl);
-    openChildren(slots, null);
+    openChildren(slots, null, .{});
     c.Clay__CloseElement();
 
     _ = c.Clay_EndLayout(0.0);
     self.recompute_count += 1;
+
+    // W16: a plain-floating widget (never modal/toast -- see their own
+    // fixed anchors above) whose "open below-left" position from this
+    // first pass would extend past the bottom and/or right edge of the
+    // window gets a second real pass with its attach point flipped on
+    // whichever axis(es) overflowed. A floating element's real resolved
+    // position is only known *after* a real Clay_EndLayout() (confirmed
+    // against vendor/clay/clay.h -- floating positions are resolved in a
+    // pass after normal box measurement), so this can never be decided
+    // during the single declare pass above -- there's no way to "ask
+    // first." Re-running the whole pass (not just patching the one
+    // widget's position after the fact) also correctly re-resolves any
+    // *nested* floating content anchored to it (e.g. a submenu anchored
+    // to a just-flipped menu panel), since Clay computes each floating
+    // element's position against its own parent's already-computed box.
+    //
+    // Clay_UpdateScrollContainers is still only called once above, not
+    // again here -- confirmed against the real implementation
+    // (vendor/clay/clay.h) that it's tied to this function's own "real
+    // recompute" event, not to each individual Begin/EndLayout pair; the
+    // scroll position it already applied this recompute carries over
+    // unchanged into this second pass's own openChildren declarations.
+    var v_flip_ids: [WidgetHost.max_widgets]u32 = undefined;
+    var v_flip_count: usize = 0;
+    var h_flip_ids: [WidgetHost.max_widgets]u32 = undefined;
+    var h_flip_count: usize = 0;
+    for (slots) |slot| {
+        if (!slot.clay_managed or !slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) continue;
+        const data = c.Clay_GetElementData(elementId(slot.id));
+        if (!data.found) continue;
+        if (data.boundingBox.y + data.boundingBox.height > window_h) {
+            v_flip_ids[v_flip_count] = slot.id;
+            v_flip_count += 1;
+        }
+        if (data.boundingBox.x + data.boundingBox.width > window_w) {
+            h_flip_ids[h_flip_count] = slot.id;
+            h_flip_count += 1;
+        }
+    }
+    if (v_flip_count > 0 or h_flip_count > 0) {
+        c.Clay_BeginLayout();
+        c.Clay__OpenElementWithId(rootElementId());
+        c.Clay__ConfigureOpenElement(root_decl);
+        openChildren(slots, null, .{ .v_ids = v_flip_ids[0..v_flip_count], .h_ids = h_flip_ids[0..h_flip_count] });
+        c.Clay__CloseElement();
+        _ = c.Clay_EndLayout(0.0);
+        self.recompute_count += 1;
+    }
 
     for (slots) |slot| {
         if (!slot.clay_managed) continue;

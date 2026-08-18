@@ -4,6 +4,25 @@
 //! drawing that widget -- or null if no ancestor scroll-clips it. Nested
 //! scroll ancestors "just work" via intersection, not explicitly banned.
 //!
+//! W16 follow-up (Quinn's real click-through feedback, first surfaced by
+//! the Date & time picker's floating panel being clipped away when its
+//! trigger lived inside a newly-scrollable fixture root): a
+//! floating/modal/toast widget's own position already escapes normal
+//! flow (see WidgetHost.ClayStyle's own doc comments and
+//! `drawFloatingWidget`'s separate draw pass) -- it shouldn't then
+//! inherit clipping from an ordinary-flow ancestor's scroll viewport
+//! either, the same way a floating panel draws on top of everything else
+//! regardless of where it's structurally parented. Two changes: (1) a
+//! floating/modal/toast widget itself always gets clip `null` outright,
+//! not run through the ancestor walk at all; (2) the ancestor walk for
+//! any *other* (non-floating) widget still applies each ancestor's own
+//! scroll clip as before, but stops climbing the instant it reaches a
+//! floating/modal/toast ancestor -- that ancestor's own subtree (e.g. a
+//! floating panel's day-button children) shouldn't inherit clipping from
+//! whatever the floating panel itself happens to be parented under
+//! either, even though the panel's *own* scroll clip (if it had one)
+//! still applies to them first.
+//!
 //! Pure, no SDL rendering calls -- unit-tested directly, same "pure
 //! bucketing logic" precedent as DrawBatcher.add.
 
@@ -15,7 +34,13 @@ const WidgetHost = @import("widgets/WidgetHost.zig");
 /// widget's own rect goes through `Widget.rectPtr()`, which requires
 /// `*Widget`.
 pub fn computeClipRects(slots: []WidgetHost.Slot, out: []?c.SDL_FRect) void {
-    for (slots, 0..) |*slot, i| out[i] = clipRectFor(slots, slot.parent_id);
+    for (slots, 0..) |*slot, i| {
+        if (slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) {
+            out[i] = null;
+        } else {
+            out[i] = clipRectFor(slots, slot.parent_id);
+        }
+    }
 }
 
 fn clipRectFor(slots: []WidgetHost.Slot, parent_id: ?u32) ?c.SDL_FRect {
@@ -26,6 +51,7 @@ fn clipRectFor(slots: []WidgetHost.Slot, parent_id: ?u32) ?c.SDL_FRect {
         if (parent.clay_style.scroll_vertical or parent.clay_style.scroll_horizontal) {
             result = intersect(result, parent.widget.rectPtr().*);
         }
+        if (parent.clay_style.floating or parent.clay_style.modal or parent.clay_style.toast) break;
         current = parent.parent_id;
     }
     return result;
@@ -64,6 +90,19 @@ fn leafSlot(id: u32, parent_id: ?u32) WidgetHost.Slot {
         .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) },
         .parent_id = parent_id,
         .clay_style = .{},
+        .clay_managed = true,
+    };
+}
+
+/// W16: a floating container -- same shape as `containerSlot`, but sets
+/// `floating` instead of taking scroll flags (a widget is never both in
+/// this codebase's own usage, see WidgetHost.ClayStyle's doc comments).
+fn floatingSlot(id: u32, parent_id: ?u32, rect: c.SDL_FRect) WidgetHost.Slot {
+    return .{
+        .id = id,
+        .widget = .{ .container = Container.init(rect, false) },
+        .parent_id = parent_id,
+        .clay_style = .{ .floating = true },
         .clay_managed = true,
     };
 }
@@ -123,4 +162,34 @@ test "a plain non-scroll container between a widget and a further scroll ancesto
     try std.testing.expectEqual(@as(f32, 5), out[2].?.y);
     try std.testing.expectEqual(@as(f32, 400), out[2].?.w);
     try std.testing.expectEqual(@as(f32, 400), out[2].?.h);
+}
+
+test "W16: a floating widget parented under a scroll container gets no clip at all" {
+    var slots = [_]WidgetHost.Slot{
+        containerSlot(1, null, .{ .x = 0, .y = 0, .w = 300, .h = 640 }, true, false),
+        leafSlot(2, 1), // an ordinary trigger button inside the scroll root
+        floatingSlot(3, 2, .{ .x = 0, .y = 700, .w = 244, .h = 300 }), // its floating panel, positioned below the fold
+    };
+    var out: [3]?c.SDL_FRect = undefined;
+    computeClipRects(&slots, &out);
+    // The trigger (an ordinary, non-floating widget) is still correctly
+    // clipped to the scroll root, same as before this fix.
+    try std.testing.expect(out[1] != null);
+    // The floating panel itself must NOT be clipped to the scroll root,
+    // even though it's structurally parented under a widget that is --
+    // it draws on top of everything else, same as a Dropdown/Menu panel
+    // already does, regardless of where its trigger happens to live.
+    try std.testing.expectEqual(@as(?c.SDL_FRect, null), out[2]);
+}
+
+test "W16: a plain child nested inside a floating panel doesn't inherit clipping from above the floating boundary either" {
+    var slots = [_]WidgetHost.Slot{
+        containerSlot(1, null, .{ .x = 0, .y = 0, .w = 300, .h = 640 }, true, false),
+        leafSlot(2, 1),
+        floatingSlot(3, 2, .{ .x = 0, .y = 700, .w = 244, .h = 300 }),
+        leafSlot(4, 3), // e.g. one of the picker's day-number buttons
+    };
+    var out: [4]?c.SDL_FRect = undefined;
+    computeClipRects(&slots, &out);
+    try std.testing.expectEqual(@as(?c.SDL_FRect, null), out[3]);
 }
