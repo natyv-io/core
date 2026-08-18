@@ -114,6 +114,8 @@ const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
 const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
+const NumericStepper = @import("NumericStepper.zig");
+const SegmentedControl = @import("SegmentedControl.zig");
 // The Extism host-function wire layer (natyv_create_*/natyv_clay_create_*
 // callbacks and the generic set/get/destroy ones) lives in its own file --
 // see WidgetHostFunctions.zig's doc comment for why, and for the mutual
@@ -147,9 +149,11 @@ pub const max_widgets = 128;
 // the existing natyv_set_checked/natyv_get_checked host functions (no new
 // ones needed for those), same as radio_button already does.
 // + badge create (1) -- W14, same natyv_clay_create_badge split.
-pub const host_function_count = 18;
+// + numeric_stepper/segmented_control create (2) -- W17, same
+// natyv_clay_create_* split.
+pub const host_function_count = 20;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge, numeric_stepper, segmented_control };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -163,6 +167,8 @@ pub const Widget = union(WidgetKind) {
     slider: Slider,
     divider: Divider,
     badge: Badge,
+    numeric_stepper: NumericStepper,
+    segmented_control: SegmentedControl,
 
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
@@ -182,6 +188,8 @@ pub const Widget = union(WidgetKind) {
             .slider => |*s| &s.rect,
             .divider => |*d| &d.rect,
             .badge => |*bd| &bd.rect,
+            .numeric_stepper => |*ns| &ns.rect,
+            .segmented_control => |*sc| &sc.rect,
         };
     }
 
@@ -219,6 +227,10 @@ pub const Widget = union(WidgetKind) {
             // W14: same "always fills" precedent as Divider -- a Badge is
             // a pill, not a checkmark-on-demand.
             .badge => |bd| .{ .color = bd.fillColor(), .rect = bd.rect },
+            // W17: both are multi-region custom draws (minus/plus zones,
+            // or N segments) -- same "opts out of the single-color batched
+            // fill" precedent Slider/Toggle already established.
+            .numeric_stepper, .segmented_control => null,
         };
     }
 
@@ -228,7 +240,7 @@ pub const Widget = union(WidgetKind) {
     /// participate in Tab order.
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
-            .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider => true,
+            .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .numeric_stepper, .segmented_control => true,
             .label, .container, .progress_bar, .divider, .badge => false,
         };
     }
@@ -246,6 +258,8 @@ pub const Widget = union(WidgetKind) {
             .toggle => |*tg| tg.focused = focused,
             .radio_button => |*r| r.focused = focused,
             .slider => |*s| s.focused = focused,
+            .numeric_stepper => |*ns| ns.focused = focused,
+            .segmented_control => |*sc| sc.focused = focused,
             .label, .container, .progress_bar, .divider, .badge => {},
         }
     }
@@ -375,6 +389,8 @@ pub const EnabledKinds = struct {
     slider: bool = true,
     divider: bool = true,
     badge: bool = true,
+    numeric_stepper: bool = true,
+    segmented_control: bool = true,
 };
 
 /// Registers only the create-functions for widget kinds `enabled` declares
@@ -434,6 +450,14 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
         funcs_out[n] = c.extism_function_new("natyv_create_badge", &in_types[0], 1, &out_types[0], 1, HostFunctions.createBadgeHostFn, self, null);
         n += 1;
     }
+    if (enabled.numeric_stepper) {
+        funcs_out[n] = c.extism_function_new("natyv_create_numeric_stepper", &in_types[0], 1, &out_types[0], 1, HostFunctions.createNumericStepperHostFn, self, null);
+        n += 1;
+    }
+    if (enabled.segmented_control) {
+        funcs_out[n] = c.extism_function_new("natyv_create_segmented_control", &in_types[0], 1, &out_types[0], 1, HostFunctions.createSegmentedControlHostFn, self, null);
+        n += 1;
+    }
     funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, HostFunctions.setTextHostFn, self, null);
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, HostFunctions.getTextHostFn, self, null);
@@ -455,7 +479,7 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     return n;
 }
 
-pub const clay_host_function_count = 12;
+pub const clay_host_function_count = 14;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -479,6 +503,8 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[9] = c.extism_function_new("natyv_clay_create_divider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayDividerHostFn, self, null);
     funcs_out[10] = c.extism_function_new("natyv_clay_create_toggle", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayToggleHostFn, self, null);
     funcs_out[11] = c.extism_function_new("natyv_clay_create_badge", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayBadgeHostFn, self, null);
+    funcs_out[12] = c.extism_function_new("natyv_clay_create_numeric_stepper", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayNumericStepperHostFn, self, null);
+    funcs_out[13] = c.extism_function_new("natyv_clay_create_segmented_control", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySegmentedControlHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -601,6 +627,8 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .toggle => |*tg| tg.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),
                 .badge => |*bd| bd.syncText(engine, font),
+                .numeric_stepper => |*ns| ns.syncText(engine, font),
+                .segmented_control => |*sc| sc.syncText(engine, font),
                 .container, .progress_bar, .slider, .divider => {},
             }
         }
@@ -626,6 +654,8 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .toggle => |*tg| tg.destroyText(),
                 .radio_button => |*r| r.destroyText(),
                 .badge => |*bd| bd.destroyText(),
+                .numeric_stepper => |*ns| ns.destroyText(),
+                .segmented_control => |*sc| sc.destroyText(),
                 .container, .progress_bar, .slider, .divider => {},
             }
         }
@@ -702,6 +732,8 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                         .toggle => |*tg| tg.destroyText(),
                         .radio_button => |*r| r.destroyText(),
                         .badge => |*bd| bd.destroyText(),
+                        .numeric_stepper => |*ns| ns.destroyText(),
+                        .segmented_control => |*sc| sc.destroyText(),
                         .container, .progress_bar, .slider, .divider => {},
                     }
                     if (s.clay_managed) self.layout_generation +%= 1;
@@ -766,6 +798,12 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .toggle => |*tg| self.queuePendingTextDestroy(&tg.text_obj),
         .radio_button => |*r| self.queuePendingTextDestroy(&r.text_obj),
         .badge => |*bd| self.queuePendingTextDestroy(&bd.text_obj),
+        .numeric_stepper => |*ns| self.queuePendingTextDestroy(&ns.text_obj),
+        // W17: up to `SegmentedControl.max_segments` (6) text objects per
+        // widget -- still well within `pending_text_destroys`' documented
+        // "practically unreachable" slack (256 slots) for any realistic
+        // number of segmented controls destroyed in a single frame.
+        .segmented_control => |*sc| for (0..sc.count) |i| self.queuePendingTextDestroy(&sc.text_objs[i]),
         .container, .progress_bar, .slider, .divider => {},
     }
 }
@@ -1020,5 +1058,34 @@ pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
     const old = slot.widget.slider.value;
     slot.widget.slider.setValue(value);
     const new = slot.widget.slider.value;
+    return if (new != old) new else null;
+}
+
+/// W17: the `NumericStepper` counterpart to `setSliderValue` -- same shape,
+/// same "return the actual resolved value, or null if unchanged/wrong
+/// kind" contract, integer-valued and going through `NumericStepper.resolve`
+/// (clamp or wrap, see that function's doc comment) instead of a plain
+/// [0,1] clamp.
+pub fn setStepperValue(self: *Self, call_io: Io, id: u32, value: i32) ?i32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(id) orelse return null;
+    if (slot.widget != .numeric_stepper) return null;
+    const old = slot.widget.numeric_stepper.value;
+    slot.widget.numeric_stepper.setValue(value);
+    const new = slot.widget.numeric_stepper.value;
+    return if (new != old) new else null;
+}
+
+/// W17: the `SegmentedControl` counterpart to `setSliderValue` -- same
+/// shape, clamping via `SegmentedControl.select` instead of a value range.
+pub fn setSegmentedIndex(self: *Self, call_io: Io, id: u32, index: usize) ?usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(id) orelse return null;
+    if (slot.widget != .segmented_control) return null;
+    const old = slot.widget.segmented_control.selected_index;
+    slot.widget.segmented_control.select(index);
+    const new = slot.widget.segmented_control.selected_index;
     return if (new != old) new else null;
 }

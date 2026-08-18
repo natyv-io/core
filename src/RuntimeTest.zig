@@ -24,6 +24,8 @@ const TextField = @import("widgets/TextField.zig");
 const TextArea = @import("widgets/TextArea.zig");
 const Label = @import("widgets/Label.zig");
 const RadioButton = @import("widgets/RadioButton.zig");
+const NumericStepper = @import("widgets/NumericStepper.zig");
+const SegmentedControl = @import("widgets/SegmentedControl.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
@@ -89,7 +91,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
             },
             .label => {},
             .container => {},
-            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .textarea, .divider, .badge => {},
+            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .textarea, .divider, .badge, .numeric_stepper, .segmented_control => {},
         }
     }
 
@@ -430,7 +432,7 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 32, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 37, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
     // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
@@ -439,20 +441,21 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // a W11 divider (1 more) + a W10 TextArea and its char-count Label (2
     // more) + a W12 toggle and its status Label (2 more) + a W14 badge row
     // and its 3 Badges (4 more) + a W15 "?" help Button (1 more) + a W16
-    // date/time picker trigger and its result Label (2 more) -- 31 widgets
-    // total (the dropdown's floating panel, the modal's panel, the
-    // combobox's options panel, the menu's panel/submenu, the W15 tooltip
-    // panel/label, and the W16 picker's own panel/grid/steppers are all
-    // only created on demand, not by natyv_init -- see the
-    // W4/W5/W6/W7/W9/W15/W16 tests below; the toast stack itself IS
-    // created here, unlike those, but individual toasts inside it
-    // aren't). Same silent-truncation risk documented at W1's identical
-    // bump from 4 to 8 -- snapshot() caps at out.len with no error, so
-    // every clay-fixture-loading test's buffer needs auditing whenever
-    // natyv_init grows, not just the test being extended.
-    var snap: [32]WidgetHost.Slot = undefined;
+    // date/time picker trigger and its result Label (2 more) + a W17
+    // Quantity row/label/NumericStepper and a View row/label/
+    // SegmentedControl (6 more) -- 37 widgets total (the dropdown's
+    // floating panel, the modal's panel, the combobox's options panel, the
+    // menu's panel/submenu, the W15 tooltip panel/label, and the W16
+    // picker's own panel/grid/steppers are all only created on demand, not
+    // by natyv_init -- see the W4/W5/W6/W7/W9/W15/W16 tests below; the
+    // toast stack itself IS created here, unlike those, but individual
+    // toasts inside it aren't). Same silent-truncation risk documented at
+    // W1's identical bump from 4 to 8 -- snapshot() caps at out.len with no
+    // error, so every clay-fixture-loading test's buffer needs auditing
+    // whenever natyv_init grows, not just the test being extended.
+    var snap: [48]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 31), n);
+    try std.testing.expectEqual(@as(usize, 37), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -717,6 +720,75 @@ test "W16: a floating widget that would overflow the right edge of the window fl
     // this is a real flip, not an incidental clamp.
     try std.testing.expect(panel_rect.x < trigger_rect.x);
     try std.testing.expectApproxEqAbs(trigger_rect.x + trigger_rect.w, panel_rect.x + panel_rect.w, 0.5);
+}
+
+// W17: pure host-level tests proving `WidgetHost.setStepperValue`/
+// `setSegmentedIndex` are wired correctly (finds the right slot by id,
+// rejects a mismatched kind, reports the actual resolved value) -- the
+// same "insertWithLayout directly, no compiled guest needed" pattern the
+// W16 flip tests above already establish. The underlying clamp/wrap/
+// clamp-index logic itself is already covered by NumericStepper.zig's and
+// SegmentedControl.zig's own pure geometry tests; this only proves
+// `main.zig`'s Left/Right keyboard handling (which calls these exact
+// functions with an already-delta'd value, see `notifyStepperValue`/
+// `notifySegmentedValue`) reaches a real widget correctly.
+test "W17: WidgetHost.setStepperValue resolves an out-of-range value and reports what actually got stored" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    // hour 23, wrap=true -- mirrors the Date & time picker's own hour
+    // stepper exactly. A Left/Right press computes `value +/- step`
+    // (here: 23 + 1 = 24) and hands the raw, unresolved result to
+    // setStepperValue, same as `notifyStepperValue` does.
+    const id = runtime.widgets.insertWithLayout(io, .{ .numeric_stepper = NumericStepper.init(.{ .x = 0, .y = 0, .w = 90, .h = 24 }, 23, 0, 23, 1, true) }, null, .{}) orelse return error.RegistryFull;
+
+    const resolved = runtime.widgets.setStepperValue(io, id, 24) orelse return error.ValueUnchanged;
+    try std.testing.expectEqual(@as(i32, 0), resolved);
+
+    var snap: [4]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == id) try std.testing.expectEqual(@as(i32, 0), slot.widget.numeric_stepper.value);
+    }
+
+    // Wrong kind -- a container id was never a numeric_stepper, must
+    // report "no change" rather than silently mutating something.
+    const other_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}) orelse return error.RegistryFull;
+    try std.testing.expectEqual(@as(?i32, null), runtime.widgets.setStepperValue(io, other_id, 5));
+}
+
+test "W17: WidgetHost.setSegmentedIndex clamps an out-of-range index and reports what actually got stored" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    const id = runtime.widgets.insertWithLayout(io, .{ .segmented_control = SegmentedControl.init(.{ .x = 0, .y = 0, .w = 180, .h = 24 }, &.{ "List", "Grid", "Table" }, 2) }, null, .{}) orelse return error.RegistryFull;
+
+    // A Right press at the last segment computes `selected_index + 1`
+    // (here: 2 + 1 = 3), same as `notifySegmentedValue` does -- out of
+    // range for a 3-segment control, must clamp to the last index (2),
+    // not wrap or go out of bounds.
+    const resolved = runtime.widgets.setSegmentedIndex(io, id, 3);
+    try std.testing.expectEqual(@as(?usize, null), resolved); // unchanged: already at 2, clamps back to 2.
+
+    var snap: [4]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == id) try std.testing.expectEqual(@as(usize, 2), slot.widget.segmented_control.selected_index);
+    }
+
+    // A real change: Left from index 2 -> 1.
+    const moved = runtime.widgets.setSegmentedIndex(io, id, 1) orelse return error.ValueUnchanged;
+    try std.testing.expectEqual(@as(usize, 1), moved);
 }
 
 test "W2: natyv_clay_create_container's scroll_vertical/scroll_horizontal round-trip into ClayStyle" {
@@ -2452,7 +2524,7 @@ test "W16: a date/time picker's calendar grid matches the real month, and select
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 100: natyv_init's 31 widgets (see the L3 test's comment above), plus
+    // 100: natyv_init's 37 widgets (see the L3 test's comment above), plus
     // opening the picker at its fixed default (August 2026) -- a real
     // month, not a hand-picked round number, confirmed independently via
     // `python3 -c "import datetime; print(datetime.date(2026,8,1).weekday())"`
@@ -2462,8 +2534,9 @@ test "W16: a date/time picker's calendar grid matches the real month, and select
     // (header row) + 2 (prev/next) + 1 (month/year label) + 1 (weekday
     // row) + 7 (weekday labels) + 6 (grid rows -- 6 leading blanks + 31
     // days = 37 cells, ceil(37/7)) + 6 (leading blank spacers) + 31 (day
-    // buttons) + 1 (time row) + 6 (hour/minute steppers+labels) = 63 --
-    // 31 + 63 = 94 at peak, comfortably under this buffer's 100.
+    // buttons) + 1 (time row) + 2 (W17: hour/minute NumericSteppers,
+    // replacing the original six-widget Button+Label+Button trio) = 59 --
+    // 37 + 59 = 96 at peak, comfortably under this buffer's 100.
     var snap: [100]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
@@ -2487,7 +2560,7 @@ test "W16: a date/time picker's calendar grid matches the real month, and select
     var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 63), n - baseline);
+    try std.testing.expectEqual(@as(usize, 59), n - baseline);
 
     // Exactly one Button labeled "15" exists in this fixture (no other
     // widget anywhere in it shares that bare-number label) -- the day-15
@@ -2543,7 +2616,11 @@ test "W16: month navigation regenerates the grid for the real target month, and 
     }
     const tid = trigger_id orelse return error.MissingTrigger;
 
-    var dispatch_buf: [64]u8 = undefined;
+    // W17: 256, not 64 -- this test now also builds a `.change` envelope
+    // via buildDispatchEnvelope (the stepper interaction below), which
+    // needs more room than a bare click envelope; same buffer size every
+    // other buildDispatchEnvelope-using test in this file already uses.
+    var dispatch_buf: [256]u8 = undefined;
     var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
@@ -2578,46 +2655,43 @@ test "W16: month navigation regenerates the grid for the real target month, and 
     }
     try std.testing.expect(header_found);
     try std.testing.expect(!day31_found);
-    _ = day10_id orelse return error.MissingDay10;
+    const d10_id = day10_id orelse return error.MissingDay10;
 
-    // Real guest-routed time-stepper click. Both the hour-plus and
-    // minute-plus buttons share the label "+" (see renderDatePickerPanel's
-    // own doc comment on why natyv's widget registry gives no reliable
-    // way to tell same-labeled siblings apart by snapshot order alone) --
-    // clicking whichever one is found first still proves the mechanism
-    // generically: exactly one of the two default values (hour 12,
-    // minute 00) must have moved by exactly one step afterward.
-    var plus_id: ?u32 = null;
+    // W17 follow-up: the hour/minute controls are now real NumericStepper
+    // widgets, not Button+Label+Button trios -- there's no "+"-labeled
+    // Button to click anymore. Found by `.value` instead of a label: the
+    // picker's hour stepper defaults to 12 and this fixture's other
+    // NumericStepper (the standalone W17 "Quantity" demo) defaults to 1,
+    // so `.value == 12` unambiguously identifies it, with no collision
+    // possible against the minute stepper's own default (0) either.
+    //
+    // A stepper's value change is entirely host-resolved (main.zig's
+    // `tryHitWidget`/keyboard handling own the click-zone/arrow-key math,
+    // see NumericStepper.zig's file doc comment) -- there's no x/y click
+    // simulation available through `natyv_dispatch` the way a Button's
+    // `.click` is. Same "guest-routed" test shape every other case in this
+    // file already uses (e.g. month nav above): build the exact `.change`
+    // envelope main.zig's own `notifyStepperValue` would deliver
+    // (`buildDispatchEnvelope`, W6) and let the guest's own dispatch
+    // handling (mutating `pickerHour`) do the rest -- this still proves
+    // the guest-side half of the mechanism end-to-end, the host-side half
+    // (regionAt/keyboard -> resolved value) is covered by RuntimeTest's
+    // own pure-host NumericStepper keyboard-adjustment test instead.
+    var hour_stepper_id: ?u32 = null;
     for (snap[0..n]) |slot| {
-        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "+")) plus_id = slot.id;
+        if (slot.widget == .numeric_stepper and slot.widget.numeric_stepper.value == 12) hour_stepper_id = slot.id;
     }
-    const pid = plus_id orelse return error.MissingPlusButton;
-    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{pid});
+    const hsid = hour_stepper_id orelse return error.MissingHourStepper;
+    payload = try buildDispatchEnvelope(&dispatch_buf, hsid, "change", "{\"value\":13}");
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
-    var saw_13 = false;
-    var saw_05 = false;
-    for (snap[0..n]) |slot| {
-        if (slot.widget != .label) continue;
-        if (std.mem.eql(u8, slot.widget.label.text(), "13")) saw_13 = true;
-        if (std.mem.eql(u8, slot.widget.label.text(), "05")) saw_05 = true;
-    }
-    // Exactly one of the two steppers advanced -- either hour 12->13
-    // (minute stays 00, "05" never appears) or minute 00->05 (hour stays
-    // 12, "13" never appears), never both, never neither.
-    try std.testing.expect(saw_13 != saw_05);
-
-    // Re-find the day-10 button -- renderDatePickerPanel rebuilds the
-    // *entire* panel on every interaction, including a stepper click (see
-    // its own doc comment for why), so the id found above no longer
-    // exists; a fresh scan is required, not reuse.
-    day10_id = null;
-    for (snap[0..n]) |slot| {
-        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "10")) day10_id = slot.id;
-    }
-    const d10_after = day10_id orelse return error.MissingDay10;
-    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{d10_after});
+    // W17 follow-up: `d10_id` (found above, before the stepper change) is
+    // still valid here, unlike the old Button+Label+Button trio's own
+    // test, which had to re-find it -- a stepper's value change no longer
+    // rebuilds the panel at all (see the dispatch case's own doc comment),
+    // so nothing about the grid's widget ids gets invalidated by it.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{d10_id});
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
@@ -2630,6 +2704,5 @@ test "W16: month navigation regenerates the grid for the real target month, and 
         if (snap[i].id == tid) trigger_index = i;
     }
     const ti = trigger_index orelse return error.MissingTrigger;
-    const expected = if (saw_13) "2026-09-10 13:00" else "2026-09-10 12:05";
-    try std.testing.expectEqualStrings(expected, snap[ti].widget.button.label());
+    try std.testing.expectEqualStrings("2026-09-10 13:00", snap[ti].widget.button.label());
 }

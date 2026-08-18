@@ -113,7 +113,10 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         .checkbox => widgets.toggleCheckbox(io, id),
         .toggle => widgets.toggleToggle(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
-        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider, .badge => return,
+        // W17: same non-activatable set Slider joins -- driven by
+        // click-zone/arrow-key input instead (see `notifyStepperValue`/
+        // `notifySegmentedValue` and the keyboard handling below).
+        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider, .badge, .numeric_stepper, .segmented_control => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -131,6 +134,31 @@ fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u
     const clamped = widgets.setSliderValue(io, id, value) orelse return;
     var buf: [32]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{clamped}) catch "{}";
+    queue.push(io, id, .change, json, surface_id);
+}
+
+/// W17: the `NumericStepper` counterpart to `notifySliderValue` -- called
+/// from both a minus/plus zone click and an arrow-key press with an
+/// already-delta'd raw value (`current.value +/- current.step`); the
+/// clamp/wrap resolution itself happens host-side in `setStepperValue`.
+fn notifyStepperValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, value: i32, surface_id: u32) void {
+    const resolved = widgets.setStepperValue(io, id, value) orelse return;
+    var buf: [32]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{resolved}) catch "{}";
+    queue.push(io, id, .change, json, surface_id);
+}
+
+/// W17: the `SegmentedControl` counterpart to `notifySliderValue` -- called
+/// from a segment click (the tapped index directly) or an arrow-key press
+/// (`current.selected_index +/- 1`). Payload key is `"value"`, not
+/// `"selected_index"` -- deliberately matching every other `.change`
+/// emitter's wire shape (Slider/Toggle/Checkbox/NumericStepper) so guest
+/// SDKs can decode all of them through one shared `{"value": N}` payload
+/// type instead of a one-off shape just for this kind.
+fn notifySegmentedValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, index: usize, surface_id: u32) void {
+    const resolved = widgets.setSegmentedIndex(io, id, index) orelse return;
+    var buf: [32]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{resolved}) catch "{}";
     queue.push(io, id, .change, json, surface_id);
 }
 
@@ -169,6 +197,8 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .textfield => |t| t.containsPoint(mx, my),
         .textarea => |ta| ta.containsPoint(mx, my),
         .slider => |s| s.containsPoint(mx, my),
+        .numeric_stepper => |ns| ns.containsPoint(mx, my),
+        .segmented_control => |sc| sc.containsPoint(mx, my),
         .label, .container, .progress_bar, .divider, .badge => false,
     };
 }
@@ -210,6 +240,31 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             dragging_slider_id.* = slot.id;
             return slot.id;
         },
+        // W17: the first widget with more than one clickable zone in a
+        // single rect -- `regionAt`/`segmentAt` (not a plain
+        // `containsPoint`) decide which one was hit. A click in the
+        // middle "value" zone (stepper) or anywhere in the rect (control)
+        // that isn't a real zone/segment still returns the id for focus,
+        // same "click to focus, no value change" feel `Slider`'s
+        // click-to-drag establishes for its own track.
+        .numeric_stepper => |ns| {
+            const surface_id = FloatingOrder.surfaceIdFor(slots, slot.id);
+            switch (ns.regionAt(mx, my)) {
+                .minus => {
+                    notifyStepperValue(widgets, io, queue, slot.id, ns.value - ns.step, surface_id);
+                    return slot.id;
+                },
+                .plus => {
+                    notifyStepperValue(widgets, io, queue, slot.id, ns.value + ns.step, surface_id);
+                    return slot.id;
+                },
+                .none => if (ns.containsPoint(mx, my)) return slot.id,
+            }
+        },
+        .segmented_control => |sc| if (sc.segmentAt(mx, my)) |idx| {
+            notifySegmentedValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, slot.id));
+            return slot.id;
+        } else if (sc.containsPoint(mx, my)) return slot.id,
         .label, .container, .progress_bar, .divider, .badge => {},
     }
     return null;
@@ -235,6 +290,8 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         .container => |cont| cont.drawDecorations(renderer),
         .divider => |d| d.drawDecorations(renderer),
         .badge => |bd| bd.drawDecorations(renderer),
+        .numeric_stepper => |ns| ns.drawDecorations(renderer),
+        .segmented_control => |sc| sc.drawDecorations(renderer),
     }
 }
 
@@ -331,6 +388,8 @@ pub fn main(init: std.process.Init) !void {
         .slider = config.value.widgets.slider,
         .divider = config.value.widgets.divider,
         .badge = config.value.widgets.badge,
+        .numeric_stepper = config.value.widgets.numeric_stepper,
+        .segmented_control = config.value.widgets.segmented_control,
     };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
     try runtime.loadPlugin(wasm, manifest, widget_kinds, clay_enabled);
@@ -677,21 +736,42 @@ pub fn main(init: std.process.Init) !void {
                     // together as "decrement"/"increment") so Down/Up alone
                     // could *also* mean "move the highlight" for a focused
                     // textfield (Combobox, W6) or Button (Menu, W9),
-                    // without Left/Right picking up that meaning too --
-                    // Left/Right are deliberately left reserved/unused for
-                    // either kind today (e.g. a future cursor-position
-                    // feature), not repurposed.
+                    // without Left/Right picking up that meaning too.
+                    //
+                    // W17: extended to also adjust a focused NumericStepper/
+                    // SegmentedControl (same "arrow keys move the value"
+                    // shape as Slider, just integer-valued/index-valued),
+                    // and -- separately -- to push `.key_nav` for a focused
+                    // plain Button, exactly mirroring how SDLK_DOWN/SDLK_UP
+                    // below were widened to cover focused Buttons in W9.
+                    // This is what lets the Date & time picker's month
+                    // prev/next buttons respond to Left/Right without any
+                    // new host concept: the guest just handles `key_nav`
+                    // "left"/"right" for the two button ids it cares about
+                    // and ignores it for every other focused Button.
                     c.SDLK_LEFT => if (focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
-                            if (slot.id == id and slot.widget == .slider) {
-                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            const surface_id = FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id);
+                            if (slot.id != id) continue;
+                            switch (slot.widget) {
+                                .slider => |s| notifySliderValue(&runtime.widgets, io, &queue, id, s.value - Slider.nudge_step, surface_id),
+                                .numeric_stepper => |ns| notifyStepperValue(&runtime.widgets, io, &queue, id, ns.value - ns.step, surface_id),
+                                .segmented_control => |sc| notifySegmentedValue(&runtime.widgets, io, &queue, id, if (sc.selected_index > 0) sc.selected_index - 1 else 0, surface_id),
+                                .button => queue.push(io, id, .key_nav, "{\"key\":\"left\"}", surface_id),
+                                else => {},
                             }
                         }
                     },
                     c.SDLK_RIGHT => if (focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
-                            if (slot.id == id and slot.widget == .slider) {
-                                notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            const surface_id = FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id);
+                            if (slot.id != id) continue;
+                            switch (slot.widget) {
+                                .slider => |s| notifySliderValue(&runtime.widgets, io, &queue, id, s.value + Slider.nudge_step, surface_id),
+                                .numeric_stepper => |ns| notifyStepperValue(&runtime.widgets, io, &queue, id, ns.value + ns.step, surface_id),
+                                .segmented_control => |sc| notifySegmentedValue(&runtime.widgets, io, &queue, id, sc.selected_index + 1, surface_id),
+                                .button => queue.push(io, id, .key_nav, "{\"key\":\"right\"}", surface_id),
+                                else => {},
                             }
                         }
                     },
@@ -783,6 +863,14 @@ pub fn main(init: std.process.Init) !void {
                     hovered_widget_id_this_frame = slot.id;
                 },
                 .slider => |s| if (s.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
+                },
+                .numeric_stepper => |ns| if (ns.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
+                },
+                .segmented_control => |sc| if (sc.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },

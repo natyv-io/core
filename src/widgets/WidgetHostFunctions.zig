@@ -40,6 +40,8 @@ const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
 const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
+const NumericStepper = @import("NumericStepper.zig");
+const SegmentedControl = @import("SegmentedControl.zig");
 
 const WidgetHost = @import("WidgetHost.zig");
 const Self = WidgetHost;
@@ -63,6 +65,10 @@ const CreateToggleRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []co
 const CreateRadioButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", group_id: u32, checked: bool = false };
 const CreateProgressBarRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
 const CreateSliderRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
+// W17: `wrap` defaults false (clamp) -- the picker's hour/minute use case
+// opts in explicitly, matching `NumericStepper.wrap`'s own default.
+const CreateNumericStepperRequest = struct { x: f32, y: f32, w: f32, h: f32, value: i32 = 0, min: i32 = 0, max: i32 = 100, step: i32 = 1, wrap: bool = false };
+const CreateSegmentedControlRequest = struct { x: f32, y: f32, w: f32, h: f32, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 const SetCheckedRequest = struct { widget_id: u32, checked: bool };
 const SetValueRequest = struct { widget_id: u32, value: f32 };
 
@@ -114,6 +120,8 @@ const ClayToggleRequest = struct { layout: ClayLayoutRequest = .{}, label: []con
 const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", group_id: u32, checked: bool = false };
 const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
+const ClayNumericStepperRequest = struct { layout: ClayLayoutRequest = .{}, value: i32 = 0, min: i32 = 0, max: i32 = 100, step: i32 = 1, wrap: bool = false };
+const ClaySegmentedControlRequest = struct { layout: ClayLayoutRequest = .{}, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 
 fn toSizingAxis(req: ClaySizingAxisRequest) c.Clay_SizingAxis {
     return switch (req.type) {
@@ -463,6 +471,52 @@ pub fn createSliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.E
     host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
 }
 
+pub fn createNumericStepperHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateNumericStepperRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const stepper = NumericStepper.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.value, req.min, req.max, req.step, req.wrap);
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .numeric_stepper = stepper });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+pub fn createSegmentedControlHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateSegmentedControlRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const control = SegmentedControl.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.segments, req.selected_index);
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .segmented_control = control });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
 pub fn createClayContainerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -590,6 +644,26 @@ pub fn createClaySliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const
     insertClayWidget(self, plugin, &outputs[0], .{ .slider = slider }, parsed.value.layout, null);
 }
 
+pub fn createClayNumericStepperHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayNumericStepperRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const stepper = NumericStepper.init(std.mem.zeroes(c.SDL_FRect), parsed.value.value, parsed.value.min, parsed.value.max, parsed.value.step, parsed.value.wrap);
+    insertClayWidget(self, plugin, &outputs[0], .{ .numeric_stepper = stepper }, parsed.value.layout, null);
+}
+
+pub fn createClaySegmentedControlHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClaySegmentedControlRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const control = SegmentedControl.init(std.mem.zeroes(c.SDL_FRect), parsed.value.segments, parsed.value.selected_index);
+    insertClayWidget(self, plugin, &outputs[0], .{ .segmented_control = control }, parsed.value.layout, null);
+}
+
 pub fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -613,7 +687,12 @@ pub fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         .toggle => |*tg| tg.setLabel(req.text),
         .radio_button => |*r| r.setLabel(req.text),
         .badge => |*bd| bd.setLabel(req.text),
-        .container, .progress_bar, .slider, .divider => {},
+        // W17: a stepper's value text is host-derived from `.value`
+        // (see `NumericStepper.setValue`), and a segmented control's
+        // segment labels are set once at creation with no v1 API to
+        // change them afterward -- same "not an error, just doesn't
+        // apply" precedent as Container/ProgressBar/Slider/Divider here.
+        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control => {},
     }
     if (slot.clay_managed) self.layout_generation +%= 1;
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -642,7 +721,7 @@ pub fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
         .badge => |bd| bd.label(),
-        .container, .progress_bar, .slider, .divider => "",
+        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -752,6 +831,12 @@ pub fn setValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
         // doesn't apply" precedent everywhere else in this file, except
         // here it *does* apply.
         .slider => |*s| s.setValue(req.value),
+        // W17: same "guest can still set it directly" precedent as
+        // Slider above -- round-trips through f32 (the wire's only
+        // numeric type), fine for the small integer ranges either of
+        // these widgets deals in.
+        .numeric_stepper => |*ns| ns.setValue(@intFromFloat(req.value)),
+        .segmented_control => |*sc| sc.select(@intFromFloat(@max(0, req.value))),
         else => {},
     }
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -774,6 +859,8 @@ pub fn getValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
     const value: f32 = switch (slot.widget) {
         .progress_bar => |p| p.value,
         .slider => |s| s.value,
+        .numeric_stepper => |ns| @floatFromInt(ns.value),
+        .segmented_control => |sc| @floatFromInt(sc.selected_index),
         else => 0,
     };
     var buf: [32]u8 = undefined;
