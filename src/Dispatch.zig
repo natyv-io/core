@@ -24,7 +24,15 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue) void {
         const event = queue.pop(io) orelse break;
         defer queue.freeEntry(event);
 
-        var allocator_buf: [512]u8 = undefined;
+        // W10: bumped from 512 -- TextField's payloads always fit
+        // comfortably under that, but TextArea's (up to 1023 bytes of
+        // content, plus JSON-escaping overhead and the envelope itself)
+        // wouldn't. Under the old size, a large-enough TextArea's
+        // `.text_changed` event would silently fail to reach the guest
+        // (buildDispatchPayload's OutOfMemory just gets logged and
+        // dropped below, no crash) -- caught by reading this file before
+        // picking TextArea's max_len, not by hitting the bug live.
+        var allocator_buf: [4096]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
         const payload = buildDispatchPayload(fba.allocator(), event) catch {
             std.debug.print("[dispatch] failed to build payload for widget {d}\n", .{event.widget_id});

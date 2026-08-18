@@ -6,6 +6,7 @@ const Runtime = @import("Runtime.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const Slider = @import("widgets/Slider.zig");
 const TextField = @import("widgets/TextField.zig");
+const TextArea = @import("widgets/TextArea.zig");
 const json_util = @import("json_util.zig");
 const timing = @import("timing.zig");
 const ClayLayout = @import("capabilities/ClayLayout.zig");
@@ -18,6 +19,12 @@ const ScrollBar = @import("ScrollBar.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
+
+/// W10: shared sizing for every stack buffer that has to hold "whichever
+/// text widget's post-mutation content is currently biggest" --
+/// TextArea.max_len is always the larger of the two, but computed via
+/// @max rather than hardcoded so this stays correct if that ever changes.
+const max_text_widget_len = @max(TextField.max_len, TextArea.max_len);
 
 /// Keyboard interaction model: the one place focus actually changes (mouse
 /// click, Tab/Shift+Tab, Escape all route through this) -- updates the
@@ -56,9 +63,11 @@ fn updateFocus(widgets: *WidgetHost, io: std.Io, window: *c.SDL_Window, queue: *
             queue.push(io, old_id, .blur, payload, FloatingOrder.surfaceIdFor(slots, old_id));
         }
     }
-    const is_textfield = widgets.setFocused(io, new_id);
+    // W10: renamed from is_textfield -- WidgetHost.setFocused's returned
+    // bool now also covers .textarea, not just .textfield.
+    const wants_text_input = widgets.setFocused(io, new_id);
     focused_widget_id.* = new_id;
-    if (is_textfield) {
+    if (wants_text_input) {
         _ = c.SDL_StartTextInput(window);
     } else {
         _ = c.SDL_StopTextInput(window);
@@ -85,13 +94,16 @@ fn toClipRect(r: c.SDL_FRect) c.SDL_Rect {
 /// just fall through without pushing an event at all, same as clicking
 /// empty space today. W3: Slider joins that non-activatable set too --
 /// Enter/Space isn't slider semantics, it's driven by drag/arrow-keys
-/// instead (see `notifySliderValue` and the drag-update block below).
+/// instead (see `notifySliderValue` and the drag-update block below). W10:
+/// TextArea joins it too, same reasoning as TextField -- Enter means
+/// "insert a newline" for it (see the SDLK_RETURN handling below), not
+/// "activate."
 fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, kind: WidgetHost.WidgetKind, surface_id: u32) void {
     switch (kind) {
         .button => widgets.flashButton(io, id),
         .checkbox => widgets.toggleCheckbox(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
-        .textfield, .label, .container, .progress_bar, .slider => return,
+        .textfield, .textarea, .label, .container, .progress_bar, .slider => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -121,7 +133,7 @@ fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u
 /// stack-based `FixedBufferAllocator` so this stays allocation-free like
 /// every other per-frame push site here.
 fn notifyTextChanged(queue: *EventQueue, io: std.Io, id: u32, new_text: []const u8, slots: []const WidgetHost.Slot) void {
-    var buf: [TextField.max_len + 16]u8 = undefined;
+    var buf: [max_text_widget_len + 16]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const a = fba.allocator();
     var out: std.ArrayList(u8) = .empty;
@@ -144,6 +156,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .checkbox => |cb| cb.containsPoint(mx, my),
         .radio_button => |r| r.containsPoint(mx, my),
         .textfield => |t| t.containsPoint(mx, my),
+        .textarea => |ta| ta.containsPoint(mx, my),
         .slider => |s| s.containsPoint(mx, my),
         .label, .container, .progress_bar => false,
     };
@@ -175,6 +188,9 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
         .textfield => |t| if (t.containsPoint(mx, my)) {
             return slot.id;
         },
+        .textarea => |ta| if (ta.containsPoint(mx, my)) {
+            return slot.id;
+        },
         .slider => |s| if (s.containsPoint(mx, my)) {
             dragging_slider_id.* = slot.id;
             return slot.id;
@@ -192,6 +208,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
     switch (widget) {
         .button => |b| b.drawDecorations(renderer),
         .textfield => |t| t.drawDecorations(renderer),
+        .textarea => |ta| ta.drawDecorations(renderer),
         .label => |l| l.drawDecorations(renderer),
         .checkbox => |cb| cb.drawDecorations(renderer),
         .radio_button => |r| r.drawDecorations(renderer),
@@ -538,7 +555,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 c.SDL_EVENT_TEXT_INPUT => {
                     if (focused_widget_id) |id| {
-                        var text_buf: [TextField.max_len]u8 = undefined;
+                        var text_buf: [max_text_widget_len]u8 = undefined;
                         if (runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text), &text_buf)) |n| {
                             notifyTextChanged(&queue, io, id, text_buf[0..n], widget_snapshot[0..widget_count]);
                         }
@@ -555,7 +572,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 c.SDL_EVENT_KEY_DOWN => switch (event.key.key) {
                     c.SDLK_BACKSPACE => if (focused_widget_id) |id| {
-                        var text_buf: [TextField.max_len]u8 = undefined;
+                        var text_buf: [max_text_widget_len]u8 = undefined;
                         if (runtime.widgets.backspaceOn(io, id, &text_buf)) |n| {
                             notifyTextChanged(&queue, io, id, text_buf[0..n], widget_snapshot[0..widget_count]);
                         }
@@ -587,6 +604,22 @@ pub fn main(init: std.process.Init) !void {
                                     // genuinely additional, not a replacement.
                                     if (slot.widget == .textfield and event.key.key != c.SDLK_SPACE) {
                                         queue.push(io, id, .key_nav, "{\"key\":\"enter\"}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                                    }
+                                    // W10: Enter on a focused TextArea
+                                    // inserts a literal newline instead --
+                                    // completely independent of the
+                                    // TextField-only key_nav "enter" case
+                                    // above (a TextArea never fires
+                                    // key_nav at all). Space is excluded
+                                    // the same way TextField's is: a
+                                    // focused TextArea already receives a
+                                    // literal space via SDL_EVENT_TEXT_INPUT,
+                                    // this path would double it.
+                                    if (slot.widget == .textarea and event.key.key != c.SDLK_SPACE) {
+                                        var text_buf: [max_text_widget_len]u8 = undefined;
+                                        if (runtime.widgets.appendTextTo(io, id, "\n", &text_buf)) |n| {
+                                            notifyTextChanged(&queue, io, id, text_buf[0..n], widget_snapshot[0..widget_count]);
+                                        }
                                     }
                                 }
                             }
@@ -691,6 +724,9 @@ pub fn main(init: std.process.Init) !void {
                     hovering_any = true;
                 },
                 .textfield => |t| if (t.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                },
+                .textarea => |ta| if (ta.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
                 },
                 .checkbox => |cb| if (cb.containsPoint(mouse_x, mouse_y)) {

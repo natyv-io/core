@@ -104,6 +104,7 @@ const timing = @import("../timing.zig");
 const json_util = @import("../json_util.zig");
 const Button = @import("Button.zig");
 const TextField = @import("TextField.zig");
+const TextArea = @import("TextArea.zig");
 const Label = @import("Label.zig");
 const Container = @import("Container.zig");
 const Checkbox = @import("Checkbox.zig");
@@ -117,12 +118,15 @@ pub const max_widgets = 64;
 // button/textfield/label create, set_text, get_text, destroy_widget (6) +
 // checkbox/radio_button/progress_bar create (3) + get_checked/set_checked/
 // get_value/set_value (4) -- W1 widget breadth. + slider create (1) -- W3.
-pub const host_function_count = 14;
+// + textarea create (1) -- W10 (natyv_clay_create_textarea is counted
+// separately in registerClayInto's own clay_host_function_count).
+pub const host_function_count = 15;
 
-pub const WidgetKind = enum { button, textfield, label, container, checkbox, radio_button, progress_bar, slider };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, radio_button, progress_bar, slider };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
+    textarea: TextArea,
     label: Label,
     container: Container,
     checkbox: Checkbox,
@@ -138,6 +142,7 @@ pub const Widget = union(WidgetKind) {
         return switch (self.*) {
             .button => |*b| &b.rect,
             .textfield => |*t| &t.rect,
+            .textarea => |*ta| &ta.rect,
             .label => |*l| &l.rect,
             .container => |*co| &co.rect,
             .checkbox => |*cb| &cb.rect,
@@ -157,6 +162,7 @@ pub const Widget = union(WidgetKind) {
         return switch (self) {
             .button => |b| .{ .color = b.fillColor(), .rect = b.rect },
             .textfield => |t| .{ .color = t.fillColor(), .rect = t.rect },
+            .textarea => |ta| .{ .color = ta.fillColor(), .rect = ta.rect },
             // Only fills when checked -- an unchecked box has nothing to
             // batch-fill, just the outline `drawDecorations` always draws.
             // Uses `boxRect()`, not the full `rect`, since the label area
@@ -181,7 +187,7 @@ pub const Widget = union(WidgetKind) {
     /// participate in Tab order.
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
-            .button, .textfield, .checkbox, .radio_button, .slider => true,
+            .button, .textfield, .textarea, .checkbox, .radio_button, .slider => true,
             .label, .container, .progress_bar => false,
         };
     }
@@ -194,6 +200,7 @@ pub const Widget = union(WidgetKind) {
         switch (self.*) {
             .button => |*b| b.focused = focused,
             .textfield => |*t| t.focused = focused,
+            .textarea => |*ta| ta.focused = focused,
             .checkbox => |*cb| cb.focused = focused,
             .radio_button => |*r| r.focused = focused,
             .slider => |*s| s.focused = focused,
@@ -317,6 +324,7 @@ pending_text_destroy_count: usize = 0,
 pub const EnabledKinds = struct {
     button: bool = true,
     textfield: bool = true,
+    textarea: bool = true,
     label: bool = true,
     checkbox: bool = true,
     radio_button: bool = true,
@@ -343,6 +351,10 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     }
     if (enabled.textfield) {
         funcs_out[n] = c.extism_function_new("natyv_create_textfield", &in_types[0], 1, &out_types[0], 1, createTextFieldHostFn, self, null);
+        n += 1;
+    }
+    if (enabled.textarea) {
+        funcs_out[n] = c.extism_function_new("natyv_create_textarea", &in_types[0], 1, &out_types[0], 1, createTextAreaHostFn, self, null);
         n += 1;
     }
     if (enabled.label) {
@@ -386,7 +398,7 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     return n;
 }
 
-pub const clay_host_function_count = 8;
+pub const clay_host_function_count = 9;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -406,6 +418,7 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[5] = c.extism_function_new("natyv_clay_create_radio_button", &in_types[0], 1, &out_types[0], 1, createClayRadioButtonHostFn, self, null);
     funcs_out[6] = c.extism_function_new("natyv_clay_create_progressbar", &in_types[0], 1, &out_types[0], 1, createClayProgressBarHostFn, self, null);
     funcs_out[7] = c.extism_function_new("natyv_clay_create_slider", &in_types[0], 1, &out_types[0], 1, createClaySliderHostFn, self, null);
+    funcs_out[8] = c.extism_function_new("natyv_clay_create_textarea", &in_types[0], 1, &out_types[0], 1, createClayTextAreaHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -507,6 +520,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
             switch (s.widget) {
                 .button => |*b| b.syncText(engine, font),
                 .textfield => |*t| t.syncText(engine, font),
+                .textarea => |*ta| ta.syncText(engine, font),
                 .label => |*l| l.syncText(engine, font),
                 .checkbox => |*cb| cb.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),
@@ -529,6 +543,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
             switch (s.widget) {
                 .button => |*b| b.destroyText(),
                 .textfield => |*t| t.destroyText(),
+                .textarea => |*ta| ta.destroyText(),
                 .label => |*l| l.destroyText(),
                 .checkbox => |*cb| cb.destroyText(),
                 .radio_button => |*r| r.destroyText(),
@@ -602,6 +617,7 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                     switch (s.widget) {
                         .button => |*b| b.destroyText(),
                         .textfield => |*t| t.destroyText(),
+                        .textarea => |*ta| ta.destroyText(),
                         .label => |*l| l.destroyText(),
                         .checkbox => |*cb| cb.destroyText(),
                         .radio_button => |*r| r.destroyText(),
@@ -659,6 +675,10 @@ fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
             self.queuePendingTextDestroy(&t.text_obj);
             self.queuePendingTextDestroy(&t.placeholder_obj);
         },
+        .textarea => |*ta| {
+            self.queuePendingTextDestroy(&ta.text_obj);
+            self.queuePendingTextDestroy(&ta.placeholder_obj);
+        },
         .label => |*l| self.queuePendingTextDestroy(&l.text_obj),
         .checkbox => |*cb| self.queuePendingTextDestroy(&cb.text_obj),
         .radio_button => |*r| self.queuePendingTextDestroy(&r.text_obj),
@@ -699,16 +719,24 @@ pub fn snapshot(self: *Self, call_io: Io, out: []Slot) usize {
 
 /// W6: returns the number of bytes copied into `out` (`out.len >=
 /// TextField.max_len` required) -- the widget's real post-mutation text --
-/// or `null` if `id` isn't a textfield. `null`, not `0`, for the not-a-
-/// textfield case specifically because `0` is itself a real, meaningful
-/// result (backspacing the last character leaves an empty string, which
-/// still needs a `.text_changed` event) -- same "?T, not a T with an
-/// overloaded sentinel" shape `setSliderValue` (W3) established. Copying
-/// the text out here (rather than handing back a slice into the live,
-/// mutex-protected, guest-mutable-via-a-concurrent-`natyv_set_text`
+/// or `null` if `id` isn't a textfield/textarea. `null`, not `0`, for the
+/// not-a-text-widget case specifically because `0` is itself a real,
+/// meaningful result (backspacing the last character leaves an empty
+/// string, which still needs a `.text_changed` event) -- same "?T, not a T
+/// with an overloaded sentinel" shape `setSliderValue` (W3) established.
+/// Copying the text out here (rather than handing back a slice into the
+/// live, mutex-protected, guest-mutable-via-a-concurrent-`natyv_set_text`
 /// buffer) is deliberate, same reasoning `setSliderValue` documents for
 /// returning a value instead of a pointer. `main.zig` uses the copy to
 /// build a `.text_changed` event.
+///
+/// W10: `.textarea` joins `.textfield` here -- same append-at-the-end
+/// model, just a bigger buffer (`out` must be sized for whichever of the
+/// two is larger; `main.zig` sizes it off `TextArea.max_len`, since that's
+/// always the bigger one). This is also the path Enter uses to insert a
+/// literal newline into a focused textarea (`appendTextTo(io, id, "\n",
+/// ...)`), not a separate mechanism -- a newline is just another string to
+/// append, from this function's point of view.
 pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -723,12 +751,19 @@ pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8)
             const text = slot.widget.textfield.text();
             @memcpy(out[0..text.len], text);
             return text.len;
+        } else if (slot.widget == .textarea) {
+            slot.widget.textarea.appendText(s);
+            if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textarea.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
         }
     }
     return null;
 }
 
-/// W6: see `appendTextTo`'s doc comment -- same shape.
+/// W6: see `appendTextTo`'s doc comment -- same shape. W10: `.textarea`
+/// joins `.textfield` here too, same reasoning.
 pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -739,6 +774,12 @@ pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
             const text = slot.widget.textfield.text();
             @memcpy(out[0..text.len], text);
             return text.len;
+        } else if (slot.widget == .textarea) {
+            slot.widget.textarea.backspace();
+            if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textarea.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
         }
     }
     return null;
@@ -746,22 +787,24 @@ pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
 
 /// Sets `id` as the sole focused widget (clearing focus on every other
 /// slot), or clears focus entirely when `id` is `null`. Returns `true` when
-/// the newly focused widget is specifically a `.textfield` -- `main.zig`
-/// uses this to decide whether to start/stop `SDL_StartTextInput` without a
-/// second registry lookup (focusing a `Button` shouldn't turn on IME/text
-/// composition).
+/// the newly focused widget wants IME/text input active -- `.textfield` or
+/// `.textarea` (W10 widened this from "is specifically a `.textfield`",
+/// renaming the local accordingly, since the old name became inaccurate).
+/// `main.zig` uses this to decide whether to start/stop `SDL_StartTextInput`
+/// without a second registry lookup (focusing a `Button` shouldn't turn on
+/// IME/text composition).
 pub fn setFocused(self: *Self, call_io: Io, id: ?u32) bool {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
-    var focused_is_textfield = false;
+    var focused_wants_text_input = false;
     for (&self.slots) |*slot| {
         if (slot.*) |*s| {
             const this_one = id != null and s.id == id.?;
             s.widget.setFocusedFlag(this_one);
-            if (this_one and s.widget == .textfield) focused_is_textfield = true;
+            if (this_one and (s.widget == .textfield or s.widget == .textarea)) focused_wants_text_input = true;
         }
     }
-    return focused_is_textfield;
+    return focused_wants_text_input;
 }
 
 /// Keyboard interaction model: every focusable widget's id (see
@@ -884,6 +927,7 @@ pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
 
 const CreateButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 };
 const CreateTextFieldRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
+const CreateTextAreaRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
 const WidgetIdRequest = struct { widget_id: u32 };
 const CreateLabelRequest = struct { x: f32, y: f32, w: f32 = 0, h: f32 = 20, text: []const u8 = "" };
 const SetTextRequest = struct { widget_id: u32, text: []const u8 };
@@ -933,6 +977,7 @@ const ClayLayoutRequest = struct {
 const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{}, background: bool = false, duration_ms: u32 = 0 };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
 const ClayTextFieldRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
+const ClayTextAreaRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
 const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const u8 = "" };
 const ClayCheckboxRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
 const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", group_id: u32, checked: bool = false };
@@ -1066,6 +1111,29 @@ fn createTextFieldHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Ex
 
     self.mutex.lockUncancelable(self.io());
     const id = self.insertLocked(.{ .textfield = field });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+fn createTextAreaHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateTextAreaRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const area = TextArea.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.placeholder);
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .textarea = area });
     self.mutex.unlock(self.io());
 
     const widget_id = id orelse {
@@ -1228,6 +1296,16 @@ fn createClayTextFieldHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const 
     insertClayWidget(self, plugin, &outputs[0], .{ .textfield = field }, parsed.value.layout, null);
 }
 
+fn createClayTextAreaHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayTextAreaRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const area = TextArea.init(std.mem.zeroes(c.SDL_FRect), parsed.value.placeholder);
+    insertClayWidget(self, plugin, &outputs[0], .{ .textarea = area }, parsed.value.layout, null);
+}
+
 fn createClayLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -1297,6 +1375,7 @@ fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
     switch (slot.widget) {
         .button => |*b| b.setLabel(req.text),
         .textfield => |*t| t.setText(req.text),
+        .textarea => |*ta| ta.setText(req.text),
         .label => |*l| l.setText(req.text),
         .checkbox => |*cb| cb.setLabel(req.text),
         .radio_button => |*r| r.setLabel(req.text),
@@ -1323,6 +1402,7 @@ fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
     const text: []const u8 = switch (slot.widget) {
         .button => |b| b.label(),
         .textfield => |t| t.text(),
+        .textarea => |ta| ta.text(),
         .label => |l| l.text(),
         .checkbox => |cb| cb.label(),
         .radio_button => |r| r.label(),
