@@ -114,6 +114,13 @@ const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
 const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
+// The Extism host-function wire layer (natyv_create_*/natyv_clay_create_*
+// callbacks and the generic set/get/destroy ones) lives in its own file --
+// see WidgetHostFunctions.zig's doc comment for why, and for the mutual
+// `@import` this creates (this file needs the callbacks' function pointers
+// by name for registerInto/registerClayInto below; that file needs this
+// one's registry-internal helpers).
+const HostFunctions = @import("WidgetHostFunctions.zig");
 
 const Self = @This();
 
@@ -372,66 +379,66 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     const out_types = [_]c.ExtismValType{c.ExtismValType_I64};
     var n: usize = 0;
     if (enabled.button) {
-        funcs_out[n] = c.extism_function_new("natyv_create_button", &in_types[0], 1, &out_types[0], 1, createButtonHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createButtonHostFn, self, null);
         n += 1;
     }
     if (enabled.textfield) {
-        funcs_out[n] = c.extism_function_new("natyv_create_textfield", &in_types[0], 1, &out_types[0], 1, createTextFieldHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_textfield", &in_types[0], 1, &out_types[0], 1, HostFunctions.createTextFieldHostFn, self, null);
         n += 1;
     }
     if (enabled.textarea) {
-        funcs_out[n] = c.extism_function_new("natyv_create_textarea", &in_types[0], 1, &out_types[0], 1, createTextAreaHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_textarea", &in_types[0], 1, &out_types[0], 1, HostFunctions.createTextAreaHostFn, self, null);
         n += 1;
     }
     if (enabled.label) {
-        funcs_out[n] = c.extism_function_new("natyv_create_label", &in_types[0], 1, &out_types[0], 1, createLabelHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_label", &in_types[0], 1, &out_types[0], 1, HostFunctions.createLabelHostFn, self, null);
         n += 1;
     }
     if (enabled.checkbox) {
-        funcs_out[n] = c.extism_function_new("natyv_create_checkbox", &in_types[0], 1, &out_types[0], 1, createCheckboxHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_checkbox", &in_types[0], 1, &out_types[0], 1, HostFunctions.createCheckboxHostFn, self, null);
         n += 1;
     }
     if (enabled.toggle) {
-        funcs_out[n] = c.extism_function_new("natyv_create_toggle", &in_types[0], 1, &out_types[0], 1, createToggleHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_toggle", &in_types[0], 1, &out_types[0], 1, HostFunctions.createToggleHostFn, self, null);
         n += 1;
     }
     if (enabled.radio_button) {
-        funcs_out[n] = c.extism_function_new("natyv_create_radio_button", &in_types[0], 1, &out_types[0], 1, createRadioButtonHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_radio_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createRadioButtonHostFn, self, null);
         n += 1;
     }
     if (enabled.progress_bar) {
-        funcs_out[n] = c.extism_function_new("natyv_create_progressbar", &in_types[0], 1, &out_types[0], 1, createProgressBarHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_progressbar", &in_types[0], 1, &out_types[0], 1, HostFunctions.createProgressBarHostFn, self, null);
         n += 1;
     }
     if (enabled.slider) {
-        funcs_out[n] = c.extism_function_new("natyv_create_slider", &in_types[0], 1, &out_types[0], 1, createSliderHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_slider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createSliderHostFn, self, null);
         n += 1;
     }
     if (enabled.divider) {
-        funcs_out[n] = c.extism_function_new("natyv_create_divider", &in_types[0], 1, &out_types[0], 1, createDividerHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_divider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createDividerHostFn, self, null);
         n += 1;
     }
     if (enabled.badge) {
-        funcs_out[n] = c.extism_function_new("natyv_create_badge", &in_types[0], 1, &out_types[0], 1, createBadgeHostFn, self, null);
+        funcs_out[n] = c.extism_function_new("natyv_create_badge", &in_types[0], 1, &out_types[0], 1, HostFunctions.createBadgeHostFn, self, null);
         n += 1;
     }
-    funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, setTextHostFn, self, null);
+    funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, HostFunctions.setTextHostFn, self, null);
     n += 1;
-    funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, getTextHostFn, self, null);
+    funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, HostFunctions.getTextHostFn, self, null);
     n += 1;
-    funcs_out[n] = c.extism_function_new("natyv_destroy_widget", &in_types[0], 1, &out_types[0], 1, destroyWidgetHostFn, self, null);
+    funcs_out[n] = c.extism_function_new("natyv_destroy_widget", &in_types[0], 1, &out_types[0], 1, HostFunctions.destroyWidgetHostFn, self, null);
     n += 1;
     // W1: generic non-text state accessors (bool/float) -- same "always
     // registered, nothing to gate" reasoning as set_text/get_text/
     // destroy_widget above (a guest can't get a widget_id to call these
     // with unless it already had permission to create that widget).
-    funcs_out[n] = c.extism_function_new("natyv_set_checked", &in_types[0], 1, &out_types[0], 1, setCheckedHostFn, self, null);
+    funcs_out[n] = c.extism_function_new("natyv_set_checked", &in_types[0], 1, &out_types[0], 1, HostFunctions.setCheckedHostFn, self, null);
     n += 1;
-    funcs_out[n] = c.extism_function_new("natyv_get_checked", &in_types[0], 1, &out_types[0], 1, getCheckedHostFn, self, null);
+    funcs_out[n] = c.extism_function_new("natyv_get_checked", &in_types[0], 1, &out_types[0], 1, HostFunctions.getCheckedHostFn, self, null);
     n += 1;
-    funcs_out[n] = c.extism_function_new("natyv_set_value", &in_types[0], 1, &out_types[0], 1, setValueHostFn, self, null);
+    funcs_out[n] = c.extism_function_new("natyv_set_value", &in_types[0], 1, &out_types[0], 1, HostFunctions.setValueHostFn, self, null);
     n += 1;
-    funcs_out[n] = c.extism_function_new("natyv_get_value", &in_types[0], 1, &out_types[0], 1, getValueHostFn, self, null);
+    funcs_out[n] = c.extism_function_new("natyv_get_value", &in_types[0], 1, &out_types[0], 1, HostFunctions.getValueHostFn, self, null);
     n += 1;
     return n;
 }
@@ -448,26 +455,29 @@ pub const clay_host_function_count = 12;
 pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
     const in_types = [_]c.ExtismValType{c.ExtismValType_I64};
     const out_types = [_]c.ExtismValType{c.ExtismValType_I64};
-    funcs_out[0] = c.extism_function_new("natyv_clay_create_container", &in_types[0], 1, &out_types[0], 1, createClayContainerHostFn, self, null);
-    funcs_out[1] = c.extism_function_new("natyv_clay_create_button", &in_types[0], 1, &out_types[0], 1, createClayButtonHostFn, self, null);
-    funcs_out[2] = c.extism_function_new("natyv_clay_create_textfield", &in_types[0], 1, &out_types[0], 1, createClayTextFieldHostFn, self, null);
-    funcs_out[3] = c.extism_function_new("natyv_clay_create_label", &in_types[0], 1, &out_types[0], 1, createClayLabelHostFn, self, null);
-    funcs_out[4] = c.extism_function_new("natyv_clay_create_checkbox", &in_types[0], 1, &out_types[0], 1, createClayCheckboxHostFn, self, null);
-    funcs_out[5] = c.extism_function_new("natyv_clay_create_radio_button", &in_types[0], 1, &out_types[0], 1, createClayRadioButtonHostFn, self, null);
-    funcs_out[6] = c.extism_function_new("natyv_clay_create_progressbar", &in_types[0], 1, &out_types[0], 1, createClayProgressBarHostFn, self, null);
-    funcs_out[7] = c.extism_function_new("natyv_clay_create_slider", &in_types[0], 1, &out_types[0], 1, createClaySliderHostFn, self, null);
-    funcs_out[8] = c.extism_function_new("natyv_clay_create_textarea", &in_types[0], 1, &out_types[0], 1, createClayTextAreaHostFn, self, null);
-    funcs_out[9] = c.extism_function_new("natyv_clay_create_divider", &in_types[0], 1, &out_types[0], 1, createClayDividerHostFn, self, null);
-    funcs_out[10] = c.extism_function_new("natyv_clay_create_toggle", &in_types[0], 1, &out_types[0], 1, createClayToggleHostFn, self, null);
-    funcs_out[11] = c.extism_function_new("natyv_clay_create_badge", &in_types[0], 1, &out_types[0], 1, createClayBadgeHostFn, self, null);
+    funcs_out[0] = c.extism_function_new("natyv_clay_create_container", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayContainerHostFn, self, null);
+    funcs_out[1] = c.extism_function_new("natyv_clay_create_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayButtonHostFn, self, null);
+    funcs_out[2] = c.extism_function_new("natyv_clay_create_textfield", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayTextFieldHostFn, self, null);
+    funcs_out[3] = c.extism_function_new("natyv_clay_create_label", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayLabelHostFn, self, null);
+    funcs_out[4] = c.extism_function_new("natyv_clay_create_checkbox", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayCheckboxHostFn, self, null);
+    funcs_out[5] = c.extism_function_new("natyv_clay_create_radio_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayRadioButtonHostFn, self, null);
+    funcs_out[6] = c.extism_function_new("natyv_clay_create_progressbar", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayProgressBarHostFn, self, null);
+    funcs_out[7] = c.extism_function_new("natyv_clay_create_slider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySliderHostFn, self, null);
+    funcs_out[8] = c.extism_function_new("natyv_clay_create_textarea", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayTextAreaHostFn, self, null);
+    funcs_out[9] = c.extism_function_new("natyv_clay_create_divider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayDividerHostFn, self, null);
+    funcs_out[10] = c.extism_function_new("natyv_clay_create_toggle", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayToggleHostFn, self, null);
+    funcs_out[11] = c.extism_function_new("natyv_clay_create_badge", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayBadgeHostFn, self, null);
     return clay_host_function_count;
 }
 
-fn io(self: *Self) Io {
+/// `pub` so `WidgetHostFunctions.zig`'s callbacks can reach it -- see that
+/// file's own doc comment for why it's a separate file at all.
+pub fn io(self: *Self) Io {
     return self.current_io orelse unreachable; // see file doc comment: invariant enforced by Runtime.call
 }
 
-fn insertLocked(self: *Self, widget: Widget) ?u32 {
+/// `pub` -- see `io`'s doc comment above.
+pub fn insertLocked(self: *Self, widget: Widget) ?u32 {
     return self.insertLockedWithLayout(widget, null, .{});
 }
 
@@ -503,7 +513,8 @@ const InsertClayError = error{ NoSuchParent, RegistryFull };
 /// by the `natyv_clay_*` host functions below, which need to report a
 /// meaningful error back to the guest rather than just failing later when
 /// L4's layout pass can't find the parent.
-fn insertLockedWithLayoutValidated(self: *Self, widget: Widget, parent_id: ?u32, clay_style: ClayStyle, expires_at_ms: ?i64) InsertClayError!u32 {
+/// `pub` -- see `io`'s doc comment above.
+pub fn insertLockedWithLayoutValidated(self: *Self, widget: Widget, parent_id: ?u32, clay_style: ClayStyle, expires_at_ms: ?i64) InsertClayError!u32 {
     if (parent_id) |pid| {
         if (self.findLocked(pid) == null) return error.NoSuchParent;
     }
@@ -537,7 +548,8 @@ pub fn setRect(self: *Self, call_io: Io, id: u32, rect: c.SDL_FRect) void {
     if (self.findLocked(id)) |slot| slot.widget.rectPtr().* = rect;
 }
 
-fn findLocked(self: *Self, id: u32) ?*Slot {
+/// `pub` -- see `io`'s doc comment above.
+pub fn findLocked(self: *Self, id: u32) ?*Slot {
     for (&self.slots) |*slot| {
         if (slot.*) |*s| {
             if (s.id == id) return s;
@@ -714,8 +726,9 @@ fn queuePendingTextDestroy(self: *Self, obj_ptr: *?*c.TTF_Text) void {
 
 /// Must be called with `mutex` already held -- queues every `TTF_Text`
 /// pointer this widget owns for later destruction on the main thread. See
-/// `destroyWidgetHostFn`, the only caller.
-fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
+/// `WidgetHostFunctions.zig`'s `destroyWidgetHostFn`, the only caller --
+/// `pub` for exactly that, see `io`'s doc comment above.
+pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
     switch (widget.*) {
         .button => |*b| self.queuePendingTextDestroy(&b.text_obj),
         .textfield => |*t| {
@@ -986,773 +999,4 @@ pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
     slot.widget.slider.setValue(value);
     const new = slot.widget.slider.value;
     return if (new != old) new else null;
-}
-
-const CreateButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 };
-const CreateTextFieldRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
-const CreateTextAreaRequest = struct { x: f32, y: f32, w: f32, h: f32, placeholder: []const u8 = "" };
-const CreateDividerRequest = struct { x: f32, y: f32, w: f32, h: f32 };
-// W14: `tone`'s JSON string parses directly into `Badge.Tone` -- its tags
-// ("primary", "success", etc.) already are the wire names, unlike Clay's
-// own C-enum-value-vs-JSON-string split (see ClayDirectionRequest above),
-// so no separate wire-format enum is needed here.
-const CreateBadgeRequest = struct { x: f32, y: f32, w: f32, h: f32, tone: Badge.Tone = .neutral, label: []const u8 = "" };
-const WidgetIdRequest = struct { widget_id: u32 };
-const CreateLabelRequest = struct { x: f32, y: f32, w: f32 = 0, h: f32 = 20, text: []const u8 = "" };
-const SetTextRequest = struct { widget_id: u32, text: []const u8 };
-const CreateCheckboxRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", checked: bool = false };
-const CreateToggleRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", checked: bool = false };
-const CreateRadioButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", group_id: u32, checked: bool = false };
-const CreateProgressBarRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
-const CreateSliderRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
-const SetCheckedRequest = struct { widget_id: u32, checked: bool };
-const SetValueRequest = struct { widget_id: u32, value: f32 };
-
-// L3: wire-format mirrors of Clay's real C types (Clay_SizingAxis,
-// Clay_Padding, Clay_LayoutDirection, Clay_ChildAlignment -- see clay.h)
-// with JSON-friendly enum tags instead of Clay's C enum constants.
-// `toClayStyle` below converts one of these into a real `ClayStyle` (which
-// *does* use Clay's actual C types directly, since that's what gets
-// redeclared to Clay every frame starting in L4).
-const ClaySizingType = enum { fit, grow, fixed, percent };
-const ClaySizingAxisRequest = struct {
-    type: ClaySizingType = .fit,
-    min: f32 = 0,
-    max: f32 = std.math.floatMax(f32),
-    percent: f32 = 0,
-};
-const ClaySizingRequest = struct {
-    width: ClaySizingAxisRequest = .{},
-    height: ClaySizingAxisRequest = .{},
-};
-const ClayPaddingRequest = struct { left: u16 = 0, right: u16 = 0, top: u16 = 0, bottom: u16 = 0 };
-const ClayDirectionRequest = enum { left_to_right, top_to_bottom };
-const ClayAlignXRequest = enum { left, right, center };
-const ClayAlignYRequest = enum { top, bottom, center };
-const ClayAlignmentRequest = struct { x: ClayAlignXRequest = .left, y: ClayAlignYRequest = .top };
-
-const ClayLayoutRequest = struct {
-    parent_id: ?u32 = null,
-    sizing: ClaySizingRequest = .{},
-    padding: ClayPaddingRequest = .{},
-    child_gap: u16 = 0,
-    direction: ClayDirectionRequest = .left_to_right,
-    child_alignment: ClayAlignmentRequest = .{},
-    scroll_vertical: bool = false,
-    scroll_horizontal: bool = false,
-    floating: bool = false,
-    modal: bool = false,
-    toast: bool = false,
-};
-const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{}, background: bool = false, duration_ms: u32 = 0 };
-const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
-const ClayTextFieldRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
-const ClayTextAreaRequest = struct { layout: ClayLayoutRequest = .{}, placeholder: []const u8 = "" };
-const ClayDividerRequest = struct { layout: ClayLayoutRequest = .{} };
-const ClayBadgeRequest = struct { layout: ClayLayoutRequest = .{}, tone: Badge.Tone = .neutral, label: []const u8 = "" };
-const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const u8 = "" };
-const ClayCheckboxRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
-const ClayToggleRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
-const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", group_id: u32, checked: bool = false };
-const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
-const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
-
-fn toSizingAxis(req: ClaySizingAxisRequest) c.Clay_SizingAxis {
-    return switch (req.type) {
-        .fit => .{ .type = c.CLAY__SIZING_TYPE_FIT, .size = .{ .minMax = .{ .min = req.min, .max = req.max } } },
-        .grow => .{ .type = c.CLAY__SIZING_TYPE_GROW, .size = .{ .minMax = .{ .min = req.min, .max = req.max } } },
-        .fixed => .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = req.min, .max = req.max } } },
-        .percent => .{ .type = c.CLAY__SIZING_TYPE_PERCENT, .size = .{ .percent = req.percent } },
-    };
-}
-
-fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
-    return .{
-        .sizing = .{ .width = toSizingAxis(req.sizing.width), .height = toSizingAxis(req.sizing.height) },
-        .padding = .{ .left = req.padding.left, .right = req.padding.right, .top = req.padding.top, .bottom = req.padding.bottom },
-        .child_gap = req.child_gap,
-        .direction = switch (req.direction) {
-            .left_to_right => c.CLAY_LEFT_TO_RIGHT,
-            .top_to_bottom => c.CLAY_TOP_TO_BOTTOM,
-        },
-        .child_alignment = .{
-            .x = switch (req.child_alignment.x) {
-                .left => c.CLAY_ALIGN_X_LEFT,
-                .right => c.CLAY_ALIGN_X_RIGHT,
-                .center => c.CLAY_ALIGN_X_CENTER,
-            },
-            .y = switch (req.child_alignment.y) {
-                .top => c.CLAY_ALIGN_Y_TOP,
-                .bottom => c.CLAY_ALIGN_Y_BOTTOM,
-                .center => c.CLAY_ALIGN_Y_CENTER,
-            },
-        },
-        .scroll_vertical = req.scroll_vertical,
-        .scroll_horizontal = req.scroll_horizontal,
-        .floating = req.floating,
-        .modal = req.modal,
-        .toast = req.toast,
-    };
-}
-
-/// Shared body for all four natyv_clay_create_* host functions: converts
-/// the request's `layout` into a real `ClayStyle`, inserts under the
-/// registry lock with parent validation, and writes back {"widget_id":N}
-/// or {"error":...}. The widget's `rect` is left zeroed at creation time --
-/// real geometry is computed output starting in L4, not creation input, so
-/// there's nothing meaningful to draw until the first real Clay layout pass
-/// runs.
-fn insertClayWidget(self: *Self, plugin: ?*c.ExtismCurrentPlugin, out_val: *allowzero c.ExtismVal, widget: Widget, layout: ClayLayoutRequest, expires_at_ms: ?i64) void {
-    const style = toClayStyle(layout);
-    const call_io = self.io();
-    self.mutex.lockUncancelable(call_io);
-    const result = self.insertLockedWithLayoutValidated(widget, layout.parent_id, style, expires_at_ms);
-    self.mutex.unlock(call_io);
-
-    const widget_id = result catch |err| {
-        switch (err) {
-            error.NoSuchParent => host_fn_util.writeErrorJson(plugin, out_val, "no such parent widget {d}", .{layout.parent_id.?}),
-            error.RegistryFull => host_fn_util.writeErrorJson(plugin, out_val, "widget registry full", .{}),
-        }
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, out_val, json);
-}
-
-// Returns the owning `std.json.Parsed(T)`, not just `T` -- `T`'s string
-// fields point into the parse arena `Parsed` owns, so the caller must keep
-// it alive (via its own `defer parsed.deinit()`) for as long as it uses
-// `.value`. An earlier version of this helper deinited the arena itself and
-// returned a bare `T`, which handed back a struct full of dangling slices
-// the instant the function returned -- caught via a real segfault inside a
-// host function callback, not by inspection.
-//
-// `.allocate = .alloc_always` is required, not cosmetic: parseFromSlice's
-// default (`.alloc_if_needed`) returns string fields as slices directly
-// into `input_bytes` whenever no escaping is needed (e.g. a plain label
-// like "Click me") -- and `input_bytes` is freed by this function before it
-// even returns, which reproduced the exact same segfault independently of
-// the `parsed.deinit()` ordering above. Forcing an always-copy decouples
-// parsed string lifetimes from `input_bytes` entirely.
-fn parseRequest(comptime T: type, self: *Self, plugin: ?*c.ExtismCurrentPlugin, in_val: *allowzero const c.ExtismVal, out_val: *allowzero c.ExtismVal) ?std.json.Parsed(T) {
-    const input_bytes = host_fn_util.readGuestBytes(self.allocator, plugin, in_val) catch {
-        host_fn_util.writeErrorJson(plugin, out_val, "out of memory reading input", .{});
-        return null;
-    };
-    defer self.allocator.free(input_bytes);
-
-    return std.json.parseFromSlice(T, self.allocator, input_bytes, .{ .allocate = .alloc_always }) catch |err| {
-        host_fn_util.writeErrorJson(plugin, out_val, "bad request: {}", .{err});
-        return null;
-    };
-}
-
-fn createButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateButtonRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const button = Button.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.label);
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .button = button });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createTextFieldHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateTextFieldRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const field = TextField.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.placeholder);
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .textfield = field });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createTextAreaHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateTextAreaRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const area = TextArea.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.placeholder);
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .textarea = area });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createDividerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateDividerRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const divider = Divider.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h });
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .divider = divider });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createBadgeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateBadgeRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const badge = Badge.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.tone, req.label);
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .badge = badge });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateLabelRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const label = Label.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.text);
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .label = label });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateCheckboxRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    var checkbox = Checkbox.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.label);
-    checkbox.checked = req.checked;
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .checkbox = checkbox });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createToggleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateToggleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    var toggle = Toggle.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.label);
-    toggle.checked = req.checked;
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .toggle = toggle });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateRadioButtonRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    var radio = RadioButton.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.group_id, req.label);
-    radio.checked = req.checked;
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .radio_button = radio });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateProgressBarRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const bar = ProgressBar.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.value);
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .progress_bar = bar });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createSliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(CreateSliderRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    const slider = Slider.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.value);
-
-    self.mutex.lockUncancelable(self.io());
-    const id = self.insertLocked(.{ .slider = slider });
-    self.mutex.unlock(self.io());
-
-    const widget_id = id orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
-        return;
-    };
-    var buf: [64]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn createClayContainerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayContainerRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const container = Container.init(std.mem.zeroes(c.SDL_FRect), parsed.value.background);
-    // W7: 0 (the default) means "never expires" -- only Container's own
-    // creation ever computes a non-null value here, see
-    // insertLockedWithLayoutValidated's doc comment.
-    const expires_at_ms: ?i64 = if (parsed.value.duration_ms > 0) timing.nowMs() + @as(i64, parsed.value.duration_ms) else null;
-    insertClayWidget(self, plugin, &outputs[0], .{ .container = container }, parsed.value.layout, expires_at_ms);
-}
-
-fn createClayButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayButtonRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const button = Button.init(std.mem.zeroes(c.SDL_FRect), parsed.value.label);
-    insertClayWidget(self, plugin, &outputs[0], .{ .button = button }, parsed.value.layout, null);
-}
-
-fn createClayTextFieldHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayTextFieldRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const field = TextField.init(std.mem.zeroes(c.SDL_FRect), parsed.value.placeholder);
-    insertClayWidget(self, plugin, &outputs[0], .{ .textfield = field }, parsed.value.layout, null);
-}
-
-fn createClayTextAreaHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayTextAreaRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const area = TextArea.init(std.mem.zeroes(c.SDL_FRect), parsed.value.placeholder);
-    insertClayWidget(self, plugin, &outputs[0], .{ .textarea = area }, parsed.value.layout, null);
-}
-
-fn createClayDividerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayDividerRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const divider = Divider.init(std.mem.zeroes(c.SDL_FRect));
-    insertClayWidget(self, plugin, &outputs[0], .{ .divider = divider }, parsed.value.layout, null);
-}
-
-fn createClayBadgeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayBadgeRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const badge = Badge.init(std.mem.zeroes(c.SDL_FRect), parsed.value.tone, parsed.value.label);
-    insertClayWidget(self, plugin, &outputs[0], .{ .badge = badge }, parsed.value.layout, null);
-}
-
-fn createClayLabelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayLabelRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const label = Label.init(std.mem.zeroes(c.SDL_FRect), parsed.value.text);
-    insertClayWidget(self, plugin, &outputs[0], .{ .label = label }, parsed.value.layout, null);
-}
-
-fn createClayCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayCheckboxRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    var checkbox = Checkbox.init(std.mem.zeroes(c.SDL_FRect), parsed.value.label);
-    checkbox.checked = parsed.value.checked;
-    insertClayWidget(self, plugin, &outputs[0], .{ .checkbox = checkbox }, parsed.value.layout, null);
-}
-
-fn createClayToggleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayToggleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    var toggle = Toggle.init(std.mem.zeroes(c.SDL_FRect), parsed.value.label);
-    toggle.checked = parsed.value.checked;
-    insertClayWidget(self, plugin, &outputs[0], .{ .toggle = toggle }, parsed.value.layout, null);
-}
-
-fn createClayRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayRadioButtonRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    var radio = RadioButton.init(std.mem.zeroes(c.SDL_FRect), parsed.value.group_id, parsed.value.label);
-    radio.checked = parsed.value.checked;
-    insertClayWidget(self, plugin, &outputs[0], .{ .radio_button = radio }, parsed.value.layout, null);
-}
-
-fn createClayProgressBarHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClayProgressBarRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const bar = ProgressBar.init(std.mem.zeroes(c.SDL_FRect), parsed.value.value);
-    insertClayWidget(self, plugin, &outputs[0], .{ .progress_bar = bar }, parsed.value.layout, null);
-}
-
-fn createClaySliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(ClaySliderRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const slider = Slider.init(std.mem.zeroes(c.SDL_FRect), parsed.value.value);
-    insertClayWidget(self, plugin, &outputs[0], .{ .slider = slider }, parsed.value.layout, null);
-}
-
-fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(SetTextRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    const slot = self.findLocked(req.widget_id) orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
-        return;
-    };
-    switch (slot.widget) {
-        .button => |*b| b.setLabel(req.text),
-        .textfield => |*t| t.setText(req.text),
-        .textarea => |*ta| ta.setText(req.text),
-        .label => |*l| l.setText(req.text),
-        .checkbox => |*cb| cb.setLabel(req.text),
-        .toggle => |*tg| tg.setLabel(req.text),
-        .radio_button => |*r| r.setLabel(req.text),
-        .badge => |*bd| bd.setLabel(req.text),
-        .container, .progress_bar, .slider, .divider => {},
-    }
-    if (slot.clay_managed) self.layout_generation +%= 1;
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
-}
-
-fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    const slot = self.findLocked(req.widget_id) orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
-        return;
-    };
-    const text: []const u8 = switch (slot.widget) {
-        .button => |b| b.label(),
-        .textfield => |t| t.text(),
-        .textarea => |ta| ta.text(),
-        .label => |l| l.text(),
-        .checkbox => |cb| cb.label(),
-        .toggle => |tg| tg.label(),
-        .radio_button => |r| r.label(),
-        .badge => |bd| bd.label(),
-        .container, .progress_bar, .slider, .divider => "",
-    };
-
-    var arena = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    var out: std.ArrayList(u8) = .empty;
-    const ok = blk: {
-        out.appendSlice(arena_allocator, "{\"text\":") catch break :blk false;
-        json_util.writeString(&out, arena_allocator, text) catch break :blk false;
-        out.append(arena_allocator, '}') catch break :blk false;
-        break :blk true;
-    };
-    if (!ok) {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory", .{});
-        return;
-    }
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], out.items);
-}
-
-/// W1: bool state for `.checkbox`/`.radio_button` -- a no-op (not an error)
-/// on any other kind, matching `setTextHostFn`'s existing precedent for
-/// kinds the operation doesn't apply to. A radio button being set `true`
-/// routes through `selectRadioExclusive` *after* releasing the lock below
-/// (that function takes its own lock -- `Io.Mutex` isn't reentrant, calling
-/// it while still holding the lock here would deadlock), so its siblings
-/// get deselected the same way a real click would; being set `false` just
-/// deselects it directly, no exclusivity to apply.
-fn setCheckedHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(SetCheckedRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    var is_radio = false;
-    self.mutex.lockUncancelable(self.io());
-    if (self.findLocked(req.widget_id)) |slot| {
-        switch (slot.widget) {
-            .checkbox => |*cb| cb.checked = req.checked,
-            .toggle => |*tg| tg.checked = req.checked,
-            .radio_button => |*r| {
-                is_radio = true;
-                if (!req.checked) r.deselect();
-            },
-            else => {},
-        }
-        self.mutex.unlock(self.io());
-    } else {
-        self.mutex.unlock(self.io());
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
-        return;
-    }
-
-    if (is_radio and req.checked) self.selectRadioExclusive(self.io(), req.widget_id);
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
-}
-
-fn getCheckedHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    const slot = self.findLocked(req.widget_id) orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
-        return;
-    };
-    const checked = switch (slot.widget) {
-        .checkbox => |cb| cb.checked,
-        .toggle => |tg| tg.checked,
-        .radio_button => |r| r.checked,
-        else => false,
-    };
-    var buf: [32]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"checked\":{}}}", .{checked}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-/// W1: float state for `.progress_bar` -- no-op on any other kind, same
-/// "not an error, just doesn't apply" precedent as `setCheckedHostFn`.
-/// `ProgressBar.setValue` clamps to [0,1] itself, so no clamping needed here.
-fn setValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(SetValueRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    const slot = self.findLocked(req.widget_id) orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
-        return;
-    };
-    switch (slot.widget) {
-        .progress_bar => |*p| p.setValue(req.value),
-        // W3: a guest can still call natyv_set_value on a slider directly
-        // (e.g. to reset it to a default) even though the common case is
-        // host-driven drag/arrow-key input -- same "not an error, just
-        // doesn't apply" precedent everywhere else in this file, except
-        // here it *does* apply.
-        .slider => |*s| s.setValue(req.value),
-        else => {},
-    }
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
-}
-
-fn getValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    const slot = self.findLocked(req.widget_id) orelse {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
-        return;
-    };
-    const value: f32 = switch (slot.widget) {
-        .progress_bar => |p| p.value,
-        .slider => |s| s.value,
-        else => 0,
-    };
-    var buf: [32]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{value}) catch "{}";
-    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
-}
-
-fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
-    _ = n_inputs;
-    _ = n_outputs;
-    const self: *Self = @ptrCast(@alignCast(user_data.?));
-    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
-    defer parsed.deinit();
-    const req = parsed.value;
-
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    for (&self.slots) |*slot| {
-        if (slot.*) |*s| {
-            if (s.id == req.widget_id) {
-                // F3: this host function runs on the worker thread (nested
-                // inside natyv_dispatch -- see Dispatch.zig's doc comment),
-                // but TTF_DestroyText is only valid on the thread that
-                // created the text (the main thread, which owns the text
-                // engine). Queue the pointer for main.zig to actually
-                // destroy next frame instead of calling it here -- see
-                // `pending_text_destroys`'s doc comment for the full story,
-                // and `destroyAllTextObjects` for the shutdown-time
-                // counterpart (safe to call directly there since it's
-                // already running on the main thread).
-                self.queueWidgetTextDestroysLocked(&s.widget);
-                if (s.clay_managed) self.layout_generation +%= 1;
-                slot.* = null;
-                host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
-                return;
-            }
-        }
-    }
-    host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
 }
