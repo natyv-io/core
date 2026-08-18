@@ -102,6 +102,7 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
     switch (kind) {
         .button => widgets.flashButton(io, id),
         .checkbox => widgets.toggleCheckbox(io, id),
+        .toggle => widgets.toggleToggle(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
         .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider => return,
     }
@@ -154,6 +155,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
     return switch (widget) {
         .button => |b| b.containsPoint(mx, my),
         .checkbox => |cb| cb.containsPoint(mx, my),
+        .toggle => |tg| tg.containsPoint(mx, my),
         .radio_button => |r| r.containsPoint(mx, my),
         .textfield => |t| t.containsPoint(mx, my),
         .textarea => |ta| ta.containsPoint(mx, my),
@@ -179,6 +181,10 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
         },
         .checkbox => |cb| if (cb.containsPoint(mx, my)) {
             activateWidget(widgets, io, queue, slot.id, .checkbox, FloatingOrder.surfaceIdFor(slots, slot.id));
+            return slot.id;
+        },
+        .toggle => |tg| if (tg.containsPoint(mx, my)) {
+            activateWidget(widgets, io, queue, slot.id, .toggle, FloatingOrder.surfaceIdFor(slots, slot.id));
             return slot.id;
         },
         .radio_button => |r| if (r.containsPoint(mx, my)) {
@@ -211,6 +217,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         .textarea => |ta| ta.drawDecorations(renderer),
         .label => |l| l.drawDecorations(renderer),
         .checkbox => |cb| cb.drawDecorations(renderer),
+        .toggle => |tg| tg.drawDecorations(renderer),
         .radio_button => |r| r.drawDecorations(renderer),
         .progress_bar => |p| p.drawDecorations(renderer),
         .slider => |s| s.drawDecorations(renderer),
@@ -305,11 +312,14 @@ pub fn main(init: std.process.Init) !void {
     const widget_kinds: WidgetHost.EnabledKinds = .{
         .button = config.value.widgets.button,
         .textfield = config.value.widgets.textfield,
+        .textarea = config.value.widgets.textarea,
         .label = config.value.widgets.label,
         .checkbox = config.value.widgets.checkbox,
+        .toggle = config.value.widgets.toggle,
         .radio_button = config.value.widgets.radio_button,
         .progress_bar = config.value.widgets.progress_bar,
         .slider = config.value.widgets.slider,
+        .divider = config.value.widgets.divider,
     };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
     try runtime.loadPlugin(wasm, manifest, widget_kinds, clay_enabled);
@@ -731,6 +741,9 @@ pub fn main(init: std.process.Init) !void {
                     hovering_any = true;
                 },
                 .checkbox => |cb| if (cb.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                },
+                .toggle => |tg| if (tg.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
                 },
                 .radio_button => |r| if (r.containsPoint(mouse_x, mouse_y)) {

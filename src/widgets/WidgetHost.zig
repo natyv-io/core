@@ -108,6 +108,7 @@ const TextArea = @import("TextArea.zig");
 const Label = @import("Label.zig");
 const Container = @import("Container.zig");
 const Checkbox = @import("Checkbox.zig");
+const Toggle = @import("Toggle.zig");
 const RadioButton = @import("RadioButton.zig");
 const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
@@ -122,9 +123,12 @@ pub const max_widgets = 64;
 // + textarea create (1) -- W10 (natyv_clay_create_textarea is counted
 // separately in registerClayInto's own clay_host_function_count).
 // + divider create (1) -- W11, same natyv_clay_create_divider split.
-pub const host_function_count = 16;
+// + toggle create (1) -- W12, same natyv_clay_create_toggle split. Reuses
+// the existing natyv_set_checked/natyv_get_checked host functions (no new
+// ones needed for those), same as radio_button already does.
+pub const host_function_count = 17;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, radio_button, progress_bar, slider, divider };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -132,6 +136,7 @@ pub const Widget = union(WidgetKind) {
     label: Label,
     container: Container,
     checkbox: Checkbox,
+    toggle: Toggle,
     radio_button: RadioButton,
     progress_bar: ProgressBar,
     slider: Slider,
@@ -149,6 +154,7 @@ pub const Widget = union(WidgetKind) {
             .label => |*l| &l.rect,
             .container => |*co| &co.rect,
             .checkbox => |*cb| &cb.rect,
+            .toggle => |*tg| &tg.rect,
             .radio_button => |*r| &r.rect,
             .progress_bar => |*p| &p.rect,
             .slider => |*s| &s.rect,
@@ -180,8 +186,10 @@ pub const Widget = union(WidgetKind) {
             // whole-rect fill.
             // W3: Slider needs its own two-color (track + fill) custom draw
             // in drawDecorations, same "opts out of the single-color batched
-            // fill" precedent ProgressBar already established.
-            .label, .radio_button, .progress_bar, .slider => null,
+            // fill" precedent ProgressBar already established. W12: Toggle
+            // joins for the same reason -- its track+thumb are a real
+            // two-color draw, not a single conditional fill.
+            .label, .radio_button, .progress_bar, .slider, .toggle => null,
             // W11: unlike Container's opt-in background, a divider always
             // fills -- see Divider.zig's doc comment.
             .divider => |d| .{ .color = d.fillColor(), .rect = d.rect },
@@ -194,7 +202,7 @@ pub const Widget = union(WidgetKind) {
     /// participate in Tab order.
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
-            .button, .textfield, .textarea, .checkbox, .radio_button, .slider => true,
+            .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider => true,
             .label, .container, .progress_bar, .divider => false,
         };
     }
@@ -209,6 +217,7 @@ pub const Widget = union(WidgetKind) {
             .textfield => |*t| t.focused = focused,
             .textarea => |*ta| ta.focused = focused,
             .checkbox => |*cb| cb.focused = focused,
+            .toggle => |*tg| tg.focused = focused,
             .radio_button => |*r| r.focused = focused,
             .slider => |*s| s.focused = focused,
             .label, .container, .progress_bar, .divider => {},
@@ -334,6 +343,7 @@ pub const EnabledKinds = struct {
     textarea: bool = true,
     label: bool = true,
     checkbox: bool = true,
+    toggle: bool = true,
     radio_button: bool = true,
     progress_bar: bool = true,
     slider: bool = true,
@@ -373,6 +383,10 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
         funcs_out[n] = c.extism_function_new("natyv_create_checkbox", &in_types[0], 1, &out_types[0], 1, createCheckboxHostFn, self, null);
         n += 1;
     }
+    if (enabled.toggle) {
+        funcs_out[n] = c.extism_function_new("natyv_create_toggle", &in_types[0], 1, &out_types[0], 1, createToggleHostFn, self, null);
+        n += 1;
+    }
     if (enabled.radio_button) {
         funcs_out[n] = c.extism_function_new("natyv_create_radio_button", &in_types[0], 1, &out_types[0], 1, createRadioButtonHostFn, self, null);
         n += 1;
@@ -410,7 +424,7 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     return n;
 }
 
-pub const clay_host_function_count = 10;
+pub const clay_host_function_count = 11;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -432,6 +446,7 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[7] = c.extism_function_new("natyv_clay_create_slider", &in_types[0], 1, &out_types[0], 1, createClaySliderHostFn, self, null);
     funcs_out[8] = c.extism_function_new("natyv_clay_create_textarea", &in_types[0], 1, &out_types[0], 1, createClayTextAreaHostFn, self, null);
     funcs_out[9] = c.extism_function_new("natyv_clay_create_divider", &in_types[0], 1, &out_types[0], 1, createClayDividerHostFn, self, null);
+    funcs_out[10] = c.extism_function_new("natyv_clay_create_toggle", &in_types[0], 1, &out_types[0], 1, createClayToggleHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -536,6 +551,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .textarea => |*ta| ta.syncText(engine, font),
                 .label => |*l| l.syncText(engine, font),
                 .checkbox => |*cb| cb.syncText(engine, font),
+                .toggle => |*tg| tg.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),
                 .container, .progress_bar, .slider, .divider => {},
             }
@@ -559,6 +575,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .textarea => |*ta| ta.destroyText(),
                 .label => |*l| l.destroyText(),
                 .checkbox => |*cb| cb.destroyText(),
+                .toggle => |*tg| tg.destroyText(),
                 .radio_button => |*r| r.destroyText(),
                 .container, .progress_bar, .slider, .divider => {},
             }
@@ -633,6 +650,7 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                         .textarea => |*ta| ta.destroyText(),
                         .label => |*l| l.destroyText(),
                         .checkbox => |*cb| cb.destroyText(),
+                        .toggle => |*tg| tg.destroyText(),
                         .radio_button => |*r| r.destroyText(),
                         .container, .progress_bar, .slider, .divider => {},
                     }
@@ -694,6 +712,7 @@ fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         },
         .label => |*l| self.queuePendingTextDestroy(&l.text_obj),
         .checkbox => |*cb| self.queuePendingTextDestroy(&cb.text_obj),
+        .toggle => |*tg| self.queuePendingTextDestroy(&tg.text_obj),
         .radio_button => |*r| self.queuePendingTextDestroy(&r.text_obj),
         .container, .progress_bar, .slider, .divider => {},
     }
@@ -886,6 +905,20 @@ pub fn toggleCheckbox(self: *Self, call_io: Io, id: u32) void {
     }
 }
 
+/// W12: the `.toggle`-kind counterpart to `toggleCheckbox` above -- kept as
+/// its own function (not a generalization of `toggleCheckbox` to any
+/// bool-state kind) since `Checkbox` and `Toggle` are otherwise-unrelated
+/// widget kinds sharing this file only by convention, and generalizing here
+/// would mean touching `toggleCheckbox`'s already-shipped, tested body for
+/// no functional gain.
+pub fn toggleToggle(self: *Self, call_io: Io, id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        if (slot.widget == .toggle) slot.widget.toggle.toggle();
+    }
+}
+
 /// W1: selects radio button `id` and deselects every other `.radio_button`
 /// sharing its `group_id` -- the actual mutual-exclusivity logic
 /// `RadioButton.zig`'s own doc comment defers to this file for, since it
@@ -946,6 +979,7 @@ const WidgetIdRequest = struct { widget_id: u32 };
 const CreateLabelRequest = struct { x: f32, y: f32, w: f32 = 0, h: f32 = 20, text: []const u8 = "" };
 const SetTextRequest = struct { widget_id: u32, text: []const u8 };
 const CreateCheckboxRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", checked: bool = false };
+const CreateToggleRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", checked: bool = false };
 const CreateRadioButtonRequest = struct { x: f32, y: f32, w: f32, h: f32, label: []const u8 = "", group_id: u32, checked: bool = false };
 const CreateProgressBarRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
 const CreateSliderRequest = struct { x: f32, y: f32, w: f32, h: f32, value: f32 = 0 };
@@ -995,6 +1029,7 @@ const ClayTextAreaRequest = struct { layout: ClayLayoutRequest = .{}, placeholde
 const ClayDividerRequest = struct { layout: ClayLayoutRequest = .{} };
 const ClayLabelRequest = struct { layout: ClayLayoutRequest = .{}, text: []const u8 = "" };
 const ClayCheckboxRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
+const ClayToggleRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", checked: bool = false };
 const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", group_id: u32, checked: bool = false };
 const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
@@ -1230,6 +1265,30 @@ fn createCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Ext
     host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
 }
 
+fn createToggleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(CreateToggleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    var toggle = Toggle.init(.{ .x = req.x, .y = req.y, .w = req.w, .h = req.h }, req.label);
+    toggle.checked = req.checked;
+
+    self.mutex.lockUncancelable(self.io());
+    const id = self.insertLocked(.{ .toggle = toggle });
+    self.mutex.unlock(self.io());
+
+    const widget_id = id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{});
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
 fn createRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -1375,6 +1434,17 @@ fn createClayCheckboxHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c
     insertClayWidget(self, plugin, &outputs[0], .{ .checkbox = checkbox }, parsed.value.layout, null);
 }
 
+fn createClayToggleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayToggleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    var toggle = Toggle.init(std.mem.zeroes(c.SDL_FRect), parsed.value.label);
+    toggle.checked = parsed.value.checked;
+    insertClayWidget(self, plugin, &outputs[0], .{ .toggle = toggle }, parsed.value.layout, null);
+}
+
 fn createClayRadioButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -1426,6 +1496,7 @@ fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .textarea => |*ta| ta.setText(req.text),
         .label => |*l| l.setText(req.text),
         .checkbox => |*cb| cb.setLabel(req.text),
+        .toggle => |*tg| tg.setLabel(req.text),
         .radio_button => |*r| r.setLabel(req.text),
         .container, .progress_bar, .slider, .divider => {},
     }
@@ -1453,6 +1524,7 @@ fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal,
         .textarea => |ta| ta.text(),
         .label => |l| l.text(),
         .checkbox => |cb| cb.label(),
+        .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
         .container, .progress_bar, .slider, .divider => "",
     };
@@ -1496,6 +1568,7 @@ fn setCheckedHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismV
     if (self.findLocked(req.widget_id)) |slot| {
         switch (slot.widget) {
             .checkbox => |*cb| cb.checked = req.checked,
+            .toggle => |*tg| tg.checked = req.checked,
             .radio_button => |*r| {
                 is_radio = true;
                 if (!req.checked) r.deselect();
@@ -1529,6 +1602,7 @@ fn getCheckedHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismV
     };
     const checked = switch (slot.widget) {
         .checkbox => |cb| cb.checked,
+        .toggle => |tg| tg.checked,
         .radio_button => |r| r.checked,
         else => false,
     };
