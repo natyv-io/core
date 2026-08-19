@@ -499,9 +499,14 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // (W27: +2 -- a RangeSlider trigger + its own mirrored status Label
     // (priceRangeStatus), placed below Table -- see priceRange's own doc
     // comment in main.go.)
+    // (W28: +9 -- Card & Panel, pure guest composition (see card.go/
+    // panel.go's own doc comments, no new WidgetKind). Card: panel + title
+    // Label + Divider + content Container (4) + the content area's own
+    // description Label + cardButton + cardStatus Label (3) = 7. Panel:
+    // panel Container + its own description Label = 2. 7 + 2 = 9.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 108), n);
+    try std.testing.expectEqual(@as(usize, 117), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1721,6 +1726,84 @@ test "W27: a range slider created via natyv_clay_create_range_slider round-trips
             try std.testing.expectApproxEqAbs(@as(f32, 0.2), slot.widget.range_slider.min, 0.001);
             try std.testing.expectApproxEqAbs(@as(f32, 0.8), slot.widget.range_slider.max, 0.001);
         }
+    }
+}
+
+test "W28: a Card's title/content structure round-trips, and a real click inside its content updates the mirrored status Label" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    // The title Label -- exactly one Label reads "Card Demo" in this
+    // fixture -- unambiguous to match directly.
+    var title_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Card Demo")) title_id = slot.id;
+    }
+    const tid = title_id orelse return error.MissingCardTitle;
+
+    // The panel itself (the title's own parent) must have its background
+    // fill on -- Card is a Panel under the hood (see card.go's own doc
+    // comment).
+    var panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.id == tid) panel_id = slot.parent_id;
+    }
+    const pid = panel_id orelse return error.MissingCardPanel;
+    for (snap[0..n]) |slot| {
+        if (slot.id == pid) try std.testing.expect(slot.widget.container.background);
+    }
+
+    // Exactly one Button labeled "Click Me" exists -- real guest-routed
+    // click (natyv_dispatch), not a test hook, proves Card.ContentID()'s
+    // own parenting actually works end to end, not just that the panel/
+    // title exist.
+    var click_id: ?u32 = null;
+    var status_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Click Me")) click_id = slot.id;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Clicked: 0")) status_id = slot.id;
+    }
+    const cid = click_id orelse return error.MissingCardButton;
+    const sid = status_id orelse return error.MissingCardStatus;
+
+    var dispatch_buf: [64]u8 = undefined;
+    const payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{cid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == sid) try std.testing.expectEqualStrings("Clicked: 1", slot.widget.label.text());
+    }
+
+    // The title-less Panel demo also exists, with its own background fill
+    // on and its own descriptive Label as a real child -- proves Panel
+    // itself (not just Card, which wraps it) round-trips correctly too.
+    var panel_demo_label_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "A plain Panel -- just a background + border, no title row.")) {
+            panel_demo_label_id = slot.id;
+        }
+    }
+    const plid = panel_demo_label_id orelse return error.MissingPanelDemoLabel;
+    var panel_demo_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.id == plid) panel_demo_id = slot.parent_id;
+    }
+    const pdid = panel_demo_id orelse return error.MissingPanelDemo;
+    for (snap[0..n]) |slot| {
+        if (slot.id == pdid) try std.testing.expect(slot.widget.container.background);
     }
 }
 
