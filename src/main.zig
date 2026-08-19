@@ -5,6 +5,7 @@ const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const Slider = @import("widgets/Slider.zig");
+const RangeSlider = @import("widgets/RangeSlider.zig");
 const TextField = @import("widgets/TextField.zig");
 const TextArea = @import("widgets/TextArea.zig");
 const json_util = @import("json_util.zig");
@@ -118,7 +119,9 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         // `notifySegmentedValue` and the keyboard handling below). W19:
         // Tabs joins for the same reason -- driven by `tabAt`/arrow-key
         // input via `notifyTabsValue`, not Enter/Space.
-        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => return,
+        // W27: RangeSlider joins the same non-activatable set as Slider --
+        // driven by drag/arrow-keys, not Enter/Space.
+        .textfield, .textarea, .label, .container, .progress_bar, .slider, .range_slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -136,6 +139,22 @@ fn notifySliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u
     const clamped = widgets.setSliderValue(io, id, value) orelse return;
     var buf: [32]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{clamped}) catch "{}";
+    queue.push(io, id, .change, json, surface_id);
+}
+
+/// W27: the `RangeSlider` counterpart to `notifySliderValue` -- called from
+/// both a drag update and an arrow-key nudge, always for whichever handle
+/// `WidgetHost.setRangeSliderValue`'s own `handle` param names (the widget's
+/// current `active_handle`, resolved separately at drag-start/focus time).
+/// Payload is `{"min":m,"max":x}`, not Slider's bare `{"value":f}` -- a
+/// different shape under the same `.change` event type, decoded by the
+/// guest SDK's own `RegisterRangeChange` instead of `RegisterChange` (see
+/// that file's own doc comment for why they're two separate handler tables
+/// rather than one, despite sharing an event type).
+fn notifyRangeSliderValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, handle: RangeSlider.Handle, value: f32, surface_id: u32) void {
+    const result = widgets.setRangeSliderValue(io, id, handle, value) orelse return;
+    var buf: [48]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"min\":{d},\"max\":{d}}}", .{ result.min, result.max }) catch "{}";
     queue.push(io, id, .change, json, surface_id);
 }
 
@@ -271,6 +290,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .textfield => |t| t.containsPoint(mx, my),
         .textarea => |ta| ta.containsPoint(mx, my),
         .slider => |s| s.containsPoint(mx, my),
+        .range_slider => |rs| rs.containsPoint(mx, my),
         .numeric_stepper => |ns| ns.containsPoint(mx, my),
         .segmented_control => |sc| sc.containsPoint(mx, my),
         .tabs => |tb| tb.containsPoint(mx, my),
@@ -286,8 +306,25 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
 /// hit widget's id (to focus) or null if `slot` wasn't hit/isn't
 /// interactive. `dragging_slider_id` is an out-param the same way it was
 /// an inline assignment before -- a slider hit starts a drag as a side
-/// effect, same as before.
-fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32) ?u32 {
+/// effect, same as before. W27: also covers a RangeSlider hit (its own drag
+/// is host-authoritative the same way, just on whichever handle
+/// `RangeSlider.closestHandle` resolves) -- not renamed to something more
+/// generic like `dragging_widget_id`, since only one of the two kinds can
+/// ever be mid-drag at once anyway (a single global mouse gesture), same
+/// reasoning `WidgetHost.setRangeSliderValue`'s own doc comment gives for
+/// reusing `.change` as RangeSlider's event type instead of inventing a new
+/// one. `dragging_range_handle` is a second, RangeSlider-only out-param --
+/// a real bug (Quinn's own click-through: "I can only use the slider on
+/// the left") caught that `widgets.setRangeSliderActiveHandle` below
+/// mutates the *live* registry, but the per-frame drag-update block reads
+/// `widget_snapshot`, captured once at the top of this same frame, *before*
+/// any of this frame's events ran -- so a fresh handle choice made here
+/// was invisible to that block for the rest of the frame it was chosen in,
+/// silently moving whichever handle was active *last* frame instead. This
+/// plain local (threaded the same way `dragging_slider_id` already is, not
+/// read back through the stale snapshot) is what the drag-update block
+/// actually reads now.
+fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle) ?u32 {
     // W19: an invisible slot (a Tabs panel that isn't the active tab, e.g.)
     // isn't declared to Clay this frame, so its cached `rect` can go stale
     // rather than zeroed -- don't rely on that; skip explicitly rather than
@@ -322,6 +359,18 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             return slot.id;
         },
         .slider => |s| if (s.containsPoint(mx, my)) {
+            dragging_slider_id.* = slot.id;
+            return slot.id;
+        },
+        // W27: resolves which handle this click targets (whichever thumb
+        // is closer) and records it as active *before* starting the drag --
+        // main.zig's own per-frame drag-update block (below) and any
+        // arrow-key nudge afterward both just move whatever `active_handle`
+        // currently is, so this is the one place that decision gets made.
+        .range_slider => |rs| if (rs.containsPoint(mx, my)) {
+            const handle = rs.closestHandle(mx);
+            widgets.setRangeSliderActiveHandle(io, slot.id, handle);
+            dragging_range_handle.* = handle;
             dragging_slider_id.* = slot.id;
             return slot.id;
         },
@@ -380,6 +429,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         .radio_button => |r| r.drawDecorations(renderer),
         .progress_bar => |p| p.drawDecorations(renderer),
         .slider => |s| s.drawDecorations(renderer),
+        .range_slider => |rs| rs.drawDecorations(renderer),
         // W5: draws a border only when `background` is set -- see
         // Container.zig's doc comment.
         .container => |cont| cont.drawDecorations(renderer),
@@ -548,6 +598,11 @@ pub fn main(init: std.process.Init) !void {
     // "main.zig owns interaction state, WidgetHost owns widget state"
     // split `focused_widget_id` already establishes.
     var dragging_slider_id: ?u32 = null;
+    // W27: which handle `dragging_slider_id` (above) is currently moving,
+    // when it names a RangeSlider -- see tryHitWidget's own doc comment for
+    // why this can't just be read back from the widget itself via
+    // `widget_snapshot` in the same frame it was chosen.
+    var dragging_range_handle: ?RangeSlider.Handle = null;
 
     // W15: which widget (if any) the mouse is currently continuously over,
     // when that hover started, and which widget (if any) we've already
@@ -734,7 +789,7 @@ pub fn main(init: std.process.Init) !void {
                             // close one.
                             for (widget_snapshot[0..widget_count]) |slot| {
                                 if (!FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
-                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id, &dragging_range_handle)) |id| hit_focusable = id;
                             }
                         } else {
                             // W4: floating content (e.g. an open dropdown's
@@ -785,12 +840,12 @@ pub fn main(init: std.process.Init) !void {
                                 if (topmost_floating_root) |root| {
                                     if (FloatingOrder.nearestFloatingRoot(widget_snapshot[0..widget_count], slot.id) != root) continue;
                                 }
-                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id, &dragging_range_handle)) |id| hit_focusable = id;
                             }
                             if (hit_focusable == null) {
                                 for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
                                     if (floating) continue;
-                                    if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id)) |id| hit_focusable = id;
+                                    if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id, &dragging_range_handle)) |id| hit_focusable = id;
                                 }
                             }
                         }
@@ -802,7 +857,10 @@ pub fn main(init: std.process.Init) !void {
                     // where the mouse currently is -- standard drag
                     // semantics (releasing outside the widget's bounds
                     // still stops it).
-                    if (event.button.button == c.SDL_BUTTON_LEFT) dragging_slider_id = null;
+                    if (event.button.button == c.SDL_BUTTON_LEFT) {
+                        dragging_slider_id = null;
+                        dragging_range_handle = null;
+                    }
                 },
                 c.SDL_EVENT_TEXT_INPUT => {
                     if (focused_widget_id) |id| {
@@ -915,6 +973,12 @@ pub fn main(init: std.process.Init) !void {
                             if (slot.id != id) continue;
                             switch (slot.widget) {
                                 .slider => |s| notifySliderValue(&runtime.widgets, io, &queue, id, s.value - Slider.nudge_step, surface_id),
+                                // W27: nudges whichever handle is currently
+                                // active (see RangeSlider.active_handle's
+                                // own doc comment) -- notifyRangeSliderValue
+                                // itself updates active_handle too, but it's
+                                // already this same handle, a no-op change.
+                                .range_slider => |rs| notifyRangeSliderValue(&runtime.widgets, io, &queue, id, rs.active_handle, rs.activeValue() - rs.nudgeAmount(), surface_id),
                                 .numeric_stepper => |ns| notifyStepperValue(&runtime.widgets, io, &queue, id, ns.value - ns.step, surface_id),
                                 .segmented_control => |sc| notifySegmentedValue(&runtime.widgets, io, &queue, id, if (sc.selected_index > 0) sc.selected_index - 1 else 0, surface_id),
                                 // W19: same clamped (non-wrapping) ±1 shape
@@ -931,6 +995,7 @@ pub fn main(init: std.process.Init) !void {
                             if (slot.id != id) continue;
                             switch (slot.widget) {
                                 .slider => |s| notifySliderValue(&runtime.widgets, io, &queue, id, s.value + Slider.nudge_step, surface_id),
+                                .range_slider => |rs| notifyRangeSliderValue(&runtime.widgets, io, &queue, id, rs.active_handle, rs.activeValue() + rs.nudgeAmount(), surface_id),
                                 .numeric_stepper => |ns| notifyStepperValue(&runtime.widgets, io, &queue, id, ns.value + ns.step, surface_id),
                                 .segmented_control => |sc| notifySegmentedValue(&runtime.widgets, io, &queue, id, sc.selected_index + 1, surface_id),
                                 .tabs => |tb| notifyTabsValue(&runtime.widgets, io, &queue, id, tb.selected_index + 1, surface_id),
@@ -943,6 +1008,9 @@ pub fn main(init: std.process.Init) !void {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            } else if (slot.id == id and slot.widget == .range_slider) {
+                                const rs = slot.widget.range_slider;
+                                notifyRangeSliderValue(&runtime.widgets, io, &queue, id, rs.active_handle, rs.activeValue() - rs.nudgeAmount(), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             } else if (slot.id == id and (slot.widget == .textfield or slot.widget == .button)) {
                                 // W9: widened from textfield-only (W6, for
                                 // Combobox) to also cover a focused Button
@@ -958,6 +1026,9 @@ pub fn main(init: std.process.Init) !void {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                            } else if (slot.id == id and slot.widget == .range_slider) {
+                                const rs = slot.widget.range_slider;
+                                notifyRangeSliderValue(&runtime.widgets, io, &queue, id, rs.active_handle, rs.activeValue() + rs.nudgeAmount(), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             } else if (slot.id == id and (slot.widget == .textfield or slot.widget == .button)) {
                                 queue.push(io, id, .key_nav, "{\"key\":\"up\"}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                             }
@@ -980,6 +1051,18 @@ pub fn main(init: std.process.Init) !void {
             for (widget_snapshot[0..widget_count]) |slot| {
                 if (slot.id == id and slot.widget == .slider) {
                     notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.valueFromX(mouse_x), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                } else if (slot.id == id and slot.widget == .range_slider) {
+                    // W27: moves whichever handle tryHitWidget's mouse-down
+                    // resolved as active (RangeSlider.closestHandle) --
+                    // valueFromX itself is handle-agnostic (see its own doc
+                    // comment), setRangeSliderValue does the real clamping.
+                    // Reads `dragging_range_handle`, NOT
+                    // `slot.widget.range_slider.active_handle` -- see
+                    // tryHitWidget's own doc comment for the same-frame
+                    // staleness bug that distinction fixes (a real one,
+                    // Quinn's own click-through caught it).
+                    const handle = dragging_range_handle orelse slot.widget.range_slider.active_handle;
+                    notifyRangeSliderValue(&runtime.widgets, io, &queue, id, handle, slot.widget.range_slider.valueFromX(mouse_x), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                 }
             }
         }
@@ -1031,6 +1114,10 @@ pub fn main(init: std.process.Init) !void {
                     hovered_widget_id_this_frame = slot.id;
                 },
                 .slider => |s| if (s.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
+                },
+                .range_slider => |rs| if (rs.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },

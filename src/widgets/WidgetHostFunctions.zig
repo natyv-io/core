@@ -38,6 +38,7 @@ const Toggle = @import("Toggle.zig");
 const RadioButton = @import("RadioButton.zig");
 const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
+const RangeSlider = @import("RangeSlider.zig");
 const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
@@ -72,6 +73,11 @@ const CreateNumericStepperRequest = struct { x: f32, y: f32, w: f32, h: f32, val
 const CreateSegmentedControlRequest = struct { x: f32, y: f32, w: f32, h: f32, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 const SetCheckedRequest = struct { widget_id: u32, checked: bool };
 const SetValueRequest = struct { widget_id: u32, value: f32 };
+// W27: RangeSlider's own two-field counterpart to SetValueRequest -- a
+// guest-initiated `natyv_set_range` sets both ends at once (see
+// setRangeHostFn's own doc comment for why, unlike a drag's single-handle
+// natyv_dispatch-driven update).
+const SetRangeRequest = struct { widget_id: u32, min: f32, max: f32 };
 const SetVisibleRequest = struct { widget_id: u32, visible: bool };
 const SetSizeRequest = struct { widget_id: u32, height: f32 };
 
@@ -131,6 +137,7 @@ const ClayToggleRequest = struct { layout: ClayLayoutRequest = .{}, label: []con
 const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 = "", group_id: u32, checked: bool = false };
 const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
+const ClayRangeSliderRequest = struct { layout: ClayLayoutRequest = .{}, min: f32 = 0, max: f32 = 1, step: f32 = 0 };
 const ClayNumericStepperRequest = struct { layout: ClayLayoutRequest = .{}, value: i32 = 0, min: i32 = 0, max: i32 = 100, step: i32 = 1, wrap: bool = false };
 const ClaySegmentedControlRequest = struct { layout: ClayLayoutRequest = .{}, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 const ClayTabsRequest = struct { layout: ClayLayoutRequest = .{}, labels: []const []const u8 = &.{}, selected_index: usize = 0 };
@@ -661,6 +668,16 @@ pub fn createClaySliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const
     insertClayWidget(self, plugin, &outputs[0], .{ .slider = slider }, parsed.value.layout, null);
 }
 
+pub fn createClayRangeSliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayRangeSliderRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const range_slider = RangeSlider.init(std.mem.zeroes(c.SDL_FRect), parsed.value.min, parsed.value.max, parsed.value.step);
+    insertClayWidget(self, plugin, &outputs[0], .{ .range_slider = range_slider }, parsed.value.layout, null);
+}
+
 pub fn createClayNumericStepperHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -791,7 +808,7 @@ pub fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         // change them afterward -- same "not an error, just doesn't
         // apply" precedent as Container/ProgressBar/Slider/Divider here.
         // W19: Tabs' labels join the same "set once at creation" set.
-        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control, .tabs => {},
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs => {},
     }
     if (slot.clay_managed) self.layout_generation +%= 1;
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -820,7 +837,7 @@ pub fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
         .badge => |bd| bd.label(),
-        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control, .tabs => "",
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1092,6 +1109,77 @@ pub fn getValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
     };
     var buf: [32]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{value}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+/// W27: RangeSlider's own two-field counterpart to `setValueHostFn` -- a
+/// guest can still call `natyv_set_range` directly (e.g. to reset both ends
+/// to a default), same "not the common case, but still works" precedent
+/// Slider's own `natyv_set_value` support established. Sets both `min` and
+/// `max` from the request in one call, not two separate single-value calls
+/// -- setting them independently through the existing (single-handle)
+/// `setRangeSliderValue` would clamp each against whatever the *other* one
+/// currently is, which can reject a legitimate new pair depending on call
+/// order (e.g. moving both ends rightward: setting the new, larger `min`
+/// first would clamp against the still-old, smaller `max`). No-op on any
+/// other kind, same "not an error, just doesn't apply" precedent every
+/// other generic accessor in this file already uses.
+pub fn setRangeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetRangeRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.mutex.lockUncancelable(self.io());
+    defer self.mutex.unlock(self.io());
+    const slot = self.findLocked(req.widget_id) orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    };
+    if (slot.widget == .range_slider) {
+        // Clamp the pair against each other directly (not via setMin/setMax,
+        // whose own clamping is exactly the ordering hazard this function's
+        // doc comment explains) -- min against [0, max_request], max against
+        // [that resolved min, 1], mirroring RangeSlider.init's own "min
+        // resolves first" ordering. Snapped independently afterward (see
+        // RangeSlider.snap's own doc comment for why snapping each side
+        // separately here is still safe -- @round is monotonic, so it can't
+        // invert an already-valid min <= max pair).
+        const clamped_min = std.math.clamp(req.min, 0, req.max);
+        const clamped_max = std.math.clamp(req.max, clamped_min, 1);
+        slot.widget.range_slider.min = slot.widget.range_slider.snap(clamped_min);
+        slot.widget.range_slider.max = slot.widget.range_slider.snap(clamped_max);
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+pub fn getRangeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.mutex.lockUncancelable(self.io());
+    defer self.mutex.unlock(self.io());
+    const slot = self.findLocked(req.widget_id) orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    };
+    var min: f32 = 0;
+    var max: f32 = 0;
+    switch (slot.widget) {
+        .range_slider => |rs| {
+            min = rs.min;
+            max = rs.max;
+        },
+        else => {},
+    }
+    var buf: [48]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"min\":{d},\"max\":{d}}}", .{ min, max }) catch "{}";
     host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
 }
 

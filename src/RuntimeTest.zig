@@ -93,7 +93,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
             },
             .label => {},
             .container => {},
-            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .textarea, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => {},
+            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .range_slider, .textarea, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => {},
         }
     }
 
@@ -494,9 +494,14 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // mirrored status Label (+5) -- each Menu's own dropdown panel/items
     // are still only created on demand, same as every other floating
     // widget's baseline exclusion noted above, not part of this count.)
+    // (W25: net +0 -- Dropdown/Popover productization, pure extraction, same
+    // wire-level widget counts as the fixture's own old hand-wired demos.)
+    // (W27: +2 -- a RangeSlider trigger + its own mirrored status Label
+    // (priceRangeStatus), placed below Table -- see priceRange's own doc
+    // comment in main.go.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 106), n);
+    try std.testing.expectEqual(@as(usize, 108), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1673,6 +1678,49 @@ test "W3: slider created via natyv_clay_create_slider round-trips its value, and
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == sid) try std.testing.expectApproxEqAbs(@as(f32, 0.25), slot.widget.slider.value, 0.001);
+    }
+}
+
+test "W27: a range slider created via natyv_clay_create_range_slider round-trips its min/max, and natyv_set_range works on it through a real guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    // Exactly one range_slider exists in this fixture -- matching by kind
+    // alone is unambiguous, same precedent the W6 combobox test's TextField
+    // match already established.
+    var range_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .range_slider) {
+            try std.testing.expectApproxEqAbs(@as(f32, 0), slot.widget.range_slider.min, 0.001);
+            try std.testing.expectApproxEqAbs(@as(f32, 1), slot.widget.range_slider.max, 0.001);
+            range_id = slot.id;
+        }
+    }
+    const rid = range_id orelse return error.MissingRangeSlider;
+
+    // Real guest-routed range change (natyv_set_range via natyv_dispatch,
+    // priceRange.SetRange -- see main.go's own "SetPriceRange" test-hook
+    // case), same shape as W3's own SetSliderQuarter case above.
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"SetPriceRange\"}") orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == rid) {
+            try std.testing.expectApproxEqAbs(@as(f32, 0.2), slot.widget.range_slider.min, 0.001);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.8), slot.widget.range_slider.max, 0.001);
+        }
     }
 }
 

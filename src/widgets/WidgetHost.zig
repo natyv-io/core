@@ -128,6 +128,7 @@ const Toggle = @import("Toggle.zig");
 const RadioButton = @import("RadioButton.zig");
 const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
+const RangeSlider = @import("RangeSlider.zig");
 const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
@@ -169,6 +170,8 @@ pub const max_widgets = 192;
 // button/textfield/label create, set_text, get_text, destroy_widget (6) +
 // checkbox/radio_button/progress_bar create (3) + get_checked/set_checked/
 // get_value/set_value (4) -- W1 widget breadth. + slider create (1) -- W3.
+// + natyv_set_range/natyv_get_range (2) -- W27 RangeSlider's own two-field
+// accessor pair, always registered like set_value/get_value above.
 // + textarea create (1) -- W10 (natyv_clay_create_textarea is counted
 // separately in registerClayInto's own clay_host_function_count).
 // + divider create (1) -- W11, same natyv_clay_create_divider split.
@@ -190,9 +193,9 @@ pub const max_widgets = 192;
 // picker, generic (unrelated to any WidgetKind at all -- these trigger a
 // native OS dialog, not a Clay widget), same "always registered" reasoning
 // as the block above.
-pub const host_function_count = 24;
+pub const host_function_count = 26;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge, numeric_stepper, segmented_control, tabs };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -204,6 +207,7 @@ pub const Widget = union(WidgetKind) {
     radio_button: RadioButton,
     progress_bar: ProgressBar,
     slider: Slider,
+    range_slider: RangeSlider,
     divider: Divider,
     badge: Badge,
     numeric_stepper: NumericStepper,
@@ -226,6 +230,7 @@ pub const Widget = union(WidgetKind) {
             .radio_button => |*r| &r.rect,
             .progress_bar => |*p| &p.rect,
             .slider => |*s| &s.rect,
+            .range_slider => |*rs| &rs.rect,
             .divider => |*d| &d.rect,
             .badge => |*bd| &bd.rect,
             .numeric_stepper => |*ns| &ns.rect,
@@ -260,8 +265,10 @@ pub const Widget = union(WidgetKind) {
             // in drawDecorations, same "opts out of the single-color batched
             // fill" precedent ProgressBar already established. W12: Toggle
             // joins for the same reason -- its track+thumb are a real
-            // two-color draw, not a single conditional fill.
-            .label, .radio_button, .progress_bar, .slider, .toggle => null,
+            // two-color draw, not a single conditional fill. W27: RangeSlider
+            // joins for the same reason as Slider -- track + span-fill +
+            // two thumbs, an even more custom draw than Slider's own.
+            .label, .radio_button, .progress_bar, .slider, .range_slider, .toggle => null,
             // W11: unlike Container's opt-in background, a divider always
             // fills -- see Divider.zig's doc comment.
             .divider => |d| .{ .color = d.fillColor(), .rect = d.rect },
@@ -285,7 +292,7 @@ pub const Widget = union(WidgetKind) {
     /// participate in Tab order.
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
-            .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .numeric_stepper, .segmented_control, .tabs => true,
+            .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .range_slider, .numeric_stepper, .segmented_control, .tabs => true,
             .label, .container, .progress_bar, .divider, .badge => false,
         };
     }
@@ -303,6 +310,7 @@ pub const Widget = union(WidgetKind) {
             .toggle => |*tg| tg.focused = focused,
             .radio_button => |*r| r.focused = focused,
             .slider => |*s| s.focused = focused,
+            .range_slider => |*rs| rs.focused = focused,
             .numeric_stepper => |*ns| ns.focused = focused,
             .segmented_control => |*sc| sc.focused = focused,
             .tabs => |*tb| tb.focused = focused,
@@ -640,6 +648,17 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_show_save_file_dialog", &in_types[0], 1, &out_types[0], 1, HostFunctions.showSaveFileDialogHostFn, self, null);
     n += 1;
+    // W27: RangeSlider's own two-field (min/max) counterpart to
+    // natyv_set_value/natyv_get_value above -- a plain {"value":f} shape
+    // doesn't fit a span, so this is its own pair rather than overloading
+    // the single-value one. Same "always registered" reasoning as every
+    // other generic accessor in this block: a guest can't get a widget_id
+    // to call this with unless it already had permission to create that
+    // widget in the first place.
+    funcs_out[n] = c.extism_function_new("natyv_set_range", &in_types[0], 1, &out_types[0], 1, HostFunctions.setRangeHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_get_range", &in_types[0], 1, &out_types[0], 1, HostFunctions.getRangeHostFn, self, null);
+    n += 1;
     return n;
 }
 
@@ -647,7 +666,8 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
 // + natyv_get_scroll_position/natyv_scroll_into_view (2) -- scroll-into-view
 // for Accordion, plus the general scroll-position getter already flagged
 // for Table/data grid's future virtualization.
-pub const clay_host_function_count = 18;
+// W27: +1 for natyv_clay_create_range_slider.
+pub const clay_host_function_count = 19;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -681,6 +701,7 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     // design this pair exists for.
     funcs_out[16] = c.extism_function_new("natyv_get_scroll_position", &in_types[0], 1, &out_types[0], 1, HostFunctions.getScrollPositionHostFn, self, null);
     funcs_out[17] = c.extism_function_new("natyv_scroll_into_view", &in_types[0], 1, &out_types[0], 1, HostFunctions.scrollIntoViewHostFn, self, null);
+    funcs_out[18] = c.extism_function_new("natyv_clay_create_range_slider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayRangeSliderHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -816,7 +837,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .numeric_stepper => |*ns| ns.syncText(engine, font),
                 .segmented_control => |*sc| sc.syncText(engine, font),
                 .tabs => |*tb| tb.syncText(engine, font),
-                .container, .progress_bar, .slider, .divider => {},
+                .container, .progress_bar, .slider, .range_slider, .divider => {},
             }
         }
     }
@@ -844,7 +865,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .numeric_stepper => |*ns| ns.destroyText(),
                 .segmented_control => |*sc| sc.destroyText(),
                 .tabs => |*tb| tb.destroyText(),
-                .container, .progress_bar, .slider, .divider => {},
+                .container, .progress_bar, .slider, .range_slider, .divider => {},
             }
         }
     }
@@ -923,7 +944,7 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                         .numeric_stepper => |*ns| ns.destroyText(),
                         .segmented_control => |*sc| sc.destroyText(),
                         .tabs => |*tb| tb.destroyText(),
-                        .container, .progress_bar, .slider, .divider => {},
+                        .container, .progress_bar, .slider, .range_slider, .divider => {},
                     }
                     if (s.clay_managed) self.layout_generation +%= 1;
                     slot.* = null;
@@ -995,7 +1016,7 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .segmented_control => |*sc| for (0..sc.count) |i| self.queuePendingTextDestroy(&sc.text_objs[i]),
         // W19: same "up to max_tabs text objects" shape as SegmentedControl.
         .tabs => |*tb| for (0..tb.count) |i| self.queuePendingTextDestroy(&tb.text_objs[i]),
-        .container, .progress_bar, .slider, .divider => {},
+        .container, .progress_bar, .slider, .range_slider, .divider => {},
     }
 }
 
@@ -1287,6 +1308,44 @@ pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
     slot.widget.slider.setValue(value);
     const new = slot.widget.slider.value;
     return if (new != old) new else null;
+}
+
+/// W27: the `RangeSlider` counterpart to `setSliderValue` -- called directly
+/// by `main.zig`'s drag-update block and arrow-key nudge handling, same as
+/// Slider's. `handle` picks which of the two clamped-against-each-other
+/// values `value` targets (see `RangeSlider.setHandleValue`'s own doc
+/// comment); also updates `active_handle` to `handle`, so a drag-start and a
+/// keyboard nudge both leave the widget pointed at whichever handle was just
+/// touched, same "last-touched handle" model `main.zig`'s own mouse-down
+/// hit-test already establishes via `setRangeSliderActiveHandle`. Returns
+/// the actual clamped `{min, max}` pair if either changed, or `null` if `id`
+/// doesn't name a range slider or nothing actually moved (e.g. nudging a
+/// handle already pinned against its sibling).
+pub fn setRangeSliderValue(self: *Self, call_io: Io, id: u32, handle: RangeSlider.Handle, value: f32) ?struct { min: f32, max: f32 } {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(id) orelse return null;
+    if (slot.widget != .range_slider) return null;
+    const old_min = slot.widget.range_slider.min;
+    const old_max = slot.widget.range_slider.max;
+    slot.widget.range_slider.setHandleValue(handle, value);
+    slot.widget.range_slider.active_handle = handle;
+    const new_min = slot.widget.range_slider.min;
+    const new_max = slot.widget.range_slider.max;
+    return if (new_min != old_min or new_max != old_max) .{ .min = new_min, .max = new_max } else null;
+}
+
+/// W27: sets which handle a click targeted, without changing either value --
+/// called from `main.zig`'s mouse-down hit-test (`RangeSlider.closestHandle`
+/// already resolved *which* handle, this just records it) before the
+/// per-frame drag-update block starts moving it via `setRangeSliderValue`
+/// above. A no-op if `id` doesn't name a range slider.
+pub fn setRangeSliderActiveHandle(self: *Self, call_io: Io, id: u32, handle: RangeSlider.Handle) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(id) orelse return;
+    if (slot.widget != .range_slider) return;
+    slot.widget.range_slider.active_handle = handle;
 }
 
 /// W17: the `NumericStepper` counterpart to `setSliderValue` -- same shape,
