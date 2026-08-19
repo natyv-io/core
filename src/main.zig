@@ -538,11 +538,17 @@ pub fn main(init: std.process.Init) !void {
         // that if a real Clay recompute happens this frame, the freshly
         // written-back `rect`s are what the rest of the frame (hit-testing,
         // hover, drawing) actually sees, not last frame's stale ones.
+        // Tree view: `scrolled_ids` collects which scroll containers (if
+        // any) actually moved this pass -- pushed as `.scroll` events below,
+        // once `widget_snapshot` (needed for each one's real surface_id) is
+        // available.
+        var scrolled_ids: [WidgetHost.max_widgets]u32 = undefined;
+        var scrolled_count: usize = 0;
         if (maybe_clay_layout) |*clay_layout| {
             var win_w: c_int = undefined;
             var win_h: c_int = undefined;
             _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
-            clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), mouse_x, mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0, pending_scroll_dx, pending_scroll_dy);
+            scrolled_count = clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), mouse_x, mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0, pending_scroll_dx, pending_scroll_dy, &scrolled_ids);
         }
         pending_scroll_dx = 0;
         pending_scroll_dy = 0;
@@ -583,6 +589,23 @@ pub fn main(init: std.process.Init) !void {
         // here.
         if (runtime.widgets.takePendingScrollIntoView(io)) |scroll_target_id| {
             ClayLayout.applyScrollIntoView(widget_snapshot[0..widget_count], &runtime.widgets, scroll_target_id);
+        }
+
+        // Tree view: a real `.scroll` push for each scroll container
+        // `layoutIfNeeded` reported above -- same `surface_id` lookup and
+        // JSON-building shape every other `notifyXValue` helper already
+        // uses, just inlined here since it needs `scrolled_ids` from
+        // outside `widget_snapshot`'s own scope, not a widget-kind-specific
+        // value.
+        for (scrolled_ids[0..scrolled_count]) |scrolled_id| {
+            for (widget_snapshot[0..widget_count]) |slot| {
+                if (slot.id != scrolled_id) continue;
+                const sd = slot.scroll_data orelse break;
+                var buf: [64]u8 = undefined;
+                const json = std.fmt.bufPrint(&buf, "{{\"scroll_offset_x\":{d},\"scroll_offset_y\":{d}}}", .{ sd.scroll_offset_x, sd.scroll_offset_y }) catch "{}";
+                queue.push(io, scrolled_id, .scroll, json, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], scrolled_id));
+                break;
+            }
         }
 
         // W4: computed here, before the event loop below, since

@@ -449,11 +449,25 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
 /// rest of the render loop. A scroll container's children shift position via
 /// this same writeback, since `openChildren` feeds their clip's
 /// `childOffset` from Clay's own internally-tracked scroll position.
-pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32) void {
+///
+/// Tree view: this same writeback loop is also the only place a scroll
+/// container's *old* `scroll_data` (about to be overwritten) and its freshly
+/// computed new value are both available in the same moment -- so it's also
+/// where a real scroll change gets detected, for `main.zig` to turn into a
+/// `.scroll` `EventQueue` push (main-thread-only work over already-resolved
+/// `Slot` data, not a new cross-thread concern the way W20's
+/// scroll-into-view write was). `scrolled_ids_out` is caller-provided
+/// (bounded by `WidgetHost.max_widgets`, same as the `v_flip_ids`/
+/// `clamp_ids` local arrays already in this function) and the return value
+/// is how many ids were written -- same "caller supplies the buffer, gets a
+/// count back" idiom `WidgetHost.snapshot` already uses. Always `0` on the
+/// early-return "nothing changed at all" path below, since no scroll
+/// container's data could have moved if this function didn't even run.
+pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32, scrolled_ids_out: []u32) usize {
     const current_generation = widgets.currentGeneration(io);
     const content_changed = self.last_computed_generation == null or self.last_computed_generation.? != current_generation;
     const scrolled = scroll_dx != 0 or scroll_dy != 0;
-    if (!content_changed and !scrolled) return;
+    if (!content_changed and !scrolled) return 0;
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = widgets.snapshot(io, &snap);
@@ -595,6 +609,7 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         }
     }
 
+    var scrolled_out_count: usize = 0;
     for (slots) |slot| {
         if (!slot.clay_managed) continue;
         const data = c.Clay_GetElementData(elementId(slot.id));
@@ -636,11 +651,26 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         // `.rect` above already established -- see `Slot.scroll_data`'s own
         // doc comment.
         if (slot.clay_managed and (slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal)) {
-            if (scrollContainerData(slot.id)) |sd| widgets.setScrollData(io, slot.id, sd);
+            if (scrollContainerData(slot.id)) |sd| {
+                // Tree view: compare against what was already stored --
+                // this is the one moment old and new are both available,
+                // see this function's own doc comment -- and report a real
+                // change so main.zig can push a `.scroll` event for it.
+                const changed = if (slot.scroll_data) |old|
+                    old.scroll_offset_x != sd.scroll_offset_x or old.scroll_offset_y != sd.scroll_offset_y
+                else
+                    true;
+                widgets.setScrollData(io, slot.id, sd);
+                if (changed and scrolled_out_count < scrolled_ids_out.len) {
+                    scrolled_ids_out[scrolled_out_count] = slot.id;
+                    scrolled_out_count += 1;
+                }
+            }
         }
     }
 
     self.last_computed_generation = current_generation;
+    return scrolled_out_count;
 }
 
 /// Main-thread-only: walks `widget_id`'s `parent_id` chain (same

@@ -522,9 +522,10 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
 
     var clay_layout = try ClayLayout.init(allocator, 300, 100, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // First frame: nothing computed yet, so this must run Clay for real.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
@@ -553,7 +554,7 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
 
     // Second frame: nothing changed since the first -- must skip the real
     // Clay computation entirely, not just produce the same numbers.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     // Mutating a Clay-managed widget's text bumps layout_generation (see
@@ -564,9 +565,9 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     // export the host can call by name.
     var payload_buf: [64]u8 = undefined;
     const payload = try std.fmt.bufPrint(&payload_buf, "{{\"widget_id\":{d},\"event_type\":\"Grown\"}}", .{bid});
-    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", payload) orelse return error.CallFailed;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 }
 
@@ -587,6 +588,7 @@ test "W16: a floating widget that would overflow the bottom of the window flips 
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // A top_to_bottom root -- a tall spacer pushes the trigger down near
     // the bottom of a 700px-tall window (620 + 30 = 650), leaving only
@@ -607,7 +609,7 @@ test "W16: a floating widget that would overflow the bottom of the window flips 
         .floating = true,
     }) orelse return error.RegistryFull;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     // A flip event means two real Clay_EndLayout calls this recompute.
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 
@@ -641,6 +643,7 @@ test "W16: a floating widget that already fits below its trigger is not flipped"
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Same shape as the flip test above, but the trigger sits near the
     // *top* this time (a 50px spacer, not 620px) -- plenty of room below
@@ -661,7 +664,7 @@ test "W16: a floating widget that already fits below its trigger is not flipped"
         .floating = true,
     }) orelse return error.RegistryFull;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     // No overflow anywhere -- exactly one real Clay_EndLayout, same as
     // every other unflipped-floating test in this file.
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
@@ -691,6 +694,7 @@ test "W16: a floating widget that would overflow the right edge of the window fl
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // A left_to_right root -- a wide spacer pushes the trigger over near
     // the right edge of a 900px-wide window (750 + 100 = 850), leaving
@@ -712,7 +716,7 @@ test "W16: a floating widget that would overflow the right edge of the window fl
         .floating = true,
     }) orelse return error.RegistryFull;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 
     var snap: [8]WidgetHost.Slot = undefined;
@@ -745,6 +749,7 @@ test "W18 follow-up: a floating widget anchored inside a scrolling ancestor flip
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Mirrors the real bug (Quinn's click-through on the Tooltip): the
     // scrolling ancestor (200px wide) is far narrower than the 900px
@@ -777,7 +782,7 @@ test "W18 follow-up: a floating widget anchored inside a scrolling ancestor flip
         .floating = true,
     }) orelse return error.RegistryFull;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     // A flip event means two real Clay_EndLayout calls this recompute.
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 
@@ -814,6 +819,7 @@ test "W18 follow-up: a floating widget too wide to clear a scrolling ancestor's 
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Exactly Quinn's own follow-up report: flipping alone isn't always
     // enough -- the flip logic only ever checks the right/bottom edges it
@@ -842,7 +848,7 @@ test "W18 follow-up: a floating widget too wide to clear a scrolling ancestor's 
         .floating = true,
     }) orelse return error.RegistryFull;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 
     var snap: [8]WidgetHost.Slot = undefined;
@@ -870,6 +876,7 @@ test "W18 follow-up (round 2): clamping a floating widget also moves its own chi
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Exactly the real bug (Quinn's follow-up round): round 1 of the fix
     // clamped the panel's own rect but left a *child* of the panel (here,
@@ -901,7 +908,7 @@ test "W18 follow-up (round 2): clamping a floating widget also moves its own chi
         .sizing = .{ .width = fixedAxis(100), .height = fixedAxis(20) },
     }) orelse return error.RegistryFull;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 
     var snap: [8]WidgetHost.Slot = undefined;
@@ -1074,6 +1081,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
 
     var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Predicted from the fixture's real layout: root is CLAY_LEFT_TO_RIGHT
     // (Clay's own default, unset by main.zig's zeroed root_decl), so the
@@ -1083,7 +1091,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     // pass a mouse position over the scroll container -- Clay only
     // registers pointerOverIds from a real EndLayout pass, and this is the
     // only recompute before the scroll-carrying frame below.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     var snap: [29]WidgetHost.Slot = undefined;
@@ -1121,7 +1129,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     // Content is 5 rows * Fixed(40) = 200px inside a Fixed(100) container --
     // 100px of overflow. A delta far beyond that must clamp exactly to
     // -100, not merely "move some amount."
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 
     n = runtime.widgets.snapshot(io, &snap);
@@ -1160,10 +1168,11 @@ test "W2: scroll position survives an intervening frame where nothing else chang
 
     var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Frame 1: baseline, mouse pre-positioned over the scroll container --
     // see the previous test's identical layout prediction/reasoning.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     var snap: [29]WidgetHost.Slot = undefined;
@@ -1180,7 +1189,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
 
     // Frame 2: a real, moderate scroll (well short of the -100 clamp found
     // in the previous test) -- recompute #2, row1 shifts up by 30px.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
     n = runtime.widgets.snapshot(io, &snap);
     var y_after_first_scroll: f32 = undefined;
@@ -1193,7 +1202,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
 
     // Frame 3: a genuine skip frame -- generation unchanged, zero delta.
     // Must NOT recompute, and the scroll position must NOT be reset.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
@@ -1205,7 +1214,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
     // first. If Clay_UpdateScrollContainers had been called on frame 3's
     // skip above, this would land back at -30 from the (wrongly reset) top
     // instead of -60 from the real starting position.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 3), clay_layout.recompute_count);
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
@@ -1275,7 +1284,7 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
     // on the next call.
     var payload_buf: [64]u8 = undefined;
     const payload = try std.fmt.bufPrint(&payload_buf, "{{\"widget_id\":{d},\"event_type\":\"Grown\"}}", .{bid});
-    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", payload) orelse return error.CallFailed;
 
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
     _ = runtime.widgets.snapshot(io, &snap);
@@ -1555,7 +1564,7 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
     const prid = progress_id orelse return error.MissingProgressBar;
 
     // Real guest-routed checkbox toggle (natyv_set_checked via natyv_dispatch).
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"CheckIt\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"CheckIt\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == cbid) try std.testing.expect(slot.widget.checkbox.checked);
@@ -1563,7 +1572,7 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
 
     // Real guest-routed radio selection -- must flip exclusivity: B becomes
     // checked, A (checked since natyv_init) becomes unchecked.
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SelectRadioB\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"SelectRadioB\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == raid) try std.testing.expect(!slot.widget.radio_button.checked);
@@ -1571,7 +1580,7 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
     }
 
     // Real guest-routed progress value change.
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SetProgressHalf\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"SetProgressHalf\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == prid) try std.testing.expectApproxEqAbs(@as(f32, 0.5), slot.widget.progress_bar.value, 0.001);
@@ -1606,7 +1615,7 @@ test "W3: slider created via natyv_clay_create_slider round-trips its value, and
 
     // Real guest-routed slider value change (natyv_set_value via
     // natyv_dispatch), same shape as W1's SetProgressHalf case above.
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SetSliderQuarter\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"SetSliderQuarter\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == sid) try std.testing.expectApproxEqAbs(@as(f32, 0.25), slot.widget.slider.value, 0.001);
@@ -1660,7 +1669,7 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
 
     // Real guest-routed open (natyv_clay_create_container with
     // floating:true, via natyv_dispatch -- openDropdown).
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"ToggleDropdown\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"ToggleDropdown\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
     var panel_id: ?u32 = null;
@@ -1697,7 +1706,7 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
     // natyv_destroy_widget on the panel/options, via natyv_dispatch --
     // closeDropdown), same "destroy old widgets" pattern examples/bookstore
     // and the F3-regression fixture case already established.
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"SelectOption2\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"SelectOption2\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
     for (snap[0..n]) |slot| {
@@ -1705,6 +1714,95 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
         // The panel and its options must be gone entirely, not just
         // hidden -- natyv has no "visible" concept, only exists/doesn't.
         try std.testing.expect(slot.id != pid);
+    }
+}
+
+// Migration follow-up (Quinn's real click-through feedback): Dropdown's
+// original v1 scope deliberately had no arrow-key cycling or click-away
+// close (see Combobox's own doc comment contrasting itself with this).
+// Brought up to Combobox's own level -- this proves both new real
+// interactions end to end through a real guest.
+test "Dropdown follow-up: arrow-key cycling + Enter selects the highlighted option, and a real click-away closes the panel" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [60]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Select...")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) panel_id = slot.id;
+    }
+    const pid = panel_id orelse return error.MissingDropdownPanel;
+
+    // Two "down" presses (-1 -> 0 -> 1) reach "Option 2", proving the
+    // marker actually moves via SetLabel, not a destroy/recreate churn.
+    for (0..2) |_| {
+        payload = try buildDispatchEnvelope(&dispatch_buf, tid, "key_nav", "{\"key\":\"down\"}");
+        _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    }
+    n = runtime.widgets.snapshot(io, &snap);
+    var option2_marked = false;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "\xe2\x96\xb8 Option 2")) option2_marked = true;
+    }
+    try std.testing.expect(option2_marked);
+
+    // A focused Button's Enter always fires a real `.click` on the trigger
+    // (never a separate `.key_nav` "enter" -- see main.zig's own SDLK_RETURN
+    // handling), so that's what confirms the highlighted option, same shape
+    // Menu's own Enter-while-highlighted regression test already uses.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == tid) try std.testing.expectEqualStrings("Option 2", slot.widget.button.label());
+        try std.testing.expect(slot.id != pid);
+    }
+
+    // Reopen, then close via a real click-away -- a `.blur` on the trigger
+    // naming a new_focus_id that isn't part of the dropdown (the "Grow
+    // Button" from W1, unambiguous elsewhere in this fixture).
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    var reopened_panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) reopened_panel_id = slot.id;
+    }
+    const rpid = reopened_panel_id orelse return error.MissingDropdownPanel;
+
+    var grow_button_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Grow Button")) grow_button_id = slot.id;
+    }
+    const gbid = grow_button_id orelse return error.MissingGrowButton;
+    var blur_payload_buf: [32]u8 = undefined;
+    payload = try buildDispatchEnvelope(&dispatch_buf, tid, "blur", try std.fmt.bufPrint(&blur_payload_buf, "{{\"new_focus_id\":{d}}}", .{gbid}));
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.id != rpid);
     }
 }
 
@@ -1734,7 +1832,8 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
     // default window size.
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     // natyv_init's baseline is now 31 (see the L3 test's comment above),
     // plus this test opens the modal (panel + message + close button = 3
@@ -1761,8 +1860,8 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
 
     // Real guest-routed open (natyv_clay_create_container with modal:true,
     // background:true, via natyv_dispatch -- openModal).
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenModal\"}") orelse return error.CallFailed;
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"OpenModal\"}") orelse return error.CallFailed;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
 
     var panel_id: ?u32 = null;
@@ -1975,8 +2074,12 @@ test "W6: a real .blur event closes the combobox panel without selecting anythin
     // whatever widget just lost focus, on any focus change away from it
     // (see updateFocus's W6 doc comment); synthesized here directly since
     // this test only needs to prove the guest's own "e"vent -> close"
-    // wiring, not a real mouse click moving focus elsewhere.
-    payload = try buildDispatchEnvelope(&dispatch_buf, fid, "blur", "");
+    // wiring, not a real mouse click moving focus elsewhere. A real
+    // `.blur` always carries a `{"new_focus_id":N}` payload (see
+    // blurPayload on the guest side, decoded unconditionally by the SDK's
+    // own dispatch for every `.blur`, not just ones a handler happens to
+    // read) -- 0 here means focus moved to nothing in particular.
+    payload = try buildDispatchEnvelope(&dispatch_buf, fid, "blur", "{\"new_focus_id\":0}");
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
@@ -2031,7 +2134,7 @@ test "W7: a toast round-trips duration_ms into a real expires_at_ms, and destroy
     // Real guest-routed toast creation (natyv_clay_create_container with
     // duration_ms:2000, via natyv_dispatch's "ShowToast" case -- showToast).
     const before_ms = timing.nowMs();
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"ShowToast\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"ShowToast\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
     var toast_id: ?u32 = null;
@@ -2101,7 +2204,8 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     // {0,0} coincidence needs a real Clay recompute, not just a snapshot.
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     // natyv_init's baseline is now 45 (see the L3 test's comment above),
     // plus this test opens the top-level menu (panel + 3 items = 4 more)
@@ -2120,8 +2224,8 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
 
     // Real guest-routed open (natyv_clay_create_container with
     // floating:true, via natyv_dispatch -- openMenu).
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
 
     var panel_id: ?u32 = null;
@@ -2160,7 +2264,7 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     // don't get a real Clay-computed rect until layout runs again, so
     // reading rect before this would capture a stale/default (0,0) rect
     // rather than "More ▸"'s actual on-screen position.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "\xe2\x96\xb8 More \xe2\x96\xb8")) mid = slot.id;
@@ -2193,7 +2297,7 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     // right widget, not just that openSubmenu itself works.
     payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{mid});
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
 
     var submenu_panel_id: ?u32 = null;
@@ -2316,8 +2420,8 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     // arrow keys "did nothing." Self-contained: opens a fresh menu from
     // scratch (everything above was just fully torn down) rather than
     // reusing any state from earlier in this test.
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
     var reopened_pid: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -2387,8 +2491,8 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     // it"), and guards against a regression from the submenuPanelID
     // branch just added above (it must never fire when the submenu was
     // never opened). Self-contained: opens a fresh menu from scratch.
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     payload = try buildDispatchEnvelope(&dispatch_buf, tid, "key_nav", "{\"key\":\"down\"}");
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
@@ -2414,6 +2518,86 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     }
     try std.testing.expect(trigger_relabeled_via_top_level_enter);
     try std.testing.expect(!menu_widgets_remain_after_top_level_enter);
+}
+
+// Repro attempt for Quinn's real click-through report: held-down arrow keys
+// eventually make the menu's rows visually go blank (but stay clickable --
+// a render/label issue, not a logic crash). A real key-repeat is just many
+// .key_nav events delivered back to back, same as this loop -- if
+// renderMenuItems' own destroy/recreate churn ever leaves a row with a
+// stale rect or an empty label after a *real* Clay layout pass runs
+// in between each one (unlike W9's own test above, which never re-runs
+// layoutIfNeeded between its two "down" presses), this should catch it.
+test "Menu migration repro: many rapid key_nav presses, with a real layout pass after each, never leave a row blank or stale" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
+
+    var snap: [60]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Menu")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingMenuTrigger;
+
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"OpenMenu\"}") orelse return error.CallFailed;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
+    n = runtime.widgets.snapshot(io, &snap);
+    var panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) panel_id = slot.id;
+    }
+    const pid = panel_id orelse return error.MissingMenuPanel;
+
+    var dispatch_buf: [256]u8 = undefined;
+    const keys = [_][]const u8{ "down", "down", "down", "down", "down", "up", "down", "up", "up", "down" };
+    for (keys, 0..) |key, step| {
+        var key_payload_buf: [32]u8 = undefined;
+        const key_json = try std.fmt.bufPrint(&key_payload_buf, "{{\"key\":\"{s}\"}}", .{key});
+        const payload = try buildDispatchEnvelope(&dispatch_buf, tid, "key_nav", key_json);
+        _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+
+        // Real layout pass after *every* press, unlike W9's own test above
+        // -- this is what actually resolves each recreated row's fresh
+        // rect, and what a real held key would get between repeats too.
+        _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
+        n = runtime.widgets.snapshot(io, &snap);
+
+        var item_count: usize = 0;
+        for (snap[0..n]) |slot| {
+            if (slot.parent_id == null or slot.parent_id.? != pid or slot.widget != .button) continue;
+            item_count += 1;
+            if (slot.widget.button.label().len == 0) {
+                std.debug.print("[menu-repro] step={d} key={s}: BLANK LABEL on widget {d}\n", .{ step, key, slot.id });
+                return error.BlankMenuItemLabel;
+            }
+            if (slot.widget.button.rect.w == 0 or slot.widget.button.rect.h == 0) {
+                std.debug.print("[menu-repro] step={d} key={s}: ZEROED RECT on widget {d} label=\"{s}\"\n", .{ step, key, slot.id, slot.widget.button.label() });
+                return error.ZeroedMenuItemRect;
+            }
+        }
+        if (item_count != 3) {
+            std.debug.print("[menu-repro] step={d} key={s}: expected 3 top-level items, found {d}\n", .{ step, key, item_count });
+            return error.WrongMenuItemCount;
+        }
+    }
 }
 
 test "W10: a textarea's multi-line content flows through host-level mutation, real guest dispatch, and blur" {
@@ -2497,7 +2681,8 @@ test "W11: a divider exists, is not focusable, and gets real Clay-computed geome
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
@@ -2566,7 +2751,7 @@ test "W12: a toggle exists, is focusable, activates via a real click, and natyv_
 
     // Real guest-routed toggle flip (natyv_set_checked via natyv_dispatch),
     // same shape as W1's CheckIt case.
-    _ = runtime.call(io, "natyv_dispatch", "{\"widget_id\":0,\"event_type\":\"ToggleOn\"}") orelse return error.CallFailed;
+    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"ToggleOn\"}") orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == tid) try std.testing.expect(slot.widget.toggle.checked);
@@ -2601,7 +2786,8 @@ test "W14: three badges exist with their real tones/labels, are not focusable, a
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
@@ -3000,10 +3186,16 @@ test "W18: a popover opens with real content, its own Checkbox toggles, its own 
     n = runtime.widgets.snapshot(io, &snap);
     try std.testing.expectEqual(baseline, n);
 
-    // Reopen, then close via click-away instead -- a real `.blur` event
-    // naming some widget id that isn't part of the popover (the "Grow
-    // Button" from W1, unambiguous elsewhere in this fixture), the same
-    // shape main.zig's updateFocus fires on a real click outside.
+    // Reopen, then close via click-away instead -- a real `.blur` event on
+    // the trigger itself (the widget a real click that opened the popover
+    // would have actually focused), naming a new_focus_id (the "Grow
+    // Button" from W1, unambiguous elsewhere in this fixture) that isn't
+    // part of the popover -- the same shape main.zig's updateFocus fires on
+    // a real click outside. Each popover-owned widget registers its own
+    // OnBlur (see openPopover), so the blur must target one of *those*
+    // widgets to be observed at all -- unlike the old hand-rolled dispatch,
+    // which (harmlessly, but non-selectively) listened to literally any
+    // blur while the panel was open, regardless of which widget it named.
     payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
@@ -3014,7 +3206,8 @@ test "W18: a popover opens with real content, its own Checkbox toggles, its own 
         if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Grow Button")) grow_button_id = slot.id;
     }
     const gbid = grow_button_id orelse return error.MissingGrowButton;
-    payload = try buildDispatchEnvelope(&dispatch_buf, gbid, "blur", "{\"new_focus_id\":0}");
+    var blur_payload_buf: [32]u8 = undefined;
+    payload = try buildDispatchEnvelope(&dispatch_buf, tid, "blur", try std.fmt.bufPrint(&blur_payload_buf, "{{\"new_focus_id\":{d}}}", .{gbid}));
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
     try std.testing.expectEqual(baseline, n);
@@ -3085,6 +3278,7 @@ test "W19: switching a Tabs widget's active tab removes the inactive panel from 
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Fixed width, fit height -- the Tabs widget's own resolved height
     // should track whichever panel is currently visible, not the sum or
@@ -3113,7 +3307,7 @@ test "W19: switching a Tabs widget's active tab removes the inactive panel from 
     }
     runtime.widgets.mutex.unlock(io);
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     var snap: [8]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
@@ -3130,7 +3324,7 @@ test "W19: switching a Tabs widget's active tab removes the inactive panel from 
     // call to actually pick up the change rather than reusing the cached
     // pre-switch pass.
     _ = runtime.widgets.setActiveTab(io, tabs_id, 1) orelse return error.ValueUnchanged;
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
@@ -3142,7 +3336,7 @@ test "W19: switching a Tabs widget's active tab removes the inactive panel from 
     // artifact; the short panel's own height genuinely isn't padded out by
     // the now-hidden tall one.
     _ = runtime.widgets.setActiveTab(io, tabs_id, 0) orelse return error.ValueUnchanged;
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == tabs_id) tabs_rect = slot.widget.tabs.rect;
@@ -3168,7 +3362,8 @@ test "W19: natyv_clay_create_tabs/_tab_panel round-trip through a real compiled 
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     var snap: [56]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
@@ -3210,7 +3405,7 @@ test "W19: natyv_clay_create_tabs/_tab_panel round-trip through a real compiled 
     // if it registered OnChange, which this static demo doesn't.
     const resolved = runtime.widgets.setActiveTab(io, tid, 1);
     try std.testing.expectEqual(@as(?usize, 1), resolved);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
@@ -3311,6 +3506,7 @@ test "Accordion: a Container hidden via setVisible is dropped from Clay's layout
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // A fit-height column holding a header (fixed 32) and a content panel
     // (fixed 50) -- same "fit height tracks exactly what's currently
@@ -3328,7 +3524,7 @@ test "Accordion: a Container hidden via setVisible is dropped from Clay's layout
         .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(50) },
     }) orelse return error.RegistryFull;
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     var snap: [8]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
@@ -3342,7 +3538,7 @@ test "Accordion: a Container hidden via setVisible is dropped from Clay's layout
     // for this next layoutIfNeeded to actually re-run Clay instead of
     // reusing the cached pre-collapse pass.
     try std.testing.expect(runtime.widgets.setVisible(io, content_id, false));
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
@@ -3477,6 +3673,7 @@ test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen chi
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // A fixed 200x100 scroll_vertical container holding 3 fixed-60-tall
     // children (180px of content, 80px of overflow) -- same "known,
@@ -3494,7 +3691,7 @@ test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen chi
         }) orelse return error.RegistryFull;
     }
 
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     // Child 3 (y:[120,180]) starts entirely below the 100px-tall viewport --
     // sanity check the geometry prediction before trusting the assertions
@@ -3516,7 +3713,7 @@ test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen chi
     // is only a snapshot as of the last real recompute -- a second real
     // pass (forced by the layout_generation bump applyScrollIntoView just
     // made) must pick it up.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
         if (slot.id == child_ids[2]) try std.testing.expectApproxEqAbs(@as(f32, 40), slot.widget.container.rect.y, 0.5);
@@ -3552,14 +3749,15 @@ test "Scroll-into-view: natyv_get_scroll_position's Slot.scroll_data mirror matc
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
     defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Same fixture geometry/mouse-position prediction the W2 scroll tests
     // above already establish and trust: the nested scroll container sits
     // at x:[300,500], y:[0,100] in a 600x200 window with the mouse at
     // (400,50). Frame 1 registers the pointer over it; frame 2's -1000
     // vertical delta clamps to the container's real -100px of overflow.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000, &scroll_scratch);
 
     var snap: [56]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
@@ -3612,7 +3810,8 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
     var snap: [56]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
@@ -3670,7 +3869,7 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
     // pass first (picks up SetVisible's layout_generation bump, resolving
     // "Specs"' content to its real, now-visible rect), then drain and apply
     // whatever scroll-into-view request the click's dispatch handler queued.
-    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
     n = runtime.widgets.snapshot(io, &snap);
     if (runtime.widgets.takePendingScrollIntoView(io)) |wid| {
         ClayLayout.applyScrollIntoView(snap[0..n], &runtime.widgets, wid);

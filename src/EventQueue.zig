@@ -42,7 +42,13 @@ const Self = @This();
 /// idiom `closeDropdown`/`closeModal` already use for their own panel
 /// ids) since coalescing narrows this edge case rather than eliminating
 /// it entirely.
-pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover };
+///
+/// Tree view: `.scroll` (payload `{"scroll_offset_x":f,"scroll_offset_y":f}`) is fired to a scroll
+/// container's own widget id whenever `ClayLayout.layoutIfNeeded`'s writeback loop sees its live
+/// scroll offset actually change from what was last recorded -- see that function's own doc comment.
+/// Coalesced like `.change`/`.text_changed`/`.hover`: a container can move every frame while actively
+/// scrolling, and only the latest offset matters to a guest re-windowing a virtualized list.
+pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll };
 
 pub const Entry = struct {
     widget_id: u32,
@@ -94,8 +100,9 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
     // second continuous type -- matched against `event_type` itself (not
     // hardcoded to `.change`) so the two families never cross-coalesce
     // with each other. W15: `.hover` joins the same coalesced family --
-    // see its own EventType doc comment for why.
-    if (event_type == .change or event_type == .text_changed or event_type == .hover) {
+    // see its own EventType doc comment for why. Tree view: `.scroll`
+    // joins it too, same reasoning.
+    if (event_type == .change or event_type == .text_changed or event_type == .hover or event_type == .scroll) {
         for (self.items.items) |*existing| {
             if (existing.widget_id == widget_id and existing.event_type == event_type) {
                 self.allocator.free(existing.payload);
