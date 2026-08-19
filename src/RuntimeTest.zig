@@ -459,29 +459,37 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // 118px body at 24px/row, each pool row a Button + 3 child Label cells
     // (~32 more) -- not hand-derived exactly here since pool sizes depend
     // on int-truncated division, not worth re-deriving by hand when the
-    // real snapshot is authoritative -- 94 widgets total (the dropdown's
-    // floating panel, the modal's panel, the combobox's options panel, the
-    // menu's panel/submenu, the W15 tooltip panel/label, the W16 picker's
-    // own panel/grid/steppers, and the W18 popover's own panel/label/
-    // checkbox/close-button are all only created on demand, not by
-    // natyv_init -- see the W4/W5/W6/W7/W9/W15/W16/W18 tests below; the
-    // toast stack itself IS created here, unlike those, but individual
-    // toasts inside it aren't -- the W19 Tabs widget and its 3 panels/
-    // labels, the Accordion demo's 2 header/content/label triples, and the
-    // Tree/Table demos' own full widget pools ARE all created here too,
-    // unlike Popover, since none of them have any open/close state, see
-    // tabsID's/accordionHeaderIDs'/tree's/table's own doc comments in the
-    // fixture guest). Same silent-truncation risk documented at W1's
-    // identical bump from 4 to 8 -- snapshot() caps at out.len with no
-    // error, so every clay-fixture-loading test's buffer needs auditing
-    // whenever natyv_init grows, not just the test being extended.
+    // real snapshot is authoritative -- + the File picker demo's own row
+    // Container + 2 trigger Buttons ("Choose File"/"Save As") + status
+    // Label (4 more, no dynamic/on-demand widgets at all -- a native OS
+    // dialog isn't a natyv widget, see filedialog.go's own doc comment) --
+    // 98 widgets total (the dropdown's floating panel, the modal's panel,
+    // the combobox's options panel, the menu's panel/submenu, the W15
+    // tooltip panel/label, the W16 picker's own panel/grid/steppers, and
+    // the W18 popover's own panel/label/checkbox/close-button are all only
+    // created on demand, not by natyv_init -- see the W4/W5/W6/W7/W9/W15/
+    // W16/W18 tests below; the toast stack itself IS created here, unlike
+    // those, but individual toasts inside it aren't -- the W19 Tabs
+    // widget and its 3 panels/labels, the Accordion demo's 2 header/
+    // content/label triples, and the Tree/Table demos' own full widget
+    // pools ARE all created here too, unlike Popover, since none of them
+    // have any open/close state, see tabsID's/accordionHeaderIDs'/tree's/
+    // table's own doc comments in the fixture guest). Same
+    // silent-truncation risk documented at W1's identical bump from 4 to
+    // 8 -- snapshot() caps at out.len with no error, so every
+    // clay-fixture-loading test's buffer needs auditing whenever
+    // natyv_init grows, not just the test being extended.
     // (W22: this baseline's own growth pushed the W16 calendar-grid test's
     // peak widget count genuinely past the old max_widgets=128 cap -- see
     // that constant's own doc comment for the real "widget registry full"
     // failure that caught it and the bump to 192.)
+    // (W23: +2 more -- the new outerWrapper (Fit-sized LeftToRight root)
+    // and rightColumn Containers this section's own layout restructuring
+    // added, see main.go's outerWrapper doc comment for why Table moved
+    // into its own column.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 94), n);
+    try std.testing.expectEqual(@as(usize, 100), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -502,9 +510,25 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     }
     const cid = container_id orelse return error.MissingContainer;
 
+    // W23: cid itself is no longer top-level -- the fixture's right-column
+    // layout change wrapped it (and Table's own new column) in a new
+    // LeftToRight root container, so derive *that* one instead (cid's own
+    // parent) to confirm the true root, rather than asserting cid's parent
+    // is null directly.
+    var outer_wrapper_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.id == cid) outer_wrapper_id = slot.parent_id;
+    }
+    const owid = outer_wrapper_id orelse return error.MissingOuterWrapper;
+    var outer_wrapper_is_root = false;
+    for (snap[0..n]) |slot| {
+        if (slot.id == owid and slot.parent_id == null) outer_wrapper_is_root = true;
+    }
+    try std.testing.expect(outer_wrapper_is_root);
+
     for (snap[0..n]) |slot| {
         if (slot.id == cid) {
-            try std.testing.expectEqual(@as(?u32, null), slot.parent_id);
+            try std.testing.expectEqual(@as(?u32, owid), slot.parent_id);
             try std.testing.expectEqual(c.CLAY__SIZING_TYPE_FIXED, slot.clay_style.sizing.width.type);
             try std.testing.expectApproxEqAbs(@as(f32, 300), slot.clay_style.sizing.width.size.minMax.max, 0.01);
             try std.testing.expectEqual(@as(u16, 8), slot.clay_style.padding.left);
@@ -1100,14 +1124,20 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Predicted from the fixture's real layout: root is CLAY_LEFT_TO_RIGHT
-    // (Clay's own default, unset by main.zig's zeroed root_decl), so the
-    // original Fixed(300)x(100) container occupies x:[0,300], and the
-    // Fixed(200)x(100) scroll container (created right after it, as a
-    // sibling) occupies x:[300,500], both y:[0,100]. Frame 1 must already
-    // pass a mouse position over the scroll container -- Clay only
-    // registers pointerOverIds from a real EndLayout pass, and this is the
-    // only recompute before the scroll-carrying frame below.
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
+    // (Clay's own default, unset by main.zig's zeroed root_decl). W23's own
+    // right-column layout change wrapped the original Fixed(300)x(640)
+    // container in a new Fit()-sized LeftToRight wrapper (that container +
+    // Table's own 370px-wide right column, widened from 300 to fit Table's
+    // own widened columns -- see main.go's tableColumns doc comment -- + a
+    // 16px gap = 686px), so the Fixed(200)x(100) scroll container (still a
+    // top-level sibling of that wrapper, untouched by the change -- it was
+    // never nested inside the original container to begin with) now
+    // occupies x:[686,886], not [300,500] -- see W23's own writeup in
+    // project_natyv.md for why moving Table right shifted this. Frame 1
+    // must already pass a mouse position over the scroll container -- Clay
+    // only registers pointerOverIds from a real EndLayout pass, and this is
+    // the only recompute before the scroll-carrying frame below.
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -1136,7 +1166,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     // into frame 1 above needs updating, not the assertions below.
     for (snap[0..n]) |slot| {
         if (slot.id == scid) {
-            try std.testing.expectApproxEqAbs(@as(f32, 300), slot.widget.container.rect.x, 0.01);
+            try std.testing.expectApproxEqAbs(@as(f32, 686), slot.widget.container.rect.x, 0.01);
             try std.testing.expectApproxEqAbs(@as(f32, 200), slot.widget.container.rect.w, 0.01);
             try std.testing.expectApproxEqAbs(@as(f32, 100), slot.widget.container.rect.h, 0.01);
         }
@@ -1145,7 +1175,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     // Content is 5 rows * Fixed(40) = 200px inside a Fixed(100) container --
     // 100px of overflow. A delta far beyond that must clamp exactly to
     // -100, not merely "move some amount."
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000, &scroll_scratch);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, -1000, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
 
     n = runtime.widgets.snapshot(io, &snap);
@@ -1187,8 +1217,9 @@ test "W2: scroll position survives an intervening frame where nothing else chang
     var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
 
     // Frame 1: baseline, mouse pre-positioned over the scroll container --
-    // see the previous test's identical layout prediction/reasoning.
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
+    // see the previous test's identical layout prediction/reasoning (W23's
+    // right-column change moved it to x:[686,886]).
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -1205,7 +1236,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
 
     // Frame 2: a real, moderate scroll (well short of the -100 clamp found
     // in the previous test) -- recompute #2, row1 shifts up by 30px.
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3, &scroll_scratch);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, -3, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
     n = runtime.widgets.snapshot(io, &snap);
     var y_after_first_scroll: f32 = undefined;
@@ -1218,7 +1249,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
 
     // Frame 3: a genuine skip frame -- generation unchanged, zero delta.
     // Must NOT recompute, and the scroll position must NOT be reset.
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
@@ -1230,7 +1261,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
     // first. If Clay_UpdateScrollContainers had been called on frame 3's
     // skip above, this would land back at -30 from the (wrongly reset) top
     // instead of -60 from the real starting position.
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -3, &scroll_scratch);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, -3, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 3), clay_layout.recompute_count);
     n = runtime.widgets.snapshot(io, &snap);
     for (snap[0..n]) |slot| {
@@ -3676,6 +3707,34 @@ test "Scroll-into-view: WidgetHost.queueScrollIntoView/takePendingScrollIntoView
     try std.testing.expectEqual(@as(?u32, 2), runtime.widgets.takePendingScrollIntoView(io));
 }
 
+test "File picker: WidgetHost.queueFileDialogRequest/takePendingFileDialogRequest hand off one pending request at a time" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    // Nothing queued yet.
+    try std.testing.expectEqual(@as(?WidgetHost.PendingFileDialogRequest, null), runtime.widgets.takePendingFileDialogRequest(io));
+
+    runtime.widgets.queueFileDialogRequest(io, .{ .kind = .open, .widget_id = 7, .allow_many = true });
+    const req = runtime.widgets.takePendingFileDialogRequest(io) orelse return error.MissingRequest;
+    try std.testing.expectEqual(WidgetHost.PendingFileDialogRequest{ .kind = .open, .widget_id = 7, .allow_many = true }, req);
+    // Drained -- a second take returns null, doesn't repeat the same request.
+    try std.testing.expectEqual(@as(?WidgetHost.PendingFileDialogRequest, null), runtime.widgets.takePendingFileDialogRequest(io));
+
+    // A second queue before the first is drained just overwrites -- same
+    // "no ordering guarantee needed" reasoning queueScrollIntoView already
+    // established, and realistic use only ever has one dialog open at a
+    // time regardless (see the field's own doc comment).
+    runtime.widgets.queueFileDialogRequest(io, .{ .kind = .open, .widget_id = 1, .allow_many = false });
+    runtime.widgets.queueFileDialogRequest(io, .{ .kind = .save, .widget_id = 2, .allow_many = false });
+    const second = runtime.widgets.takePendingFileDialogRequest(io) orelse return error.MissingRequest;
+    try std.testing.expectEqual(WidgetHost.PendingFileDialogRequest{ .kind = .save, .widget_id = 2, .allow_many = false }, second);
+}
+
 test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen child into view, is a no-op on an already-visible one, and its correction is picked up by the next real layout pass" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -3769,11 +3828,13 @@ test "Scroll-into-view: natyv_get_scroll_position's Slot.scroll_data mirror matc
 
     // Same fixture geometry/mouse-position prediction the W2 scroll tests
     // above already establish and trust: the nested scroll container sits
-    // at x:[300,500], y:[0,100] in a 600x200 window with the mouse at
-    // (400,50). Frame 1 registers the pointer over it; frame 2's -1000
-    // vertical delta clamps to the container's real -100px of overflow.
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
-    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000, &scroll_scratch);
+    // at x:[686,886], y:[0,100] in a 600x200 window with the mouse at
+    // (786,50) -- W23's right-column change shifted this from its old
+    // x:[300,500]/mouse(400,50), see those tests' own doc comments. Frame 1
+    // registers the pointer over it; frame 2's -1000 vertical delta clamps
+    // to the container's real -100px of overflow.
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, 0, &scroll_scratch);
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 786, 50, false, 0, -1000, &scroll_scratch);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
@@ -4165,4 +4226,71 @@ test "Table view: real header labels and row-1 cell content exist right after in
     try std.testing.expect(tape_measure_gone);
     try std.testing.expect(sensor_kit_now_seen);
     try std.testing.expect(pliers_now_seen);
+}
+
+test "File picker: a real .file_selected event reaches OnFileSelected for the right trigger and updates the mirrored status Label, and an empty paths array reads as cancelled" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+    defer runtime.widgets.destroyAllTextObjects(io);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    // Two real trigger Buttons exist right after natyv_init -- this demo
+    // never opens a real dialog itself (that's SDL/main.zig's job, not
+    // something a Zig-level unit test can safely trigger), only registers
+    // OnFileSelected against each trigger's own widget id up front.
+    var choose_file_id: ?u32 = null;
+    var save_as_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .button) continue;
+        const label = slot.widget.button.label();
+        if (std.mem.eql(u8, label, "Choose File")) choose_file_id = slot.id;
+        if (std.mem.eql(u8, label, "Save As")) save_as_id = slot.id;
+    }
+    const cid = choose_file_id orelse return error.MissingChooseFileButton;
+    const sid = save_as_id orelse return error.MissingSaveAsButton;
+
+    // Real guest-routed `.file_selected` event, exactly the payload shape
+    // `fileDialogCallback` (main.zig) builds from a real SDL result --
+    // targeting the "Choose File" trigger's own widget id, same as a real
+    // dialog result would.
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try buildDispatchEnvelope(&dispatch_buf, cid, "file_selected", "{\"paths\":[\"/tmp/example.txt\"]}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var open_status_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Open: example.txt")) open_status_seen = true;
+    }
+    try std.testing.expect(open_status_seen);
+
+    // An empty paths array (cancelled dialog, or a real host-side error --
+    // the wire contract doesn't distinguish the two, see EventQueue.
+    // EventType's own doc comment) targeting the *other* trigger -- real
+    // proof the event actually routes by widget id, not just whichever
+    // handler happened to run last (both triggers mirror into the same
+    // shared status Label, so this also overwrites the "Open: ..." text
+    // from above -- expected, not a bug, same single-shared-status-line
+    // convention every other demo section's own mirrored label uses).
+    payload = try buildDispatchEnvelope(&dispatch_buf, sid, "file_selected", "{\"paths\":[]}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var save_cancelled_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Save: cancelled")) save_cancelled_seen = true;
+    }
+    try std.testing.expect(save_cancelled_seen);
 }

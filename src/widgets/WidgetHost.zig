@@ -186,7 +186,11 @@ pub const max_widgets = 192;
 // composed rather than a new WidgetKind, so no Clay-side registration.
 // + natyv_set_size (1) -- Tree view, generic per-slot Fixed-height resize,
 // same "guest-composed, no new WidgetKind" reasoning as natyv_set_visible.
-pub const host_function_count = 22;
+// + natyv_show_open_file_dialog/natyv_show_save_file_dialog (2) -- File
+// picker, generic (unrelated to any WidgetKind at all -- these trigger a
+// native OS dialog, not a Clay widget), same "always registered" reasoning
+// as the block above.
+pub const host_function_count = 24;
 
 pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge, numeric_stepper, segmented_control, tabs };
 pub const Widget = union(WidgetKind) {
@@ -492,6 +496,34 @@ pending_text_destroy_count: usize = 0,
 /// this (see `queueScrollIntoView`'s own doc comment).
 pending_scroll_into_view: ?u32 = null,
 
+/// Same cross-thread hand-off shape as `pending_scroll_into_view` above,
+/// for the same class of reason: `SDL_ShowOpenFileDialog`/
+/// `SDL_ShowSaveFileDialog` must be called from the main thread (per SDL's
+/// own documented `\threadsafety`), but the host function that queues this
+/// (`natyv_show_open_file_dialog`/`natyv_show_save_file_dialog`) runs on
+/// the worker thread, same as every `natyv_dispatch`-invoked host call.
+/// `main.zig`'s frame loop drains this once per frame and makes the real
+/// SDL call there -- see its own doc comment for how the eventual result
+/// gets back to the guest (a new `.file_selected` EventQueue event, not
+/// this same hand-off in reverse -- SDL's callback can land on any thread,
+/// not necessarily the main thread that made the call). `null` means
+/// nothing pending; a second request before the first drains simply
+/// overwrites -- same "no ordering guarantee needed" reasoning
+/// `queueScrollIntoView` already documents, and realistic use only ever has
+/// one dialog open at a time regardless. Uses the named
+/// `PendingFileDialogRequest` type (declared below, after every field --
+/// same Zig field-then-decl ordering requirement `PendingSetScrollPosition`
+/// already ran into this session).
+pending_file_dialog_request: ?PendingFileDialogRequest = null,
+
+/// `allow_many` is ignored for `.save` -- `SDL_ShowSaveFileDialog` has no
+/// such parameter, only `SDL_ShowOpenFileDialog` does.
+pub const PendingFileDialogRequest = struct {
+    kind: enum { open, save },
+    widget_id: u32,
+    allow_many: bool,
+};
+
 pub const EnabledKinds = struct {
     button: bool = true,
     textfield: bool = true,
@@ -600,6 +632,13 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     // `HostFunctions.setSizeHostFn`'s own doc comment) -- same "always
     // registered" reasoning as the block above.
     funcs_out[n] = c.extism_function_new("natyv_set_size", &in_types[0], 1, &out_types[0], 1, HostFunctions.setSizeHostFn, self, null);
+    n += 1;
+    // File picker: generic, unrelated to any WidgetKind (a native OS
+    // dialog, not a Clay widget) -- same "always registered" reasoning as
+    // the block above.
+    funcs_out[n] = c.extism_function_new("natyv_show_open_file_dialog", &in_types[0], 1, &out_types[0], 1, HostFunctions.showOpenFileDialogHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_show_save_file_dialog", &in_types[0], 1, &out_types[0], 1, HostFunctions.showSaveFileDialogHostFn, self, null);
     n += 1;
     return n;
 }
@@ -991,6 +1030,24 @@ pub fn takePendingScrollIntoView(self: *Self, call_io: Io) ?u32 {
     const id = self.pending_scroll_into_view;
     self.pending_scroll_into_view = null;
     return id;
+}
+
+/// Worker-thread side of the file-dialog request hand-off -- see
+/// `pending_file_dialog_request`'s own doc comment.
+pub fn queueFileDialogRequest(self: *Self, call_io: Io, req: PendingFileDialogRequest) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    self.pending_file_dialog_request = req;
+}
+
+/// Main-thread side -- called once per frame from `main.zig`, returns and
+/// clears whatever's pending (`null` if nothing is).
+pub fn takePendingFileDialogRequest(self: *Self, call_io: Io) ?PendingFileDialogRequest {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const req = self.pending_file_dialog_request;
+    self.pending_file_dialog_request = null;
+    return req;
 }
 
 /// Copies the live widget set into `out` (id + widget snapshot) for the

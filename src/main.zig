@@ -195,6 +195,66 @@ fn notifyTextChanged(queue: *EventQueue, io: std.Io, id: u32, new_text: []const 
     queue.push(io, id, .text_changed, out.items, FloatingOrder.surfaceIdFor(slots, id));
 }
 
+/// W23: what `fileDialogCallback` below needs to push a real `.file_selected`
+/// event once SDL's own callback actually fires -- populated by the drain
+/// loop right before the real `SDL_ShowOpenFileDialog`/`SDL_ShowSaveFileDialog`
+/// call, read back via the callback's own `userdata` pointer. Kept as a
+/// single reused main()-local variable (not heap-allocated per request) --
+/// its address must stay stable for as long as the dialog might be open
+/// (unbounded; the user could leave it open indefinitely), which a
+/// stack-local in the one frame that drains the request wouldn't survive,
+/// but `WidgetHost.pending_file_dialog_request`'s own "single pending slot,
+/// a second request before the first drains just overwrites" simplification
+/// already accepts that only one dialog is ever realistically in flight, so
+/// one reused context is consistent with that, not a separate risk.
+const FileDialogCallbackContext = struct {
+    io: std.Io,
+    queue: *EventQueue,
+    widget_id: u32,
+    surface_id: u32,
+};
+
+/// Max total bytes for the JSON-encoded `{"paths":[...]}` payload this
+/// builds on the stack before handing it to `queue.push` (which then owns
+/// its own heap copy, same as every other per-frame push site here) --
+/// generous enough for several real filesystem paths in a multi-select
+/// dialog. If the real result is bigger than this, the event is silently
+/// dropped, same `catch return` precedent `notifyTextChanged` above already
+/// establishes for an oversized payload.
+const max_file_dialog_payload_len = 4096;
+
+/// The real `SDL_DialogFileCallback` -- `userdata` is the
+/// `FileDialogCallbackContext` the drain loop populated before the SDL
+/// call. Per SDL's own documented `\threadsafety`, this may fire on any
+/// thread, not necessarily main -- doesn't touch SDL/the widget registry
+/// directly, only pushes onto `EventQueue` (the same cross-thread-safe
+/// mutex/condvar primitives the worker thread's own `queue.pop` already
+/// relies on, so this is safe from any thread the same way). `filelist` is
+/// a null-terminated array of null-terminated UTF-8 paths (NULL itself for
+/// a real SDL-level error, a pointer to NULL for "user cancelled") -- both
+/// collapse to the same empty `{"paths":[]}` result, since a guest can't
+/// meaningfully act differently on the two (see EventQueue.EventType's own
+/// doc comment on `.file_selected`).
+fn fileDialogCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, filter: c_int) callconv(.c) void {
+    _ = filter;
+    const ctx: *FileDialogCallbackContext = @ptrCast(@alignCast(userdata.?));
+
+    var buf: [max_file_dialog_payload_len]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(a, "{\"paths\":[") catch return;
+    if (filelist) |list| {
+        var i: usize = 0;
+        while (list[i]) |path_ptr| : (i += 1) {
+            if (i != 0) out.append(a, ',') catch return;
+            json_util.writeString(&out, a, std.mem.span(path_ptr)) catch return;
+        }
+    }
+    out.appendSlice(a, "]}") catch return;
+    ctx.queue.push(ctx.io, ctx.widget_id, .file_selected, out.items, ctx.surface_id);
+}
+
 /// Pure per-kind geometry check, factored out of `tryHitWidget`'s switch
 /// below -- W9 follow-up: needed by the floating-content pre-scan (see the
 /// mouse-down handler below) to find which currently-open floating subtree
@@ -438,6 +498,10 @@ pub fn main(init: std.process.Init) !void {
 
     const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue });
 
+    // W23: see FileDialogCallbackContext's own doc comment -- reused across
+    // every dialog request, address stable for main()'s whole lifetime.
+    var file_dialog_ctx: FileDialogCallbackContext = undefined;
+
     const window = c.SDL_CreateWindow(app_name_z.ptr, 900, 700, 0) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlWindowFailed;
@@ -589,6 +653,27 @@ pub fn main(init: std.process.Init) !void {
         // here.
         if (runtime.widgets.takePendingScrollIntoView(io)) |scroll_target_id| {
             ClayLayout.applyScrollIntoView(widget_snapshot[0..widget_count], &runtime.widgets, scroll_target_id);
+        }
+
+        // File picker: the one safe place to call SDL_ShowOpenFileDialog/
+        // SDL_ShowSaveFileDialog for a guest-requested
+        // natyv_show_open_file_dialog/natyv_show_save_file_dialog -- main
+        // thread, per SDL's own documented \threadsafety. See
+        // WidgetHost.pending_file_dialog_request's own doc comment for why
+        // this can't happen inside the host function itself (worker
+        // thread), and FileDialogCallbackContext's for how the eventual
+        // result gets back to the guest.
+        if (runtime.widgets.takePendingFileDialogRequest(io)) |req| {
+            file_dialog_ctx = .{
+                .io = io,
+                .queue = &queue,
+                .widget_id = req.widget_id,
+                .surface_id = FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], req.widget_id),
+            };
+            switch (req.kind) {
+                .open => c.SDL_ShowOpenFileDialog(fileDialogCallback, &file_dialog_ctx, window, null, 0, null, req.allow_many),
+                .save => c.SDL_ShowSaveFileDialog(fileDialogCallback, &file_dialog_ctx, window, null, 0, null),
+            }
         }
 
         // Tree view: a real `.scroll` push for each scroll container

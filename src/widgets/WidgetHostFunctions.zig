@@ -996,6 +996,43 @@ pub fn setSizeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
 
+const ShowOpenFileDialogRequest = struct { widget_id: u32, allow_many: bool = false };
+const ShowSaveFileDialogRequest = struct { widget_id: u32 };
+
+/// Queues an "open file" dialog request for `main.zig` to actually show
+/// next frame, on the main thread -- see
+/// `WidgetHost.pending_file_dialog_request`'s own doc comment. Always
+/// succeeds from the guest's perspective, same "harmless main-thread
+/// hand-off" reasoning `scrollIntoViewHostFn` already establishes -- the
+/// real result (chosen path(s), or none) arrives later as a `.file_selected`
+/// event, not a return value here.
+pub fn showOpenFileDialogHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ShowOpenFileDialogRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.queueFileDialogRequest(self.io(), .{ .kind = .open, .widget_id = req.widget_id, .allow_many = req.allow_many });
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// Queues a "save file" dialog request -- same shape as
+/// `showOpenFileDialogHostFn` above, no `allow_many` (SDL_ShowSaveFileDialog
+/// has no such parameter).
+pub fn showSaveFileDialogHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ShowSaveFileDialogRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.queueFileDialogRequest(self.io(), .{ .kind = .save, .widget_id = req.widget_id, .allow_many = false });
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
 /// W1: float state for `.progress_bar` -- no-op on any other kind, same
 /// "not an error, just doesn't apply" precedent as `setCheckedHostFn`.
 /// `ProgressBar.setValue` clamps to [0,1] itself, so no clamping needed here.

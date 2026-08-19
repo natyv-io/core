@@ -48,7 +48,15 @@ const Self = @This();
 /// scroll offset actually change from what was last recorded -- see that function's own doc comment.
 /// Coalesced like `.change`/`.text_changed`/`.hover`: a container can move every frame while actively
 /// scrolling, and only the latest offset matters to a guest re-windowing a virtualized list.
-pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll };
+///
+/// W23: `.file_selected` (payload `{"paths":["...",...]}`, empty array for a cancelled dialog or a
+/// real SDL-level error -- see `WidgetHost.pending_file_dialog_request`'s own doc comment for why the
+/// wire contract doesn't distinguish the two) is fired to the trigger widget id that originally called
+/// `natyv_show_open_file_dialog`/`natyv_show_save_file_dialog`, once SDL's own callback actually
+/// fires. Discrete, not coalesced -- a guest awaiting a real dialog result needs the actual result,
+/// not whatever happened to still be queued, same reasoning `.click`/`.dismiss`/`.blur`/`.key_nav`
+/// already established.
+pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll, file_selected };
 
 pub const Entry = struct {
     widget_id: u32,
@@ -325,6 +333,20 @@ test "blur and key_nav events are never coalesced, matching click/dismiss" {
     queue.push(io, 1, .key_nav, "{\"key\":\"down\"}", 0);
     queue.push(io, 1, .key_nav, "{\"key\":\"down\"}", 0);
     try std.testing.expectEqual(@as(usize, 4), queue.items.items.len);
+}
+
+test "file_selected events are never coalesced, matching click/dismiss/blur/key_nav" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .file_selected, "{\"paths\":[]}", 0);
+    queue.push(io, 1, .file_selected, "{\"paths\":[\"/tmp/a.txt\"]}", 0);
+    try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
 }
 
 test "push carries surface_id through to the popped entry" {
