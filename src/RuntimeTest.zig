@@ -452,29 +452,36 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // viewport + top/bottom spacers + a fixed-size row pool (created once
     // and never destroyed/recreated, see tree.go's own doc comment) sized
     // to however many rows fit its fixed 120px viewport at 28px/row (9
-    // more, all created up front regardless of how many are populated with
-    // real content vs. hidden -- see tree.go's own visibleRowCount; not
-    // hand-derived here since the exact pool size depends on int-truncated
-    // division, not worth re-deriving by hand when the real snapshot is
-    // authoritative) -- 61 widgets total (the dropdown's floating panel,
-    // the modal's panel, the combobox's options panel, the menu's panel/
-    // submenu, the W15 tooltip panel/label, the W16 picker's own
-    // panel/grid/steppers, and the W18 popover's own panel/label/checkbox/
-    // close-button are all only created on demand, not by natyv_init -- see
-    // the W4/W5/W6/W7/W9/W15/W16/W18 tests below; the toast stack itself IS
-    // created here, unlike those, but individual toasts inside it aren't --
-    // the W19 Tabs widget and its 3 panels/labels, the Accordion demo's 2
-    // header/content/label triples, and the Tree demo's own full widget
-    // pool ARE all created here too, unlike Popover, since none of them
-    // have any open/close state, see tabsID's/accordionHeaderIDs'/tree's
-    // own doc comments in the fixture guest). Same silent-truncation risk
-    // documented at W1's identical bump from 4 to 8 -- snapshot() caps at
-    // out.len with no error, so every clay-fixture-loading test's buffer
-    // needs auditing whenever natyv_init grows, not just the test being
-    // extended.
+    // more) + the Table demo's own fixed widget pool -- wrapper + header
+    // row + 3 header buttons + body viewport + top/bottom spacers + a
+    // fixed-size row pool (same permanent-pool technique as Tree, see
+    // table.go's own doc comment) sized to however many rows fit its fixed
+    // 118px body at 24px/row, each pool row a Button + 3 child Label cells
+    // (~32 more) -- not hand-derived exactly here since pool sizes depend
+    // on int-truncated division, not worth re-deriving by hand when the
+    // real snapshot is authoritative -- 94 widgets total (the dropdown's
+    // floating panel, the modal's panel, the combobox's options panel, the
+    // menu's panel/submenu, the W15 tooltip panel/label, the W16 picker's
+    // own panel/grid/steppers, and the W18 popover's own panel/label/
+    // checkbox/close-button are all only created on demand, not by
+    // natyv_init -- see the W4/W5/W6/W7/W9/W15/W16/W18 tests below; the
+    // toast stack itself IS created here, unlike those, but individual
+    // toasts inside it aren't -- the W19 Tabs widget and its 3 panels/
+    // labels, the Accordion demo's 2 header/content/label triples, and the
+    // Tree/Table demos' own full widget pools ARE all created here too,
+    // unlike Popover, since none of them have any open/close state, see
+    // tabsID's/accordionHeaderIDs'/tree's/table's own doc comments in the
+    // fixture guest). Same silent-truncation risk documented at W1's
+    // identical bump from 4 to 8 -- snapshot() caps at out.len with no
+    // error, so every clay-fixture-loading test's buffer needs auditing
+    // whenever natyv_init grows, not just the test being extended.
+    // (W22: this baseline's own growth pushed the W16 calendar-grid test's
+    // peak widget count genuinely past the old max_widgets=128 cap -- see
+    // that constant's own doc comment for the real "widget registry full"
+    // failure that caught it and the bump to 192.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 61), n);
+    try std.testing.expectEqual(@as(usize, 94), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -4010,4 +4017,152 @@ test "Tree view: a real click expands a root and reveals children while collapse
     try std.testing.expect(apple_gone);
     try std.testing.expect(vegetables_now_seen);
     try std.testing.expect(grains_now_seen);
+}
+
+test "Table view: real header labels and row-1 cell content exist right after init, a real header click sorts by Name both directions, a real row click selects it, and a real .scroll event slides the pool's window" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+    defer runtime.widgets.destroyAllTextObjects(io);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    // The direct check against a real "the table looked empty" report: a
+    // real cell Label with row 0's unsorted Name ("Widget A", the demo
+    // data's own first entry) must exist right after natyv_init, same as
+    // the 3 header Buttons -- render(0) runs inside CreateTable itself, not
+    // deferred to some later event.
+    var name_header_id: ?u32 = null;
+    var category_header_seen = false;
+    var price_header_seen = false;
+    var widget_a_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Name")) name_header_id = slot.id;
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Category")) category_header_seen = true;
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Price")) price_header_seen = true;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Widget A")) widget_a_seen = true;
+    }
+    const name_hid = name_header_id orelse return error.MissingNameHeader;
+    try std.testing.expect(category_header_seen);
+    try std.testing.expect(price_header_seen);
+    try std.testing.expect(widget_a_seen);
+
+    // Real guest-routed click on the "Name" header -- sorts ascending
+    // (Go's plain byte-wise string `<`, so "Adapter" -- the alphabetical
+    // minimum among the demo's 30 names, hand-verified against the real
+    // dataset in main.go, not assumed -- must land in the pool's very
+    // first slot).
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try buildDispatchEnvelope(&dispatch_buf, name_hid, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var name_header_ascending = false;
+    var adapter_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Name ^")) name_header_ascending = true;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Adapter")) adapter_seen = true;
+    }
+    try std.testing.expect(name_header_ascending);
+    try std.testing.expect(adapter_seen);
+
+    // A second click on the same header toggles to descending -- "Wrench"
+    // (the alphabetical maximum) now lands first, "Tape Measure" (6th from
+    // the end, exactly the pool's own 6-row capacity) is the last row
+    // still inside the window, and "Sensor Kit" (7th from the end) is
+    // *not* -- the real proof this is virtualized, not just re-sorted in
+    // place with everything still materialized.
+    payload = try buildDispatchEnvelope(&dispatch_buf, name_hid, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var name_header_descending = false;
+    var wrench_id: ?u32 = null;
+    var viewport_id: ?u32 = null;
+    var tape_measure_seen = false;
+    var sensor_kit_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Name v")) name_header_descending = true;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Wrench")) {
+            wrench_id = slot.parent_id;
+        }
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Tape Measure")) tape_measure_seen = true;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Sensor Kit")) sensor_kit_seen = true;
+    }
+    try std.testing.expect(name_header_descending);
+    try std.testing.expect(tape_measure_seen);
+    try std.testing.expect(!sensor_kit_seen);
+    const wid = wrench_id orelse return error.MissingWrenchRow;
+
+    // Find the row Button's own viewport parent (needed for the real
+    // `.scroll` dispatch below) by walking up from the row Button itself,
+    // same technique the Tree test above already uses.
+    for (snap[0..n]) |slot| {
+        if (slot.id == wid) viewport_id = slot.parent_id;
+    }
+    const vpid = viewport_id orelse return error.MissingViewportParent;
+
+    // A real click on the row currently showing "Wrench" -- selects it,
+    // marking the first cell and mirroring into the status Label, same
+    // "* " marker + mirrored-label precedent Tree's own selection already
+    // established.
+    payload = try buildDispatchEnvelope(&dispatch_buf, wid, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var wrench_marked = false;
+    var selected_label_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "* Wrench")) wrench_marked = true;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Table selected: Wrench")) selected_label_seen = true;
+    }
+    try std.testing.expect(wrench_marked);
+    try std.testing.expect(selected_label_seen);
+
+    // Real `.scroll` event on the body viewport -- scrolled down 6 rows'
+    // worth (the pool's own full capacity), so the entire previous window
+    // scrolls out. "Wrench"/"Tape Measure" (the old window's first/last
+    // rows) must both be gone, "Sensor Kit" (previously just outside the
+    // window) and "Pliers" (the new window's own last row, 12th from the
+    // end) must both now be present.
+    payload = try buildDispatchEnvelope(&dispatch_buf, vpid, "scroll", "{\"scroll_offset_x\":0,\"scroll_offset_y\":-144}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    // Exact match, not substring -- a scrolled-out-but-still-selected row's
+    // marker never appears anywhere once it isn't populated into any pool
+    // slot, but the mirrored status Label itself still legitimately reads
+    // "Table selected: Wrench" (selection is sticky across scrolling, same as
+    // Tree's own selected node staying selected while off-window) --
+    // substring-matching "Wrench" against every Label would false-positive
+    // on that status Label and was the actual bug here, not Table itself
+    // (confirmed by temporarily dumping every Label's id/parent/text: the
+    // real cell content was already correct -- Sensor Kit through Pliers,
+    // no "Wrench" cell anywhere).
+    var wrench_gone = true;
+    var tape_measure_gone = true;
+    var sensor_kit_now_seen = false;
+    var pliers_now_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .label) continue;
+        const text = slot.widget.label.text();
+        if (std.mem.eql(u8, text, "Wrench") or std.mem.eql(u8, text, "* Wrench")) wrench_gone = false;
+        if (std.mem.eql(u8, text, "Tape Measure")) tape_measure_gone = false;
+        if (std.mem.eql(u8, text, "Sensor Kit")) sensor_kit_now_seen = true;
+        if (std.mem.eql(u8, text, "Pliers")) pliers_now_seen = true;
+    }
+    try std.testing.expect(wrench_gone);
+    try std.testing.expect(tape_measure_gone);
+    try std.testing.expect(sensor_kit_now_seen);
+    try std.testing.expect(pliers_now_seen);
 }

@@ -144,19 +144,28 @@ const HostFunctions = @import("WidgetHostFunctions.zig");
 
 const Self = @This();
 
-/// W16: bumped from 64 -- a real calendar grid (Date & time picker) can
-/// have ~60 widgets live at once at peak (week rows, day-number buttons,
-/// leading blank spacer cells, weekday/month headers, time steppers), and
-/// clay-fixture's own natyv_init already creates ~29 on top of that before
-/// the picker is even opened. Every other fixed-size array in the codebase
-/// keyed to widget count (DrawBatcher.zig, ClayLayout.zig's snapshot
-/// buffer, the expiry-cascade buffers below) derives from this one
+/// W16: bumped from 64 to 128 -- a real calendar grid (Date & time picker)
+/// can have ~60 widgets live at once at peak (week rows, day-number
+/// buttons, leading blank spacer cells, weekday/month headers, time
+/// steppers), and clay-fixture's own natyv_init already created ~29 on top
+/// of that before the picker was even opened.
+///
+/// W22: bumped from 128 to 192 -- Table's own demo (3 columns x a 6-row
+/// permanent pool, each pool row a Button + 3 child Label cells, plus its
+/// header row/buttons/spacers/viewport/wrapper -- ~32 widgets, see
+/// table.go's own doc comment for why the pool is permanent rather than
+/// created on demand) pushed clay-fixture's own natyv_init baseline to 94,
+/// which the W16 calendar-grid peak above (94 + ~60) then genuinely
+/// exceeded the old 128 cap with -- confirmed via a real `widget registry
+/// full` test failure, not assumed. Every other fixed-size array in the
+/// codebase keyed to widget count (DrawBatcher.zig, ClayLayout.zig's
+/// snapshot buffer, the expiry-cascade buffers below) derives from this one
 /// constant, so this is the only line that needs to change. Memory cost is
 /// trivial (a few more KB across small fixed-size arrays of small
 /// structs) -- a deliberate, explained bump per
 /// feedback_natyv_memory_efficiency's own "as new widgets/capabilities
 /// land" anticipation, not organic creep.
-pub const max_widgets = 128;
+pub const max_widgets = 192;
 // button/textfield/label create, set_text, get_text, destroy_widget (6) +
 // checkbox/radio_button/progress_bar create (3) + get_checked/set_checked/
 // get_value/set_value (4) -- W1 widget breadth. + slider create (1) -- W3.
