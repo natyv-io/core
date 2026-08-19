@@ -121,7 +121,7 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         // input via `notifyTabsValue`, not Enter/Space.
         // W27: RangeSlider joins the same non-activatable set as Slider --
         // driven by drag/arrow-keys, not Enter/Space.
-        .textfield, .textarea, .label, .container, .progress_bar, .slider, .range_slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => return,
+        .textfield, .textarea, .label, .container, .progress_bar, .slider, .range_slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs, .spinner => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -294,7 +294,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .numeric_stepper => |ns| ns.containsPoint(mx, my),
         .segmented_control => |sc| sc.containsPoint(mx, my),
         .tabs => |tb| tb.containsPoint(mx, my),
-        .label, .container, .progress_bar, .divider, .badge => false,
+        .label, .container, .progress_bar, .divider, .badge, .spinner => false,
     };
 }
 
@@ -409,7 +409,7 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             notifyTabsValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, slot.id));
             return slot.id;
         } else if (tb.containsPoint(mx, my)) return slot.id,
-        .label, .container, .progress_bar, .divider, .badge => {},
+        .label, .container, .progress_bar, .divider, .badge, .spinner => {},
     }
     return null;
 }
@@ -440,6 +440,11 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         // W19: header strip only -- panel content is real Clay children,
         // drawn through the normal per-child pass instead.
         .tabs => |tb| tb.drawDecorations(renderer),
+        // W29: reads wall-clock time itself, every frame -- see
+        // Spinner.zig's own doc comment for why this needs no per-widget
+        // animation state or new host mechanism, just a real call here
+        // like every other kind gets.
+        .spinner => |sp| sp.drawDecorations(renderer),
     }
 }
 
@@ -1138,6 +1143,7 @@ pub fn main(init: std.process.Init) !void {
                 .progress_bar => {},
                 .divider => {},
                 .badge => {},
+                .spinner => {},
             }
         }
         if (hovering_any != cursor_is_pointer) {

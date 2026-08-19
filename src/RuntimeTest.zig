@@ -93,7 +93,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
             },
             .label => {},
             .container => {},
-            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .range_slider, .textarea, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => {},
+            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .range_slider, .textarea, .divider, .badge, .numeric_stepper, .segmented_control, .tabs, .spinner => {},
         }
     }
 
@@ -504,9 +504,12 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // Label + Divider + content Container (4) + the content area's own
     // description Label + cardButton + cardStatus Label (3) = 7. Panel:
     // panel Container + its own description Label = 2. 7 + 2 = 9.)
+    // (W29: +1 -- the Spinner itself, a real new WidgetKind but a single
+    // widget with no children/status label of its own -- see spinner's own
+    // doc comment in main.go.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 117), n);
+    try std.testing.expectEqual(@as(usize, 118), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1804,6 +1807,54 @@ test "W28: a Card's title/content structure round-trips, and a real click inside
     const pdid = panel_demo_id orelse return error.MissingPanelDemo;
     for (snap[0..n]) |slot| {
         if (slot.id == pdid) try std.testing.expect(slot.widget.container.background);
+    }
+}
+
+test "W29: a spinner exists, is not focusable, gets real Clay-computed geometry, and its own dotScale math is not part of this test (pure, unit-tested directly in Spinner.zig)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+
+    // Exactly one Spinner exists in this fixture -- matching by kind alone
+    // is unambiguous, same precedent the W11 divider test already
+    // established.
+    var spinner_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .spinner) spinner_id = slot.id;
+    }
+    const sid = spinner_id orelse return error.MissingSpinner;
+
+    for (snap[0..n]) |slot| {
+        if (slot.id == sid) {
+            // Never focusable -- confirms Widget.isFocusable's .spinner
+            // arm, not just that the widget exists (Quinn's own explicit
+            // requirement: purely visual, no focus at all).
+            try std.testing.expect(!slot.widget.isFocusable());
+            // Real Clay-computed geometry, not the zeroed rect it was
+            // created with -- same precedent every other Clay-managed
+            // widget's own test already confirms.
+            try std.testing.expectApproxEqAbs(@as(f32, 60), slot.widget.spinner.rect.w, 0.5);
+            try std.testing.expectApproxEqAbs(@as(f32, 16), slot.widget.spinner.rect.h, 0.5);
+        }
     }
 }
 

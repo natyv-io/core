@@ -39,6 +39,7 @@ const RadioButton = @import("RadioButton.zig");
 const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
 const RangeSlider = @import("RangeSlider.zig");
+const Spinner = @import("Spinner.zig");
 const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
@@ -138,6 +139,7 @@ const ClayRadioButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: 
 const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClayRangeSliderRequest = struct { layout: ClayLayoutRequest = .{}, min: f32 = 0, max: f32 = 1, step: f32 = 0 };
+const ClaySpinnerRequest = struct { layout: ClayLayoutRequest = .{} };
 const ClayNumericStepperRequest = struct { layout: ClayLayoutRequest = .{}, value: i32 = 0, min: i32 = 0, max: i32 = 100, step: i32 = 1, wrap: bool = false };
 const ClaySegmentedControlRequest = struct { layout: ClayLayoutRequest = .{}, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 const ClayTabsRequest = struct { layout: ClayLayoutRequest = .{}, labels: []const []const u8 = &.{}, selected_index: usize = 0 };
@@ -678,6 +680,16 @@ pub fn createClayRangeSliderHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]
     insertClayWidget(self, plugin, &outputs[0], .{ .range_slider = range_slider }, parsed.value.layout, null);
 }
 
+pub fn createClaySpinnerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClaySpinnerRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const spinner = Spinner.init(std.mem.zeroes(c.SDL_FRect));
+    insertClayWidget(self, plugin, &outputs[0], .{ .spinner = spinner }, parsed.value.layout, null);
+}
+
 pub fn createClayNumericStepperHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -808,7 +820,7 @@ pub fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         // change them afterward -- same "not an error, just doesn't
         // apply" precedent as Container/ProgressBar/Slider/Divider here.
         // W19: Tabs' labels join the same "set once at creation" set.
-        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs => {},
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => {},
     }
     if (slot.clay_managed) self.layout_generation +%= 1;
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -837,7 +849,7 @@ pub fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
         .badge => |bd| bd.label(),
-        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs => "",
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);

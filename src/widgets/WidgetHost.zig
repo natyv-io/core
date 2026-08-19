@@ -129,6 +129,7 @@ const RadioButton = @import("RadioButton.zig");
 const ProgressBar = @import("ProgressBar.zig");
 const Slider = @import("Slider.zig");
 const RangeSlider = @import("RangeSlider.zig");
+const Spinner = @import("Spinner.zig");
 const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
@@ -195,7 +196,7 @@ pub const max_widgets = 192;
 // as the block above.
 pub const host_function_count = 26;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -213,6 +214,7 @@ pub const Widget = union(WidgetKind) {
     numeric_stepper: NumericStepper,
     segmented_control: SegmentedControl,
     tabs: Tabs,
+    spinner: Spinner,
 
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
@@ -236,6 +238,7 @@ pub const Widget = union(WidgetKind) {
             .numeric_stepper => |*ns| &ns.rect,
             .segmented_control => |*sc| &sc.rect,
             .tabs => |*tb| &tb.rect,
+            .spinner => |*sp| &sp.rect,
         };
     }
 
@@ -282,7 +285,10 @@ pub const Widget = union(WidgetKind) {
             // own header strip; its panel content draws via the normal
             // per-child pass instead (real Clay children, each with their
             // own fillRect).
-            .numeric_stepper, .segmented_control, .tabs => null,
+            // W29: Spinner joins the same "owns its whole draw" set --
+            // multiple independently-scaled dots isn't a single solid-color
+            // rect.
+            .numeric_stepper, .segmented_control, .tabs, .spinner => null,
         };
     }
 
@@ -293,7 +299,7 @@ pub const Widget = union(WidgetKind) {
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
             .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .range_slider, .numeric_stepper, .segmented_control, .tabs => true,
-            .label, .container, .progress_bar, .divider, .badge => false,
+            .label, .container, .progress_bar, .divider, .badge, .spinner => false,
         };
     }
 
@@ -314,7 +320,7 @@ pub const Widget = union(WidgetKind) {
             .numeric_stepper => |*ns| ns.focused = focused,
             .segmented_control => |*sc| sc.focused = focused,
             .tabs => |*tb| tb.focused = focused,
-            .label, .container, .progress_bar, .divider, .badge => {},
+            .label, .container, .progress_bar, .divider, .badge, .spinner => {},
         }
     }
 };
@@ -667,7 +673,8 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
 // for Accordion, plus the general scroll-position getter already flagged
 // for Table/data grid's future virtualization.
 // W27: +1 for natyv_clay_create_range_slider.
-pub const clay_host_function_count = 19;
+// W29: +1 for natyv_clay_create_spinner.
+pub const clay_host_function_count = 20;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -702,6 +709,7 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[16] = c.extism_function_new("natyv_get_scroll_position", &in_types[0], 1, &out_types[0], 1, HostFunctions.getScrollPositionHostFn, self, null);
     funcs_out[17] = c.extism_function_new("natyv_scroll_into_view", &in_types[0], 1, &out_types[0], 1, HostFunctions.scrollIntoViewHostFn, self, null);
     funcs_out[18] = c.extism_function_new("natyv_clay_create_range_slider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayRangeSliderHostFn, self, null);
+    funcs_out[19] = c.extism_function_new("natyv_clay_create_spinner", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySpinnerHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -837,7 +845,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .numeric_stepper => |*ns| ns.syncText(engine, font),
                 .segmented_control => |*sc| sc.syncText(engine, font),
                 .tabs => |*tb| tb.syncText(engine, font),
-                .container, .progress_bar, .slider, .range_slider, .divider => {},
+                .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
             }
         }
     }
@@ -865,7 +873,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .numeric_stepper => |*ns| ns.destroyText(),
                 .segmented_control => |*sc| sc.destroyText(),
                 .tabs => |*tb| tb.destroyText(),
-                .container, .progress_bar, .slider, .range_slider, .divider => {},
+                .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
             }
         }
     }
@@ -944,7 +952,7 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                         .numeric_stepper => |*ns| ns.destroyText(),
                         .segmented_control => |*sc| sc.destroyText(),
                         .tabs => |*tb| tb.destroyText(),
-                        .container, .progress_bar, .slider, .range_slider, .divider => {},
+                        .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
                     }
                     if (s.clay_managed) self.layout_generation +%= 1;
                     slot.* = null;
@@ -1016,7 +1024,7 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .segmented_control => |*sc| for (0..sc.count) |i| self.queuePendingTextDestroy(&sc.text_objs[i]),
         // W19: same "up to max_tabs text objects" shape as SegmentedControl.
         .tabs => |*tb| for (0..tb.count) |i| self.queuePendingTextDestroy(&tb.text_objs[i]),
-        .container, .progress_bar, .slider, .range_slider, .divider => {},
+        .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
     }
 }
 
