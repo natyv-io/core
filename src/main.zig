@@ -571,6 +571,20 @@ pub fn main(init: std.process.Init) !void {
         runtime.widgets.syncTextObjects(io, text_engine, default_font.font);
 
         const widget_count = runtime.widgets.snapshot(io, &widget_snapshot);
+
+        // Scroll-into-view: the one safe place to touch Clay's live scroll
+        // offset for a guest-requested natyv_scroll_into_view -- main
+        // thread, after this frame's layoutIfNeeded/snapshot have already
+        // resolved fresh rects, see WidgetHost.pending_scroll_into_view's
+        // doc comment for why this can't happen inside the host function
+        // itself (worker thread). Only ever non-null when the Clay backend
+        // is enabled (natyv_scroll_into_view is Clay-only, see
+        // registerClayInto), so no extra `maybe_clay_layout` guard needed
+        // here.
+        if (runtime.widgets.takePendingScrollIntoView(io)) |scroll_target_id| {
+            ClayLayout.applyScrollIntoView(widget_snapshot[0..widget_count], &runtime.widgets, scroll_target_id);
+        }
+
         // W4: computed here, before the event loop below, since
         // MOUSE_BUTTON_DOWN's hit-testing needs it this same frame.
         FloatingOrder.computeIsFloating(widget_snapshot[0..widget_count], is_floating[0..widget_count]);

@@ -27,6 +27,7 @@ const RadioButton = @import("widgets/RadioButton.zig");
 const NumericStepper = @import("widgets/NumericStepper.zig");
 const SegmentedControl = @import("widgets/SegmentedControl.zig");
 const Tabs = @import("widgets/Tabs.zig");
+const ScrollBar = @import("ScrollBar.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
@@ -445,23 +446,26 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // date/time picker trigger and its result Label (2 more) + a W17
     // Quantity row/label/NumericStepper and a View row/label/
     // SegmentedControl (6 more) + a W18 popover trigger (1 more) + a W19
-    // Tabs widget, its 3 panels, and each panel's own Label (7 more) -- 45
-    // widgets total (the dropdown's floating panel, the modal's panel, the
-    // combobox's options panel, the menu's panel/submenu, the W15 tooltip
-    // panel/label, the W16 picker's own panel/grid/steppers, and the W18
-    // popover's own panel/label/checkbox/close-button are all only created
-    // on demand, not by natyv_init -- see the W4/W5/W6/W7/W9/W15/W16/W18
-    // tests below; the toast stack itself IS created here, unlike those,
-    // but individual toasts inside it aren't -- the W19 Tabs widget and its
-    // 3 panels/labels ARE all created here too, unlike Popover, since
-    // there's no open/close state for this one, see tabsID's own doc
-    // comment in the fixture guest). Same silent-truncation risk documented
-    // at W1's identical bump from 4 to 8 -- snapshot() caps at out.len with
-    // no error, so every clay-fixture-loading test's buffer needs auditing
-    // whenever natyv_init grows, not just the test being extended.
-    var snap: [48]WidgetHost.Slot = undefined;
+    // Tabs widget, its 3 panels, and each panel's own Label (7 more) + the
+    // Accordion demo's 2 sections, each a header Button + content Container
+    // + content Label (6 more) -- 51 widgets total (the dropdown's floating
+    // panel, the modal's panel, the combobox's options panel, the menu's
+    // panel/submenu, the W15 tooltip panel/label, the W16 picker's own
+    // panel/grid/steppers, and the W18 popover's own panel/label/checkbox/
+    // close-button are all only created on demand, not by natyv_init -- see
+    // the W4/W5/W6/W7/W9/W15/W16/W18 tests below; the toast stack itself IS
+    // created here, unlike those, but individual toasts inside it aren't --
+    // the W19 Tabs widget and its 3 panels/labels, and the Accordion demo's
+    // 2 header/content/label triples, ARE all created here too, unlike
+    // Popover, since neither has any open/close state, see tabsID's/
+    // accordionHeaderIDs' own doc comments in the fixture guest). Same
+    // silent-truncation risk documented at W1's identical bump from 4 to 8
+    // -- snapshot() caps at out.len with no error, so every
+    // clay-fixture-loading test's buffer needs auditing whenever natyv_init
+    // grows, not just the test being extended.
+    var snap: [55]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 45), n);
+    try std.testing.expectEqual(@as(usize, 51), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1632,7 +1636,10 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
     // being propagated here (option_count came back 1, not 2 -- one real
     // option button silently truncated away by what was then a
     // too-small [33] buffer).
-    var snap: [50]WidgetHost.Slot = undefined;
+    // Bumped from 50 -- natyv_init's baseline grew to 51 with the
+    // Accordion demo (see the L3 test's comment above), so this buffer
+    // needs headroom past that plus whatever this test opens on top.
+    var snap: [60]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1735,7 +1742,10 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
     // silent-truncation risk documented at every prior buffer bump in
     // this file (this exact class of bug is what W16's own dropdown test
     // caught when its buffer went stale -- see that test's comment).
-    var snap: [50]WidgetHost.Slot = undefined;
+    // Bumped from 50 -- natyv_init's baseline grew to 51 with the
+    // Accordion demo (see the L3 test's comment above), so this buffer
+    // needs headroom past that plus whatever this test opens on top.
+    var snap: [60]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1839,7 +1849,10 @@ test "W6: a combobox's .text_changed re-filters, .key_nav moves the highlight an
     // + the panel itself = 6 more) -- 37 at peak, comfortably under this
     // buffer's 50. Same silent-truncation risk documented at every prior
     // buffer bump in this file.
-    var snap: [50]WidgetHost.Slot = undefined;
+    // Bumped from 50 -- natyv_init's baseline grew to 51 with the
+    // Accordion demo (see the L3 test's comment above), so this buffer
+    // needs headroom past that plus whatever this test opens on top.
+    var snap: [60]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -1933,7 +1946,10 @@ test "W6: a real .blur event closes the combobox panel without selecting anythin
     // natyv_init's baseline is now 31 (see the L3 test's comment above),
     // plus this test opens the combobox's panel with up to 5 filtered
     // options -- comfortably under this buffer's 50.
-    var snap: [50]WidgetHost.Slot = undefined;
+    // Bumped from 50 -- natyv_init's baseline grew to 51 with the
+    // Accordion demo (see the L3 test's comment above), so this buffer
+    // needs headroom past that plus whatever this test opens on top.
+    var snap: [60]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -1992,7 +2008,10 @@ test "W7: a toast round-trips duration_ms into a real expires_at_ms, and destroy
     // = 2 more) -- 33 at peak, comfortably under this buffer's 50. Same
     // silent-truncation risk documented at every prior buffer bump in
     // this file.
-    var snap: [50]WidgetHost.Slot = undefined;
+    // Bumped from 50 -- natyv_init's baseline grew to 51 with the
+    // Accordion demo (see the L3 test's comment above), so this buffer
+    // needs headroom past that plus whatever this test opens on top.
+    var snap: [60]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var stack_id: ?u32 = null;
@@ -3228,4 +3247,441 @@ test "W19 follow-up: WidgetHost.isEffectivelyVisible checks the full ancestor ch
     var slots2 = slots;
     slots2[0].clay_style.visible = true;
     try std.testing.expect(WidgetHost.isEffectivelyVisible(&slots2, slots2[2]));
+}
+
+test "Accordion: WidgetHost.setVisible flips a plain widget's visible flag, bumps layout_generation only on a real change, and fails for a missing id" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    // Unlike Tabs (host-owned, needs its own WidgetKind), Accordion is
+    // guest-composed -- setVisible works on any Clay-managed widget at all,
+    // so a plain Container (no Accordion-specific type in the registry) is
+    // enough to exercise it.
+    const content_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(50) },
+    }) orelse return error.RegistryFull;
+
+    const gen_after_insert = runtime.widgets.layout_generation;
+
+    try std.testing.expect(runtime.widgets.setVisible(io, content_id, false));
+    var snap: [4]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == content_id) try std.testing.expect(!slot.clay_style.visible);
+    }
+    try std.testing.expectEqual(gen_after_insert +% 1, runtime.widgets.layout_generation);
+
+    // A repeated identical call (already false) is a no-op -- same
+    // "return without bumping generation" contract setActiveTab's own
+    // no-op-call test proves.
+    const gen_before_repeat = runtime.widgets.layout_generation;
+    try std.testing.expect(runtime.widgets.setVisible(io, content_id, false));
+    try std.testing.expectEqual(gen_before_repeat, runtime.widgets.layout_generation);
+
+    // Flipping back to true bumps again -- proves the guard is
+    // "did the value change," not "only false->? counts."
+    try std.testing.expect(runtime.widgets.setVisible(io, content_id, true));
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == content_id) try std.testing.expect(slot.clay_style.visible);
+    }
+    try std.testing.expectEqual(gen_before_repeat +% 1, runtime.widgets.layout_generation);
+
+    // A missing id fails cleanly (the host function surfaces this as a
+    // "no such widget" error to the guest, see setVisibleHostFn) rather
+    // than silently no-oping.
+    try std.testing.expect(!runtime.widgets.setVisible(io, content_id + 999, false));
+}
+
+test "Accordion: a Container hidden via setVisible is dropped from Clay's layout entirely -- a fit-sized parent stops accounting for it" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // A fit-height column holding a header (fixed 32) and a content panel
+    // (fixed 50) -- same "fit height tracks exactly what's currently
+    // declared to Clay" proof W19's own Tabs regression test uses, just
+    // with a plain Container parent instead of a dedicated WidgetKind,
+    // since Accordion has no host-owned widget of its own to check.
+    const section_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(200), .height = .{ .type = c.CLAY__SIZING_TYPE_FIT, .size = .{ .minMax = .{ .min = 0, .max = 1e9 } } } },
+        .direction = c.CLAY_TOP_TO_BOTTOM,
+    }) orelse return error.RegistryFull;
+    _ = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, section_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(32) },
+    }) orelse return error.RegistryFull;
+    const content_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, section_id, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(50) },
+    }) orelse return error.RegistryFull;
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    var section_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == section_id) section_rect = slot.widget.container.rect;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 32 + 50), section_rect.h, 0.5);
+
+    // Collapse the content panel -- setVisible must bump layout_generation
+    // for this next layoutIfNeeded to actually re-run Clay instead of
+    // reusing the cached pre-collapse pass.
+    try std.testing.expect(runtime.widgets.setVisible(io, content_id, false));
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == section_id) section_rect = slot.widget.container.rect;
+    }
+    // Only the header's 32 remains -- the content panel isn't declared to
+    // Clay at all this frame, so it can't inflate the fit height, the same
+    // proof the W19 Tabs test uses for its own switched-away panel.
+    try std.testing.expectApproxEqAbs(@as(f32, 32), section_rect.h, 0.5);
+}
+
+test "Accordion: natyv_set_visible round-trips through a real compiled guest, and clicking either section header toggles its own content independently" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [56]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var header0_id: ?u32 = null;
+    var header1_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .button) continue;
+        const label = slot.widget.button.label();
+        if (std.mem.eql(u8, label, "v Description")) header0_id = slot.id;
+        if (std.mem.eql(u8, label, "> Specs")) header1_id = slot.id;
+    }
+    const h0 = header0_id orelse return error.MissingHeader0;
+    const h1 = header1_id orelse return error.MissingHeader1;
+
+    // Initial state, proven through the real compiled guest, not just
+    // WidgetHost.setVisible directly: section 0 starts expanded (its
+    // header already reads "v ", set at natyv_init time), section 1 starts
+    // collapsed -- set via one real natyv_set_visible call in natyv_init,
+    // not by never creating its content.
+    // The header and its content Container are siblings under the same
+    // parent, not parent/child of each other (see accordionHeaderIDs' own
+    // doc comment) -- found via each content's own Label text instead, same
+    // "identify a panel via its known-text child, then take that child's
+    // parent_id" shape the W19 Tabs Pattern B test above already uses for
+    // its own panels.
+    var content0_id: ?u32 = null;
+    var content1_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .label) continue;
+        const text = slot.widget.label.text();
+        if (std.mem.startsWith(u8, text, "Starts expanded")) content0_id = slot.parent_id;
+        if (std.mem.startsWith(u8, text, "Starts collapsed")) content1_id = slot.parent_id;
+    }
+    const c0 = content0_id orelse return error.MissingContent0;
+    const c1 = content1_id orelse return error.MissingContent1;
+    for (snap[0..n]) |slot| {
+        if (slot.id == c0) try std.testing.expect(slot.clay_style.visible);
+        if (slot.id == c1) try std.testing.expect(!slot.clay_style.visible);
+    }
+
+    // A real click on section 1's header -- routed through the actual
+    // EventQueue/Dispatch.run pipeline, same "click" EventType every real
+    // mouse click produces, not a hand-built event type.
+    var dispatch_buf: [256]u8 = undefined;
+    const payload = try buildDispatchEnvelope(&dispatch_buf, h1, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        // Section 1 expanded...
+        if (slot.id == c1) try std.testing.expect(slot.clay_style.visible);
+        // ...and section 0 is untouched -- each section's toggle is fully
+        // independent, unlike Tabs' mutual exclusivity.
+        if (slot.id == c0) try std.testing.expect(slot.clay_style.visible);
+        if (slot.id == h1) try std.testing.expectEqualStrings("v Specs", slot.widget.button.label());
+    }
+
+    // A real click on section 0's header now -- collapses it while section
+    // 1 (already toggled open above) stays untouched, proving independence
+    // holds in both directions, not just "opening one doesn't affect the
+    // other."
+    const payload2 = try buildDispatchEnvelope(&dispatch_buf, h0, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload2) orelse return error.CallFailed;
+
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == c0) try std.testing.expect(!slot.clay_style.visible);
+        if (slot.id == c1) try std.testing.expect(slot.clay_style.visible);
+        if (slot.id == h0) try std.testing.expectEqualStrings("> Description", slot.widget.button.label());
+    }
+}
+
+test "Scroll-into-view: WidgetHost.queueScrollIntoView/takePendingScrollIntoView hand off one pending target at a time" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    // Nothing queued yet.
+    try std.testing.expectEqual(@as(?u32, null), runtime.widgets.takePendingScrollIntoView(io));
+
+    runtime.widgets.queueScrollIntoView(io, 42);
+    try std.testing.expectEqual(@as(?u32, 42), runtime.widgets.takePendingScrollIntoView(io));
+    // Drained -- a second take returns null, doesn't repeat the same value.
+    try std.testing.expectEqual(@as(?u32, null), runtime.widgets.takePendingScrollIntoView(io));
+
+    // A second queue before the first is drained just overwrites -- no
+    // ordering guarantee needed for this (see the field's own doc comment).
+    runtime.widgets.queueScrollIntoView(io, 1);
+    runtime.widgets.queueScrollIntoView(io, 2);
+    try std.testing.expectEqual(@as(?u32, 2), runtime.widgets.takePendingScrollIntoView(io));
+}
+
+test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen child into view, is a no-op on an already-visible one, and its correction is picked up by the next real layout pass" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // A fixed 200x100 scroll_vertical container holding 3 fixed-60-tall
+    // children (180px of content, 80px of overflow) -- same "known,
+    // predictable geometry" shape the W2 scroll tests already establish,
+    // just built directly rather than through a compiled guest.
+    const scroll_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(100) },
+        .direction = c.CLAY_TOP_TO_BOTTOM,
+        .scroll_vertical = true,
+    }) orelse return error.RegistryFull;
+    var child_ids: [3]u32 = undefined;
+    for (0..3) |i| {
+        child_ids[i] = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, scroll_id, .{
+            .sizing = .{ .width = fixedAxis(200), .height = fixedAxis(60) },
+        }) orelse return error.RegistryFull;
+    }
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    // Child 3 (y:[120,180]) starts entirely below the 100px-tall viewport --
+    // sanity check the geometry prediction before trusting the assertions
+    // below on it.
+    var snap: [8]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == child_ids[2]) try std.testing.expectApproxEqAbs(@as(f32, 120), slot.widget.container.rect.y, 0.5);
+    }
+
+    ClayLayout.applyScrollIntoView(snap[0..n], &runtime.widgets, child_ids[2]);
+    // Clamped to exactly -80 (content_h 180 - container_h 100), not merely
+    // "moved some amount" -- same clamp-exactness discipline the W2 scroll
+    // test above already holds itself to.
+    var sd = ClayLayout.scrollContainerData(scroll_id) orelse return error.MissingScrollData;
+    try std.testing.expectApproxEqAbs(@as(f32, -80), sd.scroll_offset_y, 0.5);
+
+    // The correction is live in Clay's own storage immediately, but `.rect`
+    // is only a snapshot as of the last real recompute -- a second real
+    // pass (forced by the layout_generation bump applyScrollIntoView just
+    // made) must pick it up.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == child_ids[2]) try std.testing.expectApproxEqAbs(@as(f32, 40), slot.widget.container.rect.y, 0.5);
+    }
+
+    // Child 3 (now at y:[40,100], exactly filling the rest of the scrolled
+    // viewport) is already fully visible -- calling applyScrollIntoView on
+    // it *again* must be a genuine no-op, not "helpfully" re-center it or
+    // reset the scroll position. (Child 1, by contrast, just scrolled
+    // *out* of view above the fold as a direct consequence of the scroll
+    // above -- a 100px viewport can't show all 180px of content at once --
+    // so it's not a valid "already visible" case to test here.)
+    ClayLayout.applyScrollIntoView(snap[0..n], &runtime.widgets, child_ids[2]);
+    sd = ClayLayout.scrollContainerData(scroll_id) orelse return error.MissingScrollData;
+    try std.testing.expectApproxEqAbs(@as(f32, -80), sd.scroll_offset_y, 0.5);
+}
+
+test "Scroll-into-view: natyv_get_scroll_position's Slot.scroll_data mirror matches ClayLayout.scrollContainerData's own live read, through a real compiled guest" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Same fixture geometry/mouse-position prediction the W2 scroll tests
+    // above already establish and trust: the nested scroll container sits
+    // at x:[300,500], y:[0,100] in a 600x200 window with the mouse at
+    // (400,50). Frame 1 registers the pointer over it; frame 2's -1000
+    // vertical delta clamps to the container's real -100px of overflow.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000);
+
+    var snap: [56]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    var scroll_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .container or slot.parent_id != null) continue;
+        for (snap[0..n]) |maybe_child| {
+            if (maybe_child.parent_id) |pid| {
+                if (pid == slot.id and maybe_child.widget == .label and std.mem.eql(u8, maybe_child.widget.label.text(), "Scroll Row 1")) {
+                    scroll_id = slot.id;
+                }
+            }
+        }
+    }
+    const scid = scroll_id orelse return error.MissingScrollContainer;
+
+    const live = ClayLayout.scrollContainerData(scid) orelse return error.MissingScrollData;
+    var mirrored: ?ScrollBar.Data = null;
+    for (snap[0..n]) |slot| {
+        if (slot.id == scid) mirrored = slot.scroll_data;
+    }
+    const m = mirrored orelse return error.MissingMirroredScrollData;
+
+    // The mirror `natyv_get_scroll_position` actually reads must match
+    // Clay's own live truth exactly -- not just "close," since both were
+    // captured from the very same real recompute above.
+    try std.testing.expectApproxEqAbs(live.scroll_offset_y, m.scroll_offset_y, 0.01);
+    try std.testing.expectApproxEqAbs(live.container_h, m.container_h, 0.01);
+    try std.testing.expectApproxEqAbs(live.content_h, m.content_h, 0.01);
+    // And confirms the real clamp this mirror must also reflect: -100, not
+    // an unclamped -1000.
+    try std.testing.expectApproxEqAbs(@as(f32, -100), m.scroll_offset_y, 0.5);
+}
+
+test "Scroll-into-view: clicking an off-screen Accordion header through a real compiled guest scrolls its section into view" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    var snap: [56]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var header1_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "> Specs")) header1_id = slot.id;
+    }
+    const h1 = header1_id orelse return error.MissingHeader1;
+
+    // Find "Specs"' own nearest scroll_vertical ancestor by walking its
+    // parent_id chain -- the same walk applyScrollIntoView itself does
+    // (rather than a separate "any top-level scroll container" scan, which
+    // would wrongly match every other real scroll container this fixture's
+    // many other demos also declare, e.g. the W2/W16 nested ones).
+    var header1_slot: ?WidgetHost.Slot = null;
+    for (snap[0..n]) |slot| {
+        if (slot.id == h1) header1_slot = slot;
+    }
+    var root_id: ?u32 = null;
+    var current: ?u32 = (header1_slot orelse return error.MissingHeader1).parent_id;
+    while (current) |pid| {
+        var parent: ?WidgetHost.Slot = null;
+        for (snap[0..n]) |slot| {
+            if (slot.id == pid) parent = slot;
+        }
+        const p = parent orelse break;
+        if (p.clay_style.scroll_vertical) {
+            root_id = p.id;
+            break;
+        }
+        current = p.parent_id;
+    }
+    const rid = root_id orelse return error.MissingRootScrollContainer;
+
+    var root_rect: c.SDL_FRect = undefined;
+    var header_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == rid) root_rect = slot.widget.container.rect;
+        if (slot.id == h1) header_rect = slot.widget.button.rect;
+    }
+    // Regression-proof setup check: this fixture has 16+ milestones' worth
+    // of demo content stacked above the Accordion section inside a fixed
+    // 640px-tall scroll viewport -- the "Specs" header must genuinely start
+    // below the fold at the default scroll position, not merely assumed to.
+    try std.testing.expect(header_rect.y > root_rect.y + root_rect.h);
+
+    const scroll_before = ClayLayout.scrollContainerData(rid) orelse return error.MissingScrollData;
+
+    var dispatch_buf: [256]u8 = undefined;
+    const payload = try buildDispatchEnvelope(&dispatch_buf, h1, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+
+    // Same ordering `main.zig`'s real per-frame loop uses: a real layout
+    // pass first (picks up SetVisible's layout_generation bump, resolving
+    // "Specs"' content to its real, now-visible rect), then drain and apply
+    // whatever scroll-into-view request the click's dispatch handler queued.
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+    if (runtime.widgets.takePendingScrollIntoView(io)) |wid| {
+        ClayLayout.applyScrollIntoView(snap[0..n], &runtime.widgets, wid);
+    } else {
+        return error.NoScrollIntoViewQueued;
+    }
+
+    const scroll_after = ClayLayout.scrollContainerData(rid) orelse return error.MissingScrollData;
+    // The real regression proof: the click didn't just reveal the content
+    // (already covered by the plain Accordion Pattern B test above), it
+    // also actually moved the viewport -- not left it clipped off-screen,
+    // which is the bug Quinn's own click-through caught.
+    try std.testing.expect(scroll_after.scroll_offset_y != scroll_before.scroll_offset_y);
 }

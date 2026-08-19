@@ -133,6 +133,7 @@ const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
 const SegmentedControl = @import("SegmentedControl.zig");
 const Tabs = @import("Tabs.zig");
+const ScrollBar = @import("../ScrollBar.zig");
 // The Extism host-function wire layer (natyv_create_*/natyv_clay_create_*
 // callbacks and the generic set/get/destroy ones) lives in its own file --
 // see WidgetHostFunctions.zig's doc comment for why, and for the mutual
@@ -172,7 +173,9 @@ pub const max_widgets = 128;
 // Container, it's inherently a Clay parent/child + visibility construct,
 // so it's Clay-only (see registerClayInto/clay_host_function_count below),
 // not gated by an EnabledKinds/WidgetsConfig flag.
-pub const host_function_count = 20;
+// + natyv_set_visible (1) -- Accordion, generic per-slot toggle, guest-
+// composed rather than a new WidgetKind, so no Clay-side registration.
+pub const host_function_count = 21;
 
 pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge, numeric_stepper, segmented_control, tabs };
 pub const Widget = union(WidgetKind) {
@@ -387,6 +390,15 @@ pub const Slot = struct {
     /// not a layout property -- lives here, not on `ClayStyle`, same
     /// reasoning `clay_managed` already gets.
     expires_at_ms: ?i64 = null,
+    /// Live scroll offset/dimensions, refreshed every real Clay layout pass
+    /// (`ClayLayout.layoutIfNeeded`'s writeback loop, right alongside
+    /// `.rect`) for any slot with `clay_style.scroll_vertical` or
+    /// `.scroll_horizontal` -- `null` for every other slot. This is the
+    /// cross-thread-safe copy `natyv_get_scroll_position` reads (see
+    /// `pending_scroll_into_view`'s doc comment for why the host function
+    /// can't just call Clay directly) -- always at most one real Clay pass
+    /// stale, same staleness `.rect` itself already has between passes.
+    scroll_data: ?ScrollBar.Data = null,
 };
 
 /// W19 follow-up: whether `slot` should actually be drawn/hit-tested this
@@ -455,6 +467,19 @@ current_io: ?Io = null,
 /// entered-text and placeholder objects).
 pending_text_destroys: [max_widgets * 2]?*c.TTF_Text = [_]?*c.TTF_Text{null} ** (max_widgets * 2),
 pending_text_destroy_count: usize = 0,
+/// Scroll-into-view: same cross-thread hand-off shape as
+/// `pending_text_destroys` above, for the same reason -- Clay's live scroll
+/// offset lives behind a single global, non-thread-safe C context
+/// (`Clay__currentContext`), and `natyv_scroll_into_view` (called from
+/// `natyv_dispatch` on the worker thread) can't touch it directly without
+/// racing the main thread's own `Clay_UpdateScrollContainers`/layout pass.
+/// `queueScrollIntoView` (worker thread) just stashes the target widget id
+/// here; `ClayLayout.applyScrollIntoView` (called once per frame from
+/// `main.zig`, main thread, via `takePendingScrollIntoView`) does the real
+/// Clay work. `null` means nothing pending. A second request before the
+/// first is drained simply overwrites -- no ordering guarantee needed for
+/// this (see `queueScrollIntoView`'s own doc comment).
+pending_scroll_into_view: ?u32 = null,
 
 pub const EnabledKinds = struct {
     button: bool = true,
@@ -555,11 +580,19 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_value", &in_types[0], 1, &out_types[0], 1, HostFunctions.getValueHostFn, self, null);
     n += 1;
+    // Accordion: generic per-slot visibility toggle, guest-composed (see
+    // Accordion's own doc comment on `HostFunctions.setVisibleHostFn`) --
+    // same "always registered" reasoning as the block above.
+    funcs_out[n] = c.extism_function_new("natyv_set_visible", &in_types[0], 1, &out_types[0], 1, HostFunctions.setVisibleHostFn, self, null);
+    n += 1;
     return n;
 }
 
 // W19: +2 for natyv_clay_create_tabs/natyv_clay_create_tab_panel.
-pub const clay_host_function_count = 16;
+// + natyv_get_scroll_position/natyv_scroll_into_view (2) -- scroll-into-view
+// for Accordion, plus the general scroll-position getter already flagged
+// for Table/data grid's future virtualization.
+pub const clay_host_function_count = 18;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -587,6 +620,12 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[13] = c.extism_function_new("natyv_clay_create_segmented_control", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySegmentedControlHostFn, self, null);
     funcs_out[14] = c.extism_function_new("natyv_clay_create_tabs", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayTabsHostFn, self, null);
     funcs_out[15] = c.extism_function_new("natyv_clay_create_tab_panel", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayTabPanelHostFn, self, null);
+    // Scroll-into-view: Clay-only (scroll containers don't exist outside
+    // the Clay backend), so registered here rather than registerInto -- see
+    // pending_scroll_into_view's own doc comment for the cross-thread
+    // design this pair exists for.
+    funcs_out[16] = c.extism_function_new("natyv_get_scroll_position", &in_types[0], 1, &out_types[0], 1, HostFunctions.getScrollPositionHostFn, self, null);
+    funcs_out[17] = c.extism_function_new("natyv_scroll_into_view", &in_types[0], 1, &out_types[0], 1, HostFunctions.scrollIntoViewHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -676,6 +715,16 @@ pub fn setRect(self: *Self, call_io: Io, id: u32, rect: c.SDL_FRect) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     if (self.findLocked(id)) |slot| slot.widget.rectPtr().* = rect;
+}
+
+/// Same shape/caller as `setRect` above (called from `ClayLayout`'s own
+/// writeback loop, right alongside it) -- writes a fresh cross-thread-safe
+/// copy of a scroll container's live Clay data into its `Slot`. See
+/// `Slot.scroll_data`'s own doc comment.
+pub fn setScrollData(self: *Self, call_io: Io, id: u32, data: ScrollBar.Data) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| slot.scroll_data = data;
 }
 
 /// `pub` -- see `io`'s doc comment above.
@@ -907,6 +956,25 @@ pub fn flushPendingTextDestroys(self: *Self, call_io: Io) void {
         if (maybe_obj) |obj| c.TTF_DestroyText(obj);
     }
     self.pending_text_destroy_count = 0;
+}
+
+/// Worker-thread side of the scroll-into-view hand-off -- see
+/// `pending_scroll_into_view`'s own doc comment for why this can't just call
+/// into Clay directly.
+pub fn queueScrollIntoView(self: *Self, call_io: Io, widget_id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    self.pending_scroll_into_view = widget_id;
+}
+
+/// Main-thread side -- called once per frame from `main.zig`, returns and
+/// clears whatever's pending (`null` if nothing is).
+pub fn takePendingScrollIntoView(self: *Self, call_io: Io) ?u32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const id = self.pending_scroll_into_view;
+    self.pending_scroll_into_view = null;
+    return id;
 }
 
 /// Copies the live widget set into `out` (id + widget snapshot) for the
@@ -1201,4 +1269,30 @@ pub fn setActiveTab(self: *Self, call_io: Io, id: u32, index: usize) ?usize {
     }
     self.layout_generation +%= 1;
     return new;
+}
+
+/// Generic per-slot visibility toggle, guest-composed for Accordion (a
+/// plain `Button` header + `Container` content wired together in guest code
+/// -- see `sdk/go/widgets/accordion.go`) rather than a new host-owned
+/// `WidgetKind` -- unlike `setActiveTab`, this never switches on
+/// `slot.widget`, since `clay_style.visible` exists on every `Slot`
+/// regardless of kind. Returns `false` only when `id` doesn't name any
+/// widget (the host function surfaces that as a "no such widget" error to
+/// the guest); a no-op call (already at the requested value) still returns
+/// `true`. Bumps `layout_generation` -- same reason `setActiveTab` does and
+/// `setSegmentedIndex`/`setStepperValue` don't, see `ClayStyle.visible`'s
+/// doc comment -- but only when the value actually changes, so a repeated
+/// identical call doesn't force a pointless recompute.
+pub fn setVisible(self: *Self, call_io: Io, id: u32, visible: bool) bool {
+    self.mutex.lockUncancelable(call_io);
+    const slot = self.findLocked(id) orelse {
+        self.mutex.unlock(call_io);
+        return false;
+    };
+    const changed = slot.clay_style.visible != visible;
+    slot.clay_style.visible = visible;
+    self.mutex.unlock(call_io);
+
+    if (changed) self.layout_generation +%= 1;
+    return true;
 }

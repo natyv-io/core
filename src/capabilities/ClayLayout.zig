@@ -630,7 +630,85 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
             }
             widgets.setRect(io, slot.id, .{ .x = box.x, .y = box.y, .w = box.width, .h = box.height });
         }
+        // Scroll-into-view: refresh the cross-thread-safe `scroll_data`
+        // copy for any real scroll container, same "main thread writes,
+        // host functions only ever read the mirrored copy" reasoning
+        // `.rect` above already established -- see `Slot.scroll_data`'s own
+        // doc comment.
+        if (slot.clay_managed and (slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal)) {
+            if (scrollContainerData(slot.id)) |sd| widgets.setScrollData(io, slot.id, sd);
+        }
     }
 
     self.last_computed_generation = current_generation;
+}
+
+/// Main-thread-only: walks `widget_id`'s `parent_id` chain (same
+/// ancestor-walk shape `isEffectivelyVisible`/`nearestScrollBoundary`
+/// already use) to find the nearest ancestor with `scroll_vertical`, and if
+/// `widget_id`'s own rect currently falls outside that ancestor's rect,
+/// writes a clamped new Y offset directly through Clay's live
+/// `scrollPosition` pointer -- see `WidgetHost.pending_scroll_into_view`'s
+/// doc comment for why this is the one safe place to do that write. A
+/// no-op (not an error) if `widget_id` doesn't resolve, has no scrollable
+/// ancestor, or is already fully visible. v1 scope: vertical-only -- see
+/// this function's own plan doc for why.
+///
+/// Bumps `widgets.layout_generation` directly (no lock -- same "racy
+/// increment is fine, a lost/extra bump just means one harmless recompute
+/// either way" precedent every other `layout_generation +%= 1` site in this
+/// codebase already relies on, see `setVisible`'s own doc comment) when it
+/// actually writes a correction: `.rect`s on `Slot` are a snapshot of
+/// Clay's geometry *as of the last real recompute*, not re-derived live
+/// from the scroll pointer on every draw, so without this the write above
+/// would be invisible until something else happened to trigger a real
+/// recompute. Takes effect on the *next* frame's `layoutIfNeeded`, same one
+/// -frame latency every other generation-bump-driven change in this
+/// codebase already has (nothing here is drawn synchronously mid-frame).
+pub fn applyScrollIntoView(slots: []const WidgetHost.Slot, widgets: *WidgetHost, widget_id: u32) void {
+    var target: ?WidgetHost.Slot = null;
+    for (slots) |s| {
+        if (s.id == widget_id) {
+            target = s;
+            break;
+        }
+    }
+    var t = target orelse return;
+
+    var ancestor: ?WidgetHost.Slot = null;
+    var current: ?u32 = t.parent_id;
+    while (current) |pid| {
+        var parent: ?WidgetHost.Slot = null;
+        for (slots) |s| {
+            if (s.id == pid) {
+                parent = s;
+                break;
+            }
+        }
+        const p = parent orelse break;
+        if (p.clay_style.scroll_vertical) {
+            ancestor = p;
+            break;
+        }
+        current = p.parent_id;
+    }
+    var a = ancestor orelse return;
+
+    const t_rect = t.widget.rectPtr().*;
+    const a_rect = a.widget.rectPtr().*;
+    var delta_y: f32 = 0;
+    if (t_rect.y < a_rect.y) {
+        delta_y = a_rect.y - t_rect.y;
+    } else if (t_rect.y + t_rect.h > a_rect.y + a_rect.h) {
+        delta_y = (a_rect.y + a_rect.h) - (t_rect.y + t_rect.h);
+    } else {
+        return; // already fully visible
+    }
+
+    const data = c.Clay_GetScrollContainerData(elementId(a.id));
+    if (!data.found) return;
+    const pos = data.scrollPosition orelse return;
+    const max_scroll_y = @max(0, data.contentDimensions.height - data.scrollContainerDimensions.height);
+    pos.*.y = std.math.clamp(pos.*.y + delta_y, -max_scroll_y, 0);
+    widgets.layout_generation +%= 1;
 }

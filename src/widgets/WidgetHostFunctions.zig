@@ -72,6 +72,7 @@ const CreateNumericStepperRequest = struct { x: f32, y: f32, w: f32, h: f32, val
 const CreateSegmentedControlRequest = struct { x: f32, y: f32, w: f32, h: f32, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 const SetCheckedRequest = struct { widget_id: u32, checked: bool };
 const SetValueRequest = struct { widget_id: u32, value: f32 };
+const SetVisibleRequest = struct { widget_id: u32, visible: bool };
 
 // L3: wire-format mirrors of Clay's real C types (Clay_SizingAxis,
 // Clay_Padding, Clay_LayoutDirection, Clay_ChildAlignment -- see clay.h)
@@ -901,6 +902,76 @@ pub fn getCheckedHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Ext
     var buf: [32]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"checked\":{}}}", .{checked}) catch "{}";
     host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+/// Reads a scroll container's cross-thread-safe `Slot.scroll_data` copy --
+/// see that field's own doc comment for why this doesn't (and can't safely)
+/// call into Clay directly. Errors if `widget_id` doesn't name a widget, or
+/// names one that isn't a scroll container (`scroll_data == null`).
+pub fn getScrollPositionHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.mutex.lockUncancelable(self.io());
+    const slot = self.findLocked(req.widget_id) orelse {
+        self.mutex.unlock(self.io());
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    };
+    const data = slot.scroll_data;
+    self.mutex.unlock(self.io());
+
+    const d = data orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget {d} is not a scroll container", .{req.widget_id});
+        return;
+    };
+    var buf: [192]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"scroll_offset_x\":{d},\"scroll_offset_y\":{d},\"container_w\":{d},\"container_h\":{d},\"content_w\":{d},\"content_h\":{d}}}", .{ d.scroll_offset_x, d.scroll_offset_y, d.container_w, d.container_h, d.content_w, d.content_h }) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+/// Queues `widget_id` for `ClayLayout.applyScrollIntoView` to actually
+/// handle next frame, on the main thread -- see
+/// `WidgetHost.pending_scroll_into_view`'s own doc comment. Always succeeds
+/// from the guest's perspective: a missing id or one with no scrollable
+/// ancestor is a harmless main-thread no-op, not something worth surfacing
+/// as an error here.
+pub fn scrollIntoViewHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    self.queueScrollIntoView(self.io(), req.widget_id);
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// Generic per-slot visibility toggle -- thin wire adapter over
+/// `WidgetHost.setVisible`, same "host function just parses JSON and calls
+/// a plain `WidgetHost` method" split `setActiveTab`/`main.zig`'s
+/// `notifyTabsValue` already establish (kept that way here too so
+/// `RuntimeTest.zig` can call `setVisible` directly, without going through
+/// the Extism C callback boundary, the same way its own `setActiveTab`
+/// tests already do).
+pub fn setVisibleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetVisibleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    if (!self.setVisible(self.io(), req.widget_id, req.visible)) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
 
 /// W1: float state for `.progress_bar` -- no-op on any other kind, same
