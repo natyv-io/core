@@ -1721,9 +1721,13 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
         try std.testing.expect(slot.parent_id == null or slot.parent_id.? != tid);
     }
 
-    // Real guest-routed open (natyv_clay_create_container with
-    // floating:true, via natyv_dispatch -- openDropdown).
-    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"ToggleDropdown\"}") orelse return error.CallFailed;
+    // Real guest-routed open -- a real click on the trigger (natyv_dispatch
+    // -- Menu.onTriggerClick, the productized Dropdown's own underlying
+    // Menu), not a test hook -- proves the click actually routes through
+    // it, not just that Open() itself works.
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
     var panel_id: ?u32 = null;
@@ -1756,11 +1760,17 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
         }
     }
 
-    // Real guest-routed select-and-close (natyv_set_text on the trigger +
-    // natyv_destroy_widget on the panel/options, via natyv_dispatch --
-    // closeDropdown), same "destroy old widgets" pattern examples/bookstore
-    // and the F3-regression fixture case already established.
-    _ = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"SelectOption2\"}") orelse return error.CallFailed;
+    // Real guest-routed select-and-close -- a real click on "Option 2"
+    // itself (natyv_set_text on the trigger + natyv_destroy_widget on the
+    // panel/options, via natyv_dispatch -- Menu.selectItem), same "destroy
+    // old widgets" pattern examples/bookstore and the F3-regression fixture
+    // case already established.
+    var option2_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Option 2")) option2_id = slot.id;
+    }
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{option2_id orelse return error.MissingOption2});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
 
     for (snap[0..n]) |slot| {
