@@ -448,24 +448,33 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // SegmentedControl (6 more) + a W18 popover trigger (1 more) + a W19
     // Tabs widget, its 3 panels, and each panel's own Label (7 more) + the
     // Accordion demo's 2 sections, each a header Button + content Container
-    // + content Label (6 more) -- 51 widgets total (the dropdown's floating
-    // panel, the modal's panel, the combobox's options panel, the menu's
-    // panel/submenu, the W15 tooltip panel/label, the W16 picker's own
+    // + content Label (6 more) + the Tree demo's own fixed widget pool --
+    // viewport + top/bottom spacers + a fixed-size row pool (created once
+    // and never destroyed/recreated, see tree.go's own doc comment) sized
+    // to however many rows fit its fixed 120px viewport at 28px/row (9
+    // more, all created up front regardless of how many are populated with
+    // real content vs. hidden -- see tree.go's own visibleRowCount; not
+    // hand-derived here since the exact pool size depends on int-truncated
+    // division, not worth re-deriving by hand when the real snapshot is
+    // authoritative) -- 61 widgets total (the dropdown's floating panel,
+    // the modal's panel, the combobox's options panel, the menu's panel/
+    // submenu, the W15 tooltip panel/label, the W16 picker's own
     // panel/grid/steppers, and the W18 popover's own panel/label/checkbox/
     // close-button are all only created on demand, not by natyv_init -- see
     // the W4/W5/W6/W7/W9/W15/W16/W18 tests below; the toast stack itself IS
     // created here, unlike those, but individual toasts inside it aren't --
-    // the W19 Tabs widget and its 3 panels/labels, and the Accordion demo's
-    // 2 header/content/label triples, ARE all created here too, unlike
-    // Popover, since neither has any open/close state, see tabsID's/
-    // accordionHeaderIDs' own doc comments in the fixture guest). Same
-    // silent-truncation risk documented at W1's identical bump from 4 to 8
-    // -- snapshot() caps at out.len with no error, so every
-    // clay-fixture-loading test's buffer needs auditing whenever natyv_init
-    // grows, not just the test being extended.
-    var snap: [55]WidgetHost.Slot = undefined;
+    // the W19 Tabs widget and its 3 panels/labels, the Accordion demo's 2
+    // header/content/label triples, and the Tree demo's own full widget
+    // pool ARE all created here too, unlike Popover, since none of them
+    // have any open/close state, see tabsID's/accordionHeaderIDs'/tree's
+    // own doc comments in the fixture guest). Same silent-truncation risk
+    // documented at W1's identical bump from 4 to 8 -- snapshot() caps at
+    // out.len with no error, so every clay-fixture-loading test's buffer
+    // needs auditing whenever natyv_init grows, not just the test being
+    // extended.
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 51), n);
+    try std.testing.expectEqual(@as(usize, 61), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -529,7 +538,7 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     // W4: the fixture now creates a *second* button (the dropdown trigger,
     // "Select...", Fixed height 32) alongside "Grow Button" (GROW width,
@@ -1013,7 +1022,7 @@ test "W2: natyv_clay_create_container's scroll_vertical/scroll_horizontal round-
     runtime.initGuest(io);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // The scroll container is the top-level (parent_id == null) container
@@ -1094,7 +1103,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var scroll_container_id: ?u32 = null;
@@ -1175,7 +1184,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
     _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
     try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
 
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     var row1_id: ?u32 = null;
     var row1_base_y: f32 = undefined;
@@ -1253,7 +1262,7 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     // W4: two buttons exist now (the fixture's own "Grow Button" plus the
     // dropdown trigger) -- every button gets synced once on this first
@@ -1339,7 +1348,7 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     runtime.widgets.syncTextObjects(io, engine, font_cap.font);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     // W4: must be "Grow Button" specifically, not whichever button the
     // scan finds last -- a real click's widget_id now matters (the
@@ -1528,7 +1537,7 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
     runtime.initGuest(io);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var checkbox_id: ?u32 = null;
@@ -1601,7 +1610,7 @@ test "W3: slider created via natyv_clay_create_slider round-trips its value, and
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [29]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var slider_id: ?u32 = null;
@@ -1648,7 +1657,7 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
     // Bumped from 50 -- natyv_init's baseline grew to 51 with the
     // Accordion demo (see the L3 test's comment above), so this buffer
     // needs headroom past that plus whatever this test opens on top.
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1736,7 +1745,7 @@ test "Dropdown follow-up: arrow-key cycling + Enter selects the highlighted opti
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     var trigger_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -1844,7 +1853,7 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
     // Bumped from 50 -- natyv_init's baseline grew to 51 with the
     // Accordion demo (see the L3 test's comment above), so this buffer
     // needs headroom past that plus whatever this test opens on top.
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -1951,7 +1960,7 @@ test "W6: a combobox's .text_changed re-filters, .key_nav moves the highlight an
     // Bumped from 50 -- natyv_init's baseline grew to 51 with the
     // Accordion demo (see the L3 test's comment above), so this buffer
     // needs headroom past that plus whatever this test opens on top.
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -2048,7 +2057,7 @@ test "W6: a real .blur event closes the combobox panel without selecting anythin
     // Bumped from 50 -- natyv_init's baseline grew to 51 with the
     // Accordion demo (see the L3 test's comment above), so this buffer
     // needs headroom past that plus whatever this test opens on top.
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var field_id: ?u32 = null;
@@ -2114,7 +2123,7 @@ test "W7: a toast round-trips duration_ms into a real expires_at_ms, and destroy
     // Bumped from 50 -- natyv_init's baseline grew to 51 with the
     // Accordion demo (see the L3 test's comment above), so this buffer
     // needs headroom past that plus whatever this test opens on top.
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var stack_id: ?u32 = null;
@@ -2213,7 +2222,7 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     // silently overflowed the old 50-slot buffer (W19's +7 widget bump).
     // Bumped to 60 for headroom. Same silent-truncation risk documented at
     // every prior buffer bump in this file.
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -2549,7 +2558,7 @@ test "Menu migration repro: many rapid key_nav presses, with a real layout pass 
     var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
     _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
-    var snap: [60]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
     var trigger_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -2616,7 +2625,7 @@ test "W10: a textarea's multi-line content flows through host-level mutation, re
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [32]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one TextArea exists in this fixture -- see natyv_init's own
@@ -2686,7 +2695,7 @@ test "W11: a divider exists, is not focusable, and gets real Clay-computed geome
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [32]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Divider exists in this fixture -- see natyv_init's own
@@ -2731,7 +2740,7 @@ test "W12: a toggle exists, is focusable, activates via a real click, and natyv_
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [32]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Toggle exists in this fixture -- see natyv_init's own
@@ -2791,7 +2800,7 @@ test "W14: three badges exist with their real tones/labels, are not focusable, a
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
     // this test never opens anything else on top, well within headroom.
-    var snap: [32]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
 
     // Exactly one Badge per tone exists in this fixture -- see
@@ -2841,7 +2850,7 @@ test "W15: a real .hover event creates a floating tooltip through a real guest, 
     // at peak, which silently overflowed the old 40-slot buffer (W19's +7
     // widget bump). Bumped to 55 for headroom. Same silent-truncation risk
     // documented at every prior buffer bump in this file.
-    var snap: [55]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var help_id: ?u32 = null;
@@ -2939,7 +2948,7 @@ test "W16: a date/time picker's calendar grid matches the real month, and select
     // replacing the original six-widget Button+Label+Button trio) = 59 --
     // 45 + 59 = 104 at peak, which silently overflowed the old 100-slot
     // buffer (W19's +7 widget bump). Bumped to 115 for headroom.
-    var snap: [115]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -3012,7 +3021,7 @@ test "W16: month navigation regenerates the grid for the real target month, and 
     // Bumped from 100 -- same peak-widget-count math as the previous
     // test's own updated comment (W19's +7 widget bump on natyv_init's
     // baseline pushed this picker-open scenario's peak past 100 too).
-    var snap: [115]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -3131,7 +3140,7 @@ test "W18: a popover opens with real content, its own Checkbox toggles, its own 
     // opens the popover on top of that (+4), which silently overflowed a
     // 48-slot buffer before this bump (same "snapshot() caps at out.len
     // with no error" risk that comment documents).
-    var snap: [56]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -3365,7 +3374,7 @@ test "W19: natyv_clay_create_tabs/_tab_panel round-trip through a real compiled 
     var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
     _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
-    var snap: [56]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var tabs_id: ?u32 = null;
@@ -3564,7 +3573,7 @@ test "Accordion: natyv_set_visible round-trips through a real compiled guest, an
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [56]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var header0_id: ?u32 = null;
@@ -3759,7 +3768,7 @@ test "Scroll-into-view: natyv_get_scroll_position's Slot.scroll_data mirror matc
     _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, 0, &scroll_scratch);
     _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 200, 400, 50, false, 0, -1000, &scroll_scratch);
 
-    var snap: [56]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
     var scroll_id: ?u32 = null;
     for (snap[0..n]) |slot| {
@@ -3813,7 +3822,7 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
     var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
     _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch);
 
-    var snap: [56]WidgetHost.Slot = undefined;
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var header1_id: ?u32 = null;
@@ -3883,4 +3892,122 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
     // also actually moved the viewport -- not left it clipped off-screen,
     // which is the bug Quinn's own click-through caught.
     try std.testing.expect(scroll_after.scroll_offset_y != scroll_before.scroll_offset_y);
+}
+
+test "Tree view: a real click expands a root and reveals children while collapsed siblings stay unassigned to any pool row, another click moves selection to a leaf, and a real .scroll event slides the pool's window" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+    defer runtime.widgets.destroyAllTextObjects(io);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    // Nothing is Expanded at init -- flatten() returns just the 3 category
+    // roots (Fruits/Vegetables/Grains). Tree's row pool is a fixed 6 real
+    // Buttons (viewportHeight/rowHeight + 2 overscan, created once and
+    // never destroyed -- see tree.go's own doc comment), so all 6 already
+    // exist as widgets regardless of content -- but only 3 of them are
+    // populated with a real node's label and set visible; the other 3 sit
+    // hidden with their original empty label, never having been assigned
+    // any of the tree's 18 total nodes.
+    var fruits_id: ?u32 = null;
+    var apple_seen_at_init = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .button) continue;
+        const label = slot.widget.button.label();
+        if (std.mem.eql(u8, label, "> Fruits")) fruits_id = slot.id;
+        if (std.mem.indexOf(u8, label, "Apple") != null) apple_seen_at_init = true;
+    }
+    const fid = fruits_id orelse return error.MissingFruitsRoot;
+    try std.testing.expect(!apple_seen_at_init);
+
+    // Real guest-routed click (a real `.click` event, exactly as a real
+    // mouse click dispatches -- same convention as the Accordion click test
+    // above). Fruits has children, so this both expands and selects it --
+    // Tree's own OnClick always sets selection regardless of whether the
+    // node has children (see tree.go), so the row becomes "* v Fruits", not
+    // just "v Fruits".
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try buildDispatchEnvelope(&dispatch_buf, fid, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var expanded_and_selected_fruits_seen = false;
+    var apple_id: ?u32 = null;
+    var viewport_id: ?u32 = null;
+    var vegetables_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .button) continue;
+        const label = slot.widget.button.label();
+        if (std.mem.eql(u8, label, "* v Fruits")) expanded_and_selected_fruits_seen = true;
+        if (std.mem.eql(u8, label, "    Apple")) {
+            apple_id = slot.id;
+            viewport_id = slot.parent_id;
+        }
+        if (std.mem.indexOf(u8, label, "Vegetables") != null) vegetables_seen = true;
+    }
+    // Expanding Fruits grows the flattened list to 8 rows (3 roots + 5
+    // children), but the fixed 120px-tall/28px-row pool only holds 6 rows
+    // at once -- Vegetables and Grains aren't assigned to any pool row at
+    // all right now, not just visually clipped -- the real proof this is
+    // virtualized, not an Accordion-style show/hide of widgets that already
+    // exist for every node.
+    try std.testing.expect(expanded_and_selected_fruits_seen);
+    try std.testing.expect(!vegetables_seen);
+    const aid = apple_id orelse return error.MissingAppleChild;
+    const vpid = viewport_id orelse return error.MissingViewportParent;
+
+    // A second real click, on a leaf this time -- moves selection without
+    // touching Fruits' own Expanded state, proving OnClick's `len(n.
+    // Children) > 0` guard actually gates the expand half independently of
+    // the always-runs selection half.
+    payload = try buildDispatchEnvelope(&dispatch_buf, aid, "click", "");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var fruits_still_expanded_not_selected = false;
+    var apple_marked = false;
+    var selected_label_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "v Fruits")) fruits_still_expanded_not_selected = true;
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "*     Apple")) apple_marked = true;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Selected: Apple")) selected_label_seen = true;
+    }
+    try std.testing.expect(fruits_still_expanded_not_selected);
+    try std.testing.expect(apple_marked);
+    try std.testing.expect(selected_label_seen);
+
+    // Real `.scroll` event targeting the viewport itself, with the exact
+    // payload shape main.zig's own post-layout push builds (see the
+    // `.scroll` EventQueue.EventType's own doc comment) -- scrolled down 2
+    // rows' worth. Proves Tree's real internal.RegisterScroll wiring
+    // re-renders the window on a live host-detected scroll, not just on its
+    // own row clicks.
+    payload = try buildDispatchEnvelope(&dispatch_buf, vpid, "scroll", "{\"scroll_offset_x\":0,\"scroll_offset_y\":-56}");
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var apple_gone = true;
+    var vegetables_now_seen = false;
+    var grains_now_seen = false;
+    for (snap[0..n]) |slot| {
+        if (slot.widget != .button) continue;
+        const label = slot.widget.button.label();
+        if (std.mem.indexOf(u8, label, "Apple") != null) apple_gone = false;
+        if (std.mem.indexOf(u8, label, "Vegetables") != null) vegetables_now_seen = true;
+        if (std.mem.indexOf(u8, label, "Grains") != null) grains_now_seen = true;
+    }
+    try std.testing.expect(apple_gone);
+    try std.testing.expect(vegetables_now_seen);
+    try std.testing.expect(grains_now_seen);
 }

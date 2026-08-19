@@ -73,6 +73,7 @@ const CreateSegmentedControlRequest = struct { x: f32, y: f32, w: f32, h: f32, s
 const SetCheckedRequest = struct { widget_id: u32, checked: bool };
 const SetValueRequest = struct { widget_id: u32, value: f32 };
 const SetVisibleRequest = struct { widget_id: u32, visible: bool };
+const SetSizeRequest = struct { widget_id: u32, height: f32 };
 
 // L3: wire-format mirrors of Clay's real C types (Clay_SizingAxis,
 // Clay_Padding, Clay_LayoutDirection, Clay_ChildAlignment -- see clay.h)
@@ -968,6 +969,27 @@ pub fn setVisibleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Ext
     const req = parsed.value;
 
     if (!self.setVisible(self.io(), req.widget_id, req.visible)) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// Generic per-slot Fixed-height resize -- thin wire adapter over
+/// `WidgetHost.setHeight`, same "host function just parses JSON and calls a
+/// plain `WidgetHost` method" split `setVisibleHostFn` above already
+/// establishes (kept that way here too so `RuntimeTest.zig` can call
+/// `setHeight` directly, without going through the Extism C callback
+/// boundary).
+pub fn setSizeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetSizeRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    if (!self.setHeight(self.io(), req.widget_id, req.height)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }

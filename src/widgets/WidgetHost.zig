@@ -175,7 +175,9 @@ pub const max_widgets = 128;
 // not gated by an EnabledKinds/WidgetsConfig flag.
 // + natyv_set_visible (1) -- Accordion, generic per-slot toggle, guest-
 // composed rather than a new WidgetKind, so no Clay-side registration.
-pub const host_function_count = 21;
+// + natyv_set_size (1) -- Tree view, generic per-slot Fixed-height resize,
+// same "guest-composed, no new WidgetKind" reasoning as natyv_set_visible.
+pub const host_function_count = 22;
 
 pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge, numeric_stepper, segmented_control, tabs };
 pub const Widget = union(WidgetKind) {
@@ -584,6 +586,11 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     // Accordion's own doc comment on `HostFunctions.setVisibleHostFn`) --
     // same "always registered" reasoning as the block above.
     funcs_out[n] = c.extism_function_new("natyv_set_visible", &in_types[0], 1, &out_types[0], 1, HostFunctions.setVisibleHostFn, self, null);
+    n += 1;
+    // Tree view: generic per-slot Fixed-height resize, guest-composed (see
+    // `HostFunctions.setSizeHostFn`'s own doc comment) -- same "always
+    // registered" reasoning as the block above.
+    funcs_out[n] = c.extism_function_new("natyv_set_size", &in_types[0], 1, &out_types[0], 1, HostFunctions.setSizeHostFn, self, null);
     n += 1;
     return n;
 }
@@ -1291,6 +1298,39 @@ pub fn setVisible(self: *Self, call_io: Io, id: u32, visible: bool) bool {
     };
     const changed = slot.clay_style.visible != visible;
     slot.clay_style.visible = visible;
+    self.mutex.unlock(call_io);
+
+    if (changed) self.layout_generation +%= 1;
+    return true;
+}
+
+/// Generic per-slot Fixed-height resize (min=max=height, regardless of
+/// whichever sizing type the slot was created with) -- built for Tree
+/// view's virtualized top/bottom spacer Containers (see
+/// sdk/go/widgets/tree.go), which used to destroy+recreate on every window
+/// shift purely to get a new height. That destroy/create pair on both
+/// spacers, every single scroll tick, was a real source of visible flash
+/// (see tree.go's own render/onScroll doc comments) -- this collapses it
+/// to a single in-place mutation, no widget identity change at all.
+/// Guest-composed rather than a new `WidgetKind`, same "no coordination the
+/// host needs to own" reasoning `natyv_set_visible` already established --
+/// `ClayStyle.sizing` exists on every `Slot` regardless of kind, so this
+/// never switches on `slot.widget` either. Width is left exactly as it was
+/// at creation time -- no current caller needs to resize both axes
+/// independently. Returns `false` only when `id` doesn't name any widget; a
+/// no-op call (already at the requested height) still returns `true`.
+/// Bumps `layout_generation` only when the value actually changes, same
+/// reasoning as `setVisible`.
+pub fn setHeight(self: *Self, call_io: Io, id: u32, height: f32) bool {
+    self.mutex.lockUncancelable(call_io);
+    const slot = self.findLocked(id) orelse {
+        self.mutex.unlock(call_io);
+        return false;
+    };
+    const axis = &slot.clay_style.sizing.height;
+    const changed = axis.type != c.CLAY__SIZING_TYPE_FIXED or axis.size.minMax.min != height or axis.size.minMax.max != height;
+    axis.type = c.CLAY__SIZING_TYPE_FIXED;
+    axis.size.minMax = .{ .min = height, .max = height };
     self.mutex.unlock(call_io);
 
     if (changed) self.layout_generation +%= 1;
