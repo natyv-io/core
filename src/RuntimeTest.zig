@@ -42,7 +42,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
 
     var runtime = try Runtime.init(allocator, ":memory:");
     defer runtime.deinit();
-    // L5: bookstore is now laid out entirely via sdk/go/ui/clay, so its
+    // L5: bookstore is now laid out entirely via sdk/go/widgets, so its
     // guest only imports natyv_clay_* (never natyv_create_button/etc) --
     // needs clay_enabled=true or plugin creation itself fails with an
     // "unknown import" error before natyv_init ever runs.

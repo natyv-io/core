@@ -39,7 +39,7 @@ fn onClayError(errorData: c.Clay_ErrorData) callconv(.c) void {
 // (`openChildren` below), never as Clay TEXT children via
 // `Clay__OpenTextElement` -- so Clay never actually calls this function
 // yet, and a FIT-sized leaf widget still collapses to its min (0) exactly
-// as `sdk/go/ui/clay`'s `Fit()` doc comment already says. Fixed now anyway
+// as `sdk/go/widgets`'s `Fit()` doc comment already says. Fixed now anyway
 // so it's correct the moment something does declare Clay text content,
 // rather than leaving a heuristic that would silently need revisiting
 // again later.
