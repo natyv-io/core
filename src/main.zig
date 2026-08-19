@@ -115,8 +115,10 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         .radio_button => widgets.selectRadioExclusive(io, id),
         // W17: same non-activatable set Slider joins -- driven by
         // click-zone/arrow-key input instead (see `notifyStepperValue`/
-        // `notifySegmentedValue` and the keyboard handling below).
-        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider, .badge, .numeric_stepper, .segmented_control => return,
+        // `notifySegmentedValue` and the keyboard handling below). W19:
+        // Tabs joins for the same reason -- driven by `tabAt`/arrow-key
+        // input via `notifyTabsValue`, not Enter/Space.
+        .textfield, .textarea, .label, .container, .progress_bar, .slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -162,6 +164,18 @@ fn notifySegmentedValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id
     queue.push(io, id, .change, json, surface_id);
 }
 
+/// W19: the `Tabs` counterpart to `notifySegmentedValue` -- same shape,
+/// same shared `{"value":N}` payload convention, except `setActiveTab`
+/// (unlike `setSegmentedIndex`) also flips every panel's `visible` flag and
+/// bumps `layout_generation` as a side effect -- see that function's doc
+/// comment.
+fn notifyTabsValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32, index: usize, surface_id: u32) void {
+    const resolved = widgets.setActiveTab(io, id, index) orelse return;
+    var buf: [32]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"value\":{d}}}", .{resolved}) catch "{}";
+    queue.push(io, id, .change, json, surface_id);
+}
+
 /// W6: the TextField counterpart to `notifySliderValue` -- called after
 /// `appendTextTo`/`backspaceOn` already mutated the widget and copied its
 /// real post-mutation text into `new_text`. Unlike the slider's payload
@@ -199,6 +213,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .slider => |s| s.containsPoint(mx, my),
         .numeric_stepper => |ns| ns.containsPoint(mx, my),
         .segmented_control => |sc| sc.containsPoint(mx, my),
+        .tabs => |tb| tb.containsPoint(mx, my),
         .label, .container, .progress_bar, .divider, .badge => false,
     };
 }
@@ -213,6 +228,16 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
 /// an inline assignment before -- a slider hit starts a drag as a side
 /// effect, same as before.
 fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32) ?u32 {
+    // W19: an invisible slot (a Tabs panel that isn't the active tab, e.g.)
+    // isn't declared to Clay this frame, so its cached `rect` can go stale
+    // rather than zeroed -- don't rely on that; skip explicitly rather than
+    // risk hit-testing/clicking a hidden widget for one frame. Checked once
+    // here rather than at every one of this function's several call sites.
+    // Ancestor-aware (`WidgetHost.isEffectivelyVisible`, not the raw
+    // `slot.clay_style.visible` field) -- a hidden panel's own children
+    // (e.g. a Label) keep their own default `visible == true`, since that
+    // flag is never propagated down; see that function's own doc comment.
+    if (!WidgetHost.isEffectivelyVisible(slots, slot)) return null;
     switch (slot.widget) {
         .button => |b| if (b.containsPoint(mx, my)) {
             activateWidget(widgets, io, queue, slot.id, .button, FloatingOrder.surfaceIdFor(slots, slot.id));
@@ -265,6 +290,16 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             notifySegmentedValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, slot.id));
             return slot.id;
         } else if (sc.containsPoint(mx, my)) return slot.id,
+        // W19: same "internal zone, not the whole rect" shape as
+        // SegmentedControl -- `tabAt` only resolves inside the header strip
+        // (see `Tabs.headerRect`), so a click on real panel content below it
+        // correctly falls through to `null` here (that content is a
+        // separate slot with its own hit-test arm, tried elsewhere in the
+        // caller's own loop over every slot).
+        .tabs => |tb| if (tb.tabAt(mx, my)) |idx| {
+            notifyTabsValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, slot.id));
+            return slot.id;
+        } else if (tb.containsPoint(mx, my)) return slot.id,
         .label, .container, .progress_bar, .divider, .badge => {},
     }
     return null;
@@ -292,6 +327,9 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) 
         .badge => |bd| bd.drawDecorations(renderer),
         .numeric_stepper => |ns| ns.drawDecorations(renderer),
         .segmented_control => |sc| sc.drawDecorations(renderer),
+        // W19: header strip only -- panel content is real Clay children,
+        // drawn through the normal per-child pass instead.
+        .tabs => |tb| tb.drawDecorations(renderer),
     }
 }
 
@@ -757,6 +795,9 @@ pub fn main(init: std.process.Init) !void {
                                 .slider => |s| notifySliderValue(&runtime.widgets, io, &queue, id, s.value - Slider.nudge_step, surface_id),
                                 .numeric_stepper => |ns| notifyStepperValue(&runtime.widgets, io, &queue, id, ns.value - ns.step, surface_id),
                                 .segmented_control => |sc| notifySegmentedValue(&runtime.widgets, io, &queue, id, if (sc.selected_index > 0) sc.selected_index - 1 else 0, surface_id),
+                                // W19: same clamped (non-wrapping) ±1 shape
+                                // as SegmentedControl.
+                                .tabs => |tb| notifyTabsValue(&runtime.widgets, io, &queue, id, if (tb.selected_index > 0) tb.selected_index - 1 else 0, surface_id),
                                 .button => queue.push(io, id, .key_nav, "{\"key\":\"left\"}", surface_id),
                                 else => {},
                             }
@@ -770,6 +811,7 @@ pub fn main(init: std.process.Init) !void {
                                 .slider => |s| notifySliderValue(&runtime.widgets, io, &queue, id, s.value + Slider.nudge_step, surface_id),
                                 .numeric_stepper => |ns| notifyStepperValue(&runtime.widgets, io, &queue, id, ns.value + ns.step, surface_id),
                                 .segmented_control => |sc| notifySegmentedValue(&runtime.widgets, io, &queue, id, sc.selected_index + 1, surface_id),
+                                .tabs => |tb| notifyTabsValue(&runtime.widgets, io, &queue, id, tb.selected_index + 1, surface_id),
                                 .button => queue.push(io, id, .key_nav, "{\"key\":\"right\"}", surface_id),
                                 else => {},
                             }
@@ -837,6 +879,10 @@ pub fn main(init: std.process.Init) !void {
             if (topmost_modal) |modal_id| {
                 if (!FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
             }
+            // W19: a hidden Tabs panel (or its content) shouldn't register
+            // hover/pointer-cursor -- same reasoning as tryHitWidget's own
+            // `visible` skip, ancestor-aware for the same reason.
+            if (!WidgetHost.isEffectivelyVisible(widget_snapshot[0..widget_count], slot)) continue;
             switch (slot.widget) {
                 .button => |b| if (b.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
@@ -871,6 +917,10 @@ pub fn main(init: std.process.Init) !void {
                     hovered_widget_id_this_frame = slot.id;
                 },
                 .segmented_control => |sc| if (sc.containsPoint(mouse_x, mouse_y)) {
+                    hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
+                },
+                .tabs => |tb| if (tb.containsPoint(mouse_x, mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
@@ -949,6 +999,10 @@ pub fn main(init: std.process.Init) !void {
             // adds here only actually renders at flush() below, which
             // would then paint over an already-drawn floating widget.
             if (floating) continue;
+            // W19: see tryHitWidget's own `visible` skip -- an invisible
+            // slot's cached rect can go stale rather than zeroed, so don't
+            // rely on it alone to keep a hidden Tabs panel from drawing.
+            if (!WidgetHost.isEffectivelyVisible(widget_snapshot[0..widget_count], slot)) continue;
             if (slot.widget.fillRect()) |fr| {
                 if (clip) |cr| {
                     const sdl_clip = toClipRect(cr);
@@ -965,6 +1019,7 @@ pub fn main(init: std.process.Init) !void {
 
         for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
             if (floating) continue;
+            if (!WidgetHost.isEffectivelyVisible(widget_snapshot[0..widget_count], slot)) continue;
             const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
             if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
             drawWidgetDecorations(slot.widget, renderer);
@@ -991,6 +1046,7 @@ pub fn main(init: std.process.Init) !void {
         // undimmed.
         for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
             if (!floating) continue;
+            if (!WidgetHost.isEffectivelyVisible(widget_snapshot[0..widget_count], slot)) continue;
             if (topmost_modal) |modal_id| {
                 if (FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
             }
@@ -1008,6 +1064,7 @@ pub fn main(init: std.process.Init) !void {
 
             for (widget_snapshot[0..widget_count], clip_rects[0..widget_count], is_floating[0..widget_count]) |slot, clip, floating| {
                 if (!floating) continue;
+                if (!WidgetHost.isEffectivelyVisible(widget_snapshot[0..widget_count], slot)) continue;
                 if (!FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
                 drawFloatingWidget(slot, clip, renderer);
             }

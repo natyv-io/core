@@ -42,6 +42,7 @@ const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
 const SegmentedControl = @import("SegmentedControl.zig");
+const Tabs = @import("Tabs.zig");
 
 const WidgetHost = @import("WidgetHost.zig");
 const Self = WidgetHost;
@@ -107,6 +108,14 @@ const ClayLayoutRequest = struct {
     floating: bool = false,
     modal: bool = false,
     toast: bool = false,
+    /// W19: see `ClayStyle.visible`'s doc comment. Defaults `true`, same as
+    /// the real style field it feeds -- most callers never set this; it
+    /// exists on the wire mainly so `createClayTabPanelHostFn` can start a
+    /// freshly-created panel hidden/shown correctly without a follow-up
+    /// `setActiveTab` call (see that function -- it computes the real value
+    /// itself and overwrites whatever a guest happened to request here,
+    /// since panel visibility is host-owned, not guest-declared).
+    visible: bool = true,
 };
 const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{}, background: bool = false, duration_ms: u32 = 0 };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
@@ -122,6 +131,11 @@ const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: 
 const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClayNumericStepperRequest = struct { layout: ClayLayoutRequest = .{}, value: i32 = 0, min: i32 = 0, max: i32 = 100, step: i32 = 1, wrap: bool = false };
 const ClaySegmentedControlRequest = struct { layout: ClayLayoutRequest = .{}, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
+const ClayTabsRequest = struct { layout: ClayLayoutRequest = .{}, labels: []const []const u8 = &.{}, selected_index: usize = 0 };
+// `layout.parent_id` MUST name an existing `.tabs` widget -- validated in
+// `createClayTabPanelHostFn` itself (`insertLockedWithLayoutValidated` only
+// checks that *some* widget exists at that id, not its kind).
+const ClayTabPanelRequest = struct { layout: ClayLayoutRequest = .{} };
 
 fn toSizingAxis(req: ClaySizingAxisRequest) c.Clay_SizingAxis {
     return switch (req.type) {
@@ -158,6 +172,7 @@ fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
         .floating = req.floating,
         .modal = req.modal,
         .toast = req.toast,
+        .visible = req.visible,
     };
 }
 
@@ -664,6 +679,87 @@ pub fn createClaySegmentedControlHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs:
     insertClayWidget(self, plugin, &outputs[0], .{ .segmented_control = control }, parsed.value.layout, null);
 }
 
+pub fn createClayTabsHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayTabsRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const tabs = Tabs.init(std.mem.zeroes(c.SDL_FRect), parsed.value.labels, parsed.value.selected_index);
+    // The header-height top-padding reservation and forced top_to_bottom
+    // direction are enforced in ClayLayout.zig's openChildren, not here --
+    // that way the invariant holds for every `.tabs` insertion path
+    // (including a direct insertWithLayout call in a test), not just this
+    // guest-facing wire contract.
+    insertClayWidget(self, plugin, &outputs[0], .{ .tabs = tabs }, parsed.value.layout, null);
+}
+
+/// W19: unlike every other `natyv_clay_create_*` function, this doesn't go
+/// through `insertClayWidget` -- it needs two things that shared helper
+/// doesn't do: reject a `parent_id` that exists but isn't a `.tabs` widget
+/// (`insertLockedWithLayoutValidated` only checks that *some* widget exists
+/// there), and, after inserting, register the new panel's id into the
+/// parent Tabs widget's `panel_ids` so `WidgetHost.setActiveTab` knows to
+/// manage its `visible` flag. The panel's own initial `visible` is computed
+/// here (not left to whatever the guest's `layout.visible` requested,
+/// default `true`) -- correct panel visibility on creation is this
+/// widget's whole reason for existing, so it isn't guest-configurable.
+pub fn createClayTabPanelHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayTabPanelRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const layout = parsed.value.layout;
+
+    const parent_id = layout.parent_id orelse {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "tab panel requires layout.parent_id naming a Tabs widget", .{});
+        return;
+    };
+
+    const call_io = self.io();
+    self.mutex.lockUncancelable(call_io);
+
+    const parent_slot = self.findLocked(parent_id) orelse {
+        self.mutex.unlock(call_io);
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such parent widget {d}", .{parent_id});
+        return;
+    };
+    if (parent_slot.widget != .tabs) {
+        self.mutex.unlock(call_io);
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "parent_id {d} does not name a Tabs widget", .{parent_id});
+        return;
+    }
+    if (parent_slot.widget.tabs.panel_count >= Tabs.max_tabs) {
+        self.mutex.unlock(call_io);
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "tabs widget {d} already has the maximum of {d} panels", .{ parent_id, Tabs.max_tabs });
+        return;
+    }
+    const panel_index = parent_slot.widget.tabs.panel_count;
+    var style = toClayStyle(layout);
+    style.visible = (panel_index == parent_slot.widget.tabs.selected_index);
+
+    const container = Container.init(std.mem.zeroes(c.SDL_FRect), false);
+    const result = self.insertLockedWithLayoutValidated(.{ .container = container }, parent_id, style, null);
+    const widget_id = result catch |err| {
+        self.mutex.unlock(call_io);
+        switch (err) {
+            error.NoSuchParent => host_fn_util.writeErrorJson(plugin, &outputs[0], "no such parent widget {d}", .{parent_id}),
+            error.RegistryFull => host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{}),
+        }
+        return;
+    };
+    if (self.findLocked(parent_id)) |p| {
+        p.widget.tabs.panel_ids[panel_index] = widget_id;
+        p.widget.tabs.panel_count = panel_index + 1;
+    }
+    self.mutex.unlock(call_io);
+
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
 pub fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -692,7 +788,8 @@ pub fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         // segment labels are set once at creation with no v1 API to
         // change them afterward -- same "not an error, just doesn't
         // apply" precedent as Container/ProgressBar/Slider/Divider here.
-        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control => {},
+        // W19: Tabs' labels join the same "set once at creation" set.
+        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control, .tabs => {},
     }
     if (slot.clay_managed) self.layout_generation +%= 1;
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -721,7 +818,7 @@ pub fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
         .badge => |bd| bd.label(),
-        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control => "",
+        .container, .progress_bar, .slider, .divider, .numeric_stepper, .segmented_control, .tabs => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);

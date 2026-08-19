@@ -95,6 +95,22 @@
 //! guest-authored-composition pattern RadioButton groups and bookstore's
 //! book list already use. The only new surface is the `floating` layout
 //! flag above.
+//!
+//! W19: Tabs is natyv's first host-owned widget that both draws its own
+//! decoration (a clickable header row, like SegmentedControl) AND is the
+//! real Clay parent of further Clay-managed children (its panels, like
+//! Container) -- and the first to need hiding a subtree without destroying
+//! it, since exactly one panel is shown at a time:
+//!   natyv_clay_create_tabs      in: {"layout":{...},"labels":["..."],"selected_index":N}
+//!   natyv_clay_create_tab_panel in: {"layout":{"parent_id":N,...}}  -- parent_id MUST name a Tabs widget
+//!     both out: {"widget_id":N} | {"error":"..."}
+//!   Selecting a different tab (click or arrow-key) calls `setActiveTab`,
+//!   which flips a new `ClayStyle.visible` flag on every panel so only the
+//!   newly-selected one participates in layout/draw/hit-test -- see that
+//!   flag's own doc comment for the mechanism, and `Tabs.zig`'s file doc
+//!   comment for why this widget owns both header and panel-visibility
+//!   together instead of guest-composing a SegmentedControl header with
+//!   manually-toggled panels.
 
 const std = @import("std");
 const Io = std.Io;
@@ -116,6 +132,7 @@ const Divider = @import("Divider.zig");
 const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
 const SegmentedControl = @import("SegmentedControl.zig");
+const Tabs = @import("Tabs.zig");
 // The Extism host-function wire layer (natyv_create_*/natyv_clay_create_*
 // callbacks and the generic set/get/destroy ones) lives in its own file --
 // see WidgetHostFunctions.zig's doc comment for why, and for the mutual
@@ -151,9 +168,13 @@ pub const max_widgets = 128;
 // + badge create (1) -- W14, same natyv_clay_create_badge split.
 // + numeric_stepper/segmented_control create (2) -- W17, same
 // natyv_clay_create_* split.
+// Tabs (W19) adds no plain natyv_create_* function at all -- like
+// Container, it's inherently a Clay parent/child + visibility construct,
+// so it's Clay-only (see registerClayInto/clay_host_function_count below),
+// not gated by an EnabledKinds/WidgetsConfig flag.
 pub const host_function_count = 20;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge, numeric_stepper, segmented_control };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, divider, badge, numeric_stepper, segmented_control, tabs };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -169,6 +190,7 @@ pub const Widget = union(WidgetKind) {
     badge: Badge,
     numeric_stepper: NumericStepper,
     segmented_control: SegmentedControl,
+    tabs: Tabs,
 
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
@@ -190,6 +212,7 @@ pub const Widget = union(WidgetKind) {
             .badge => |*bd| &bd.rect,
             .numeric_stepper => |*ns| &ns.rect,
             .segmented_control => |*sc| &sc.rect,
+            .tabs => |*tb| &tb.rect,
         };
     }
 
@@ -230,7 +253,11 @@ pub const Widget = union(WidgetKind) {
             // W17: both are multi-region custom draws (minus/plus zones,
             // or N segments) -- same "opts out of the single-color batched
             // fill" precedent Slider/Toggle already established.
-            .numeric_stepper, .segmented_control => null,
+            // W19: Tabs is the same kind of multi-region custom draw for its
+            // own header strip; its panel content draws via the normal
+            // per-child pass instead (real Clay children, each with their
+            // own fillRect).
+            .numeric_stepper, .segmented_control, .tabs => null,
         };
     }
 
@@ -240,7 +267,7 @@ pub const Widget = union(WidgetKind) {
     /// participate in Tab order.
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
-            .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .numeric_stepper, .segmented_control => true,
+            .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .numeric_stepper, .segmented_control, .tabs => true,
             .label, .container, .progress_bar, .divider, .badge => false,
         };
     }
@@ -260,6 +287,7 @@ pub const Widget = union(WidgetKind) {
             .slider => |*s| s.focused = focused,
             .numeric_stepper => |*ns| ns.focused = focused,
             .segmented_control => |*sc| sc.focused = focused,
+            .tabs => |*tb| tb.focused = focused,
             .label, .container, .progress_bar, .divider, .badge => {},
         }
     }
@@ -321,6 +349,20 @@ pub const ClayStyle = struct {
     /// `ClayContainerRequest.duration_ms` below (the actual expiry timer)
     /// -- a toast's content Container carries `duration_ms`, not `toast`.
     toast: bool = false,
+    /// W19: when false, `ClayLayout.openChildren` skips declaring this slot
+    /// (and, since it never recurses into an undeclared slot, its entire
+    /// subtree) in Clay's tree at all this frame -- it doesn't contribute to
+    /// a `fit`-sized parent's sizing, isn't returned by `Clay_GetElementData`,
+    /// and isn't drawn or hit-tested. This is the generic mechanism Tabs
+    /// uses to show exactly one panel at a time while keeping every panel's
+    /// widgets alive in the registry (no destroy/recreate churn) -- see
+    /// `WidgetHost.setActiveTab`. Toggling this flips what `openChildren`
+    /// declares, so any code path that changes it must also bump
+    /// `layout_generation` or the next frame's cached-layout short-circuit
+    /// in `layoutIfNeeded` will skip re-running Clay and the change won't
+    /// appear. Defaults `true` so every existing widget kind (which never
+    /// sets this) keeps behaving exactly as before.
+    visible: bool = true,
 };
 
 pub const Slot = struct {
@@ -346,6 +388,43 @@ pub const Slot = struct {
     /// reasoning `clay_managed` already gets.
     expires_at_ms: ?i64 = null,
 };
+
+/// W19 follow-up: whether `slot` should actually be drawn/hit-tested this
+/// frame -- true only if `slot.clay_style.visible` AND every ancestor's
+/// (walked via `parent_id`) is also `true`. `ClayLayout.openChildren`'s own
+/// skip (`if (!slot.clay_style.visible) continue`) is correct as-is because
+/// it's recursive -- skipping a slot there means its own children are never
+/// even visited, so *they* never get redeclared to Clay regardless of their
+/// own `visible` flag. But `visible` is never propagated down to children's
+/// own `clay_style` -- a hidden Tabs panel's child Label keeps its own
+/// default `visible == true` -- so any *flat* per-slot check (main.zig's
+/// draw loops, `tryHitWidget`) that only reads `slot.clay_style.visible`
+/// directly will happily draw/hit-test that Label using its last real
+/// (now-stale, since Clay stopped recomputing it) rect. Caught via Quinn's
+/// real click-through (2026-08-18): switching Tabs left every previous
+/// tab's content visually stacked on screen instead of disappearing, even
+/// though only the newly-selected panel was still being laid out -- same
+/// "fix applied to the parent, not propagated to descendants" class of bug
+/// as the W15 tooltip-overflow fix's round 2. `slots` is a snapshot slice
+/// (same shape `FloatingOrder.zig`'s own ancestor-walk helpers take), not
+/// the live locked registry -- callers already have one from `snapshot()`.
+pub fn isEffectivelyVisible(slots: []const Slot, slot: Slot) bool {
+    if (!slot.clay_style.visible) return false;
+    var current = slot.parent_id;
+    while (current) |pid| {
+        var parent: ?Slot = null;
+        for (slots) |s| {
+            if (s.id == pid) {
+                parent = s;
+                break;
+            }
+        }
+        const p = parent orelse return true; // orphaned parent id -- shouldn't normally happen, no ancestor constraint to apply
+        if (!p.clay_style.visible) return false;
+        current = p.parent_id;
+    }
+    return true;
+}
 
 allocator: std.mem.Allocator,
 mutex: Io.Mutex = .init,
@@ -479,7 +558,8 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     return n;
 }
 
-pub const clay_host_function_count = 14;
+// W19: +2 for natyv_clay_create_tabs/natyv_clay_create_tab_panel.
+pub const clay_host_function_count = 16;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -505,6 +585,8 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[11] = c.extism_function_new("natyv_clay_create_badge", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayBadgeHostFn, self, null);
     funcs_out[12] = c.extism_function_new("natyv_clay_create_numeric_stepper", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayNumericStepperHostFn, self, null);
     funcs_out[13] = c.extism_function_new("natyv_clay_create_segmented_control", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySegmentedControlHostFn, self, null);
+    funcs_out[14] = c.extism_function_new("natyv_clay_create_tabs", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayTabsHostFn, self, null);
+    funcs_out[15] = c.extism_function_new("natyv_clay_create_tab_panel", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayTabPanelHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -629,6 +711,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .badge => |*bd| bd.syncText(engine, font),
                 .numeric_stepper => |*ns| ns.syncText(engine, font),
                 .segmented_control => |*sc| sc.syncText(engine, font),
+                .tabs => |*tb| tb.syncText(engine, font),
                 .container, .progress_bar, .slider, .divider => {},
             }
         }
@@ -656,6 +739,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .badge => |*bd| bd.destroyText(),
                 .numeric_stepper => |*ns| ns.destroyText(),
                 .segmented_control => |*sc| sc.destroyText(),
+                .tabs => |*tb| tb.destroyText(),
                 .container, .progress_bar, .slider, .divider => {},
             }
         }
@@ -734,6 +818,7 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                         .badge => |*bd| bd.destroyText(),
                         .numeric_stepper => |*ns| ns.destroyText(),
                         .segmented_control => |*sc| sc.destroyText(),
+                        .tabs => |*tb| tb.destroyText(),
                         .container, .progress_bar, .slider, .divider => {},
                     }
                     if (s.clay_managed) self.layout_generation +%= 1;
@@ -804,6 +889,8 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         // "practically unreachable" slack (256 slots) for any realistic
         // number of segmented controls destroyed in a single frame.
         .segmented_control => |*sc| for (0..sc.count) |i| self.queuePendingTextDestroy(&sc.text_objs[i]),
+        // W19: same "up to max_tabs text objects" shape as SegmentedControl.
+        .tabs => |*tb| for (0..tb.count) |i| self.queuePendingTextDestroy(&tb.text_objs[i]),
         .container, .progress_bar, .slider, .divider => {},
     }
 }
@@ -1088,4 +1175,30 @@ pub fn setSegmentedIndex(self: *Self, call_io: Io, id: u32, index: usize) ?usize
     slot.widget.segmented_control.select(index);
     const new = slot.widget.segmented_control.selected_index;
     return if (new != old) new else null;
+}
+
+/// W19: the `Tabs` counterpart to `setSegmentedIndex` -- same clamp-and-
+/// report-if-changed shape, plus the real reason Tabs is its own host-owned
+/// widget kind rather than a guest-composed pairing: flips the `visible`
+/// flag on every tracked panel so exactly the newly-selected one participates
+/// in the next Clay layout pass, and bumps `layout_generation` so that pass
+/// actually runs (see `ClayStyle.visible`'s doc comment for why this bump is
+/// required here but not on `setSegmentedIndex`/`setStepperValue`, which
+/// never change what's declared in the tree).
+pub fn setActiveTab(self: *Self, call_io: Io, id: u32, index: usize) ?usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(id) orelse return null;
+    if (slot.widget != .tabs) return null;
+    const old = slot.widget.tabs.selected_index;
+    slot.widget.tabs.select(index);
+    const new = slot.widget.tabs.selected_index;
+    if (new == old) return null;
+    for (0..slot.widget.tabs.panel_count) |i| {
+        if (self.findLocked(slot.widget.tabs.panel_ids[i])) |panel_slot| {
+            panel_slot.clay_style.visible = (i == new);
+        }
+    }
+    self.layout_generation +%= 1;
+    return new;
 }

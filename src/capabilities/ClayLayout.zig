@@ -23,6 +23,7 @@ const c = @import("../c.zig").c;
 const WidgetHost = @import("../widgets/WidgetHost.zig");
 const timing = @import("../timing.zig");
 const ScrollBar = @import("../ScrollBar.zig");
+const Tabs = @import("../widgets/Tabs.zig");
 
 const Self = @This();
 
@@ -291,6 +292,13 @@ fn nearestScrollBoundary(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, 
 fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet) void {
     for (slots) |slot| {
         if (!slot.clay_managed or !std.meta.eql(slot.parent_id, parent_id)) continue;
+        // W19: an invisible slot (see ClayStyle.visible's doc comment) is
+        // simply never declared to Clay at all -- since this function only
+        // ever recurses into a slot's children *after* declaring the slot
+        // itself, skipping here skips its entire subtree too, no separate
+        // recursive-skip logic needed. This is Tabs' whole mechanism for
+        // showing exactly one panel at a time without destroying the rest.
+        if (!slot.clay_style.visible) continue;
 
         var decl: c.Clay_ElementDeclaration = std.mem.zeroes(c.Clay_ElementDeclaration);
         decl.layout.sizing = slot.clay_style.sizing;
@@ -298,6 +306,20 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
         decl.layout.childGap = slot.clay_style.child_gap;
         decl.layout.layoutDirection = slot.clay_style.direction;
         decl.layout.childAlignment = slot.clay_style.child_alignment;
+        // W19: a Tabs widget always reserves its own header strip's height
+        // as top padding and always lays its (single visible) panel out
+        // top_to_bottom, regardless of what `clay_style` says -- enforced
+        // here, not only in the guest-facing `createClayTabsHostFn`, so
+        // this invariant holds for every insertion path (including a test
+        // that builds a `.tabs` slot directly via `insertWithLayout`), not
+        // just the wire contract. Without this, Clay would lay panel
+        // content out starting at this widget's own y=0, directly under
+        // (visually colliding with) the header strip Tabs.drawDecorations
+        // draws separately -- see Tabs.headerRect's doc comment.
+        if (slot.widget == .tabs) {
+            decl.layout.padding.top += @intFromFloat(Tabs.header_height);
+            decl.layout.layoutDirection = c.CLAY_TOP_TO_BOTTOM;
+        }
 
         c.Clay__OpenElementWithId(elementId(slot.id));
         // W2: Clay_GetScrollOffset() only returns the right value for

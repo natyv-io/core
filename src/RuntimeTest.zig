@@ -26,6 +26,7 @@ const Label = @import("widgets/Label.zig");
 const RadioButton = @import("widgets/RadioButton.zig");
 const NumericStepper = @import("widgets/NumericStepper.zig");
 const SegmentedControl = @import("widgets/SegmentedControl.zig");
+const Tabs = @import("widgets/Tabs.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
@@ -91,7 +92,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
             },
             .label => {},
             .container => {},
-            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .textarea, .divider, .badge, .numeric_stepper, .segmented_control => {},
+            .checkbox, .toggle, .radio_button, .progress_bar, .slider, .textarea, .divider, .badge, .numeric_stepper, .segmented_control, .tabs => {},
         }
     }
 
@@ -432,7 +433,7 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 38, not 8: natyv_init creates container + button + checkbox + 2 radio
+    // 45, not 8: natyv_init creates container + button + checkbox + 2 radio
     // buttons + a progress bar (W1, 6 widgets) + a W2 scroll container + 5
     // row labels (6 more) + a W3 slider (1 more) + a W4 dropdown trigger
     // button (1 more) + a W5 modal trigger button (1 more) + a W6 combobox
@@ -443,21 +444,24 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // and its 3 Badges (4 more) + a W15 "?" help Button (1 more) + a W16
     // date/time picker trigger and its result Label (2 more) + a W17
     // Quantity row/label/NumericStepper and a View row/label/
-    // SegmentedControl (6 more) + a W18 popover trigger (1 more) -- 38
+    // SegmentedControl (6 more) + a W18 popover trigger (1 more) + a W19
+    // Tabs widget, its 3 panels, and each panel's own Label (7 more) -- 45
     // widgets total (the dropdown's floating panel, the modal's panel, the
     // combobox's options panel, the menu's panel/submenu, the W15 tooltip
     // panel/label, the W16 picker's own panel/grid/steppers, and the W18
     // popover's own panel/label/checkbox/close-button are all only created
     // on demand, not by natyv_init -- see the W4/W5/W6/W7/W9/W15/W16/W18
     // tests below; the toast stack itself IS created here, unlike those,
-    // but individual toasts inside it aren't). Same silent-truncation risk
-    // documented at W1's identical bump from 4 to 8 -- snapshot() caps at
-    // out.len with no error, so every clay-fixture-loading test's buffer
-    // needs auditing whenever natyv_init grows, not just the test being
-    // extended.
+    // but individual toasts inside it aren't -- the W19 Tabs widget and its
+    // 3 panels/labels ARE all created here too, unlike Popover, since
+    // there's no open/close state for this one, see tabsID's own doc
+    // comment in the fixture guest). Same silent-truncation risk documented
+    // at W1's identical bump from 4 to 8 -- snapshot() caps at out.len with
+    // no error, so every clay-fixture-loading test's buffer needs auditing
+    // whenever natyv_init grows, not just the test being extended.
     var snap: [48]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 38), n);
+    try std.testing.expectEqual(@as(usize, 45), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -2080,12 +2084,13 @@ test "W9: a menu's nested submenu positions correctly, each level's key_nav is i
     defer clay_layout.deinit(allocator);
     clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
 
-    // natyv_init's baseline is now 31 (see the L3 test's comment above),
+    // natyv_init's baseline is now 45 (see the L3 test's comment above),
     // plus this test opens the top-level menu (panel + 3 items = 4 more)
-    // and the submenu (panel + 2 items = 3 more) -- 38 at peak,
-    // comfortably under this buffer's 50. Same silent-truncation risk
-    // documented at every prior buffer bump in this file.
-    var snap: [50]WidgetHost.Slot = undefined;
+    // and the submenu (panel + 2 items = 3 more) -- 52 at peak, which
+    // silently overflowed the old 50-slot buffer (W19's +7 widget bump).
+    // Bumped to 60 for headroom. Same silent-truncation risk documented at
+    // every prior buffer bump in this file.
+    var snap: [60]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -2626,13 +2631,12 @@ test "W15: a real .hover event creates a floating tooltip through a real guest, 
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // natyv_init's baseline was 29 when this test was first written (28
-    // from W14 plus the new "?" help Button); now 31 after W16 added its
-    // own trigger+result Label, plus this test opens the tooltip
-    // (Container + Label = 2 more) -- 33 at peak, comfortably under this
-    // buffer's 40. Same silent-truncation risk documented at every prior
-    // buffer bump in this file.
-    var snap: [40]WidgetHost.Slot = undefined;
+    // natyv_init's baseline is now 45 (see the L3 test's comment above),
+    // plus this test opens the tooltip (Container + Label = 2 more) -- 47
+    // at peak, which silently overflowed the old 40-slot buffer (W19's +7
+    // widget bump). Bumped to 55 for headroom. Same silent-truncation risk
+    // documented at every prior buffer bump in this file.
+    var snap: [55]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var help_id: ?u32 = null;
@@ -2716,8 +2720,8 @@ test "W16: a date/time picker's calendar grid matches the real month, and select
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    // 100: natyv_init's 37 widgets (see the L3 test's comment above), plus
-    // opening the picker at its fixed default (August 2026) -- a real
+    // natyv_init's baseline is now 45 (see the L3 test's comment above),
+    // plus opening the picker at its fixed default (August 2026) -- a real
     // month, not a hand-picked round number, confirmed independently via
     // `python3 -c "import datetime; print(datetime.date(2026,8,1).weekday())"`
     // (Saturday, weekday 5 in Python's Monday=0 scheme -- 6 in Go's own
@@ -2728,8 +2732,9 @@ test "W16: a date/time picker's calendar grid matches the real month, and select
     // days = 37 cells, ceil(37/7)) + 6 (leading blank spacers) + 31 (day
     // buttons) + 1 (time row) + 2 (W17: hour/minute NumericSteppers,
     // replacing the original six-widget Button+Label+Button trio) = 59 --
-    // 37 + 59 = 96 at peak, comfortably under this buffer's 100.
-    var snap: [100]WidgetHost.Slot = undefined;
+    // 45 + 59 = 104 at peak, which silently overflowed the old 100-slot
+    // buffer (W19's +7 widget bump). Bumped to 115 for headroom.
+    var snap: [115]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -2799,7 +2804,10 @@ test "W16: month navigation regenerates the grid for the real target month, and 
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [100]WidgetHost.Slot = undefined;
+    // Bumped from 100 -- same peak-widget-count math as the previous
+    // test's own updated comment (W19's +7 widget bump on natyv_init's
+    // baseline pushed this picker-open scenario's peak past 100 too).
+    var snap: [115]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -2913,7 +2921,12 @@ test "W18: a popover opens with real content, its own Checkbox toggles, its own 
     try runtime.loadPlugin(wasm, .{}, .{}, true);
     runtime.initGuest(io);
 
-    var snap: [48]WidgetHost.Slot = undefined;
+    // W19 follow-up: bumped from 48 -- natyv_init now creates 45 widgets on
+    // its own (see the L3 test's own updated count/comment), and this test
+    // opens the popover on top of that (+4), which silently overflowed a
+    // 48-slot buffer before this bump (same "snapshot() caps at out.len
+    // with no error" risk that comment documents).
+    var snap: [56]WidgetHost.Slot = undefined;
     var n = runtime.widgets.snapshot(io, &snap);
 
     var trigger_id: ?u32 = null;
@@ -2986,4 +2999,233 @@ test "W18: a popover opens with real content, its own Checkbox toggles, its own 
     _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
     n = runtime.widgets.snapshot(io, &snap);
     try std.testing.expectEqual(baseline, n);
+}
+
+test "W19: WidgetHost.setActiveTab clamps an out-of-range index and flips panel visible flags" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    const tabs_id = runtime.widgets.insertWithLayout(io, .{ .tabs = Tabs.init(.{ .x = 0, .y = 0, .w = 180, .h = 200 }, &.{ "One", "Two", "Three" }, 0) }, null, .{}) orelse return error.RegistryFull;
+
+    // Register 3 panels the same way createClayTabPanelHostFn does --
+    // insert each as a real Clay-managed child of tabs_id, then append its
+    // id into the Tabs widget's own panel_ids/panel_count directly. There's
+    // no host-function-level entrypoint reachable without a compiled guest,
+    // same reasoning the W17 setSegmentedIndex test above uses
+    // insertWithLayout directly instead of a round trip through
+    // natyv_clay_create_*.
+    var panel_ids: [3]u32 = undefined;
+    for (0..3) |i| {
+        panel_ids[i] = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, tabs_id, .{
+            .sizing = .{ .width = fixedAxis(180), .height = fixedAxis(40) },
+            .visible = (i == 0),
+        }) orelse return error.RegistryFull;
+    }
+    runtime.widgets.mutex.lockUncancelable(io);
+    if (runtime.widgets.findLocked(tabs_id)) |slot| {
+        for (0..3) |i| slot.widget.tabs.panel_ids[i] = panel_ids[i];
+        slot.widget.tabs.panel_count = 3;
+    }
+    runtime.widgets.mutex.unlock(io);
+
+    // Out of range for a 3-tab control (index 3) clamps to the last index
+    // (2), same shape as setSegmentedIndex's own clamp test.
+    const resolved = runtime.widgets.setActiveTab(io, tabs_id, 3) orelse return error.ValueUnchanged;
+    try std.testing.expectEqual(@as(usize, 2), resolved);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        for (0..3) |i| {
+            if (slot.id == panel_ids[i]) try std.testing.expectEqual(i == 2, slot.clay_style.visible);
+        }
+    }
+
+    // Calling again with the already-resolved index reports "no change" --
+    // same "return null if unchanged" contract setSegmentedIndex/
+    // setSliderValue/setStepperValue all share.
+    const unchanged = runtime.widgets.setActiveTab(io, tabs_id, 2);
+    try std.testing.expectEqual(@as(?usize, null), unchanged);
+}
+
+test "W19: switching a Tabs widget's active tab removes the inactive panel from Clay's layout and resizes the Tabs widget's own fit box" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    // Fixed width, fit height -- the Tabs widget's own resolved height
+    // should track whichever panel is currently visible, not the sum or
+    // max of both. If the invisible panel were still contributing to
+    // layout (the exact bug ClayStyle.visible's `openChildren` skip exists
+    // to prevent), the fit height would never shrink back down after
+    // switching to the taller tab and back.
+    const tabs_id = runtime.widgets.insertWithLayout(io, .{ .tabs = Tabs.init(.{ .x = 0, .y = 0, .w = 180, .h = 0 }, &.{ "Short", "Tall" }, 0) }, null, .{
+        .sizing = .{ .width = fixedAxis(180), .height = .{ .type = c.CLAY__SIZING_TYPE_FIT, .size = .{ .minMax = .{ .min = 0, .max = 1e9 } } } },
+    }) orelse return error.RegistryFull;
+
+    const short_panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, tabs_id, .{
+        .sizing = .{ .width = fixedAxis(180), .height = fixedAxis(30) },
+        .visible = true,
+    }) orelse return error.RegistryFull;
+    const tall_panel_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, tabs_id, .{
+        .sizing = .{ .width = fixedAxis(180), .height = fixedAxis(150) },
+        .visible = false,
+    }) orelse return error.RegistryFull;
+
+    runtime.widgets.mutex.lockUncancelable(io);
+    if (runtime.widgets.findLocked(tabs_id)) |slot| {
+        slot.widget.tabs.panel_ids[0] = short_panel_id;
+        slot.widget.tabs.panel_ids[1] = tall_panel_id;
+        slot.widget.tabs.panel_count = 2;
+    }
+    runtime.widgets.mutex.unlock(io);
+
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+    var tabs_rect: c.SDL_FRect = undefined;
+    for (snap[0..n]) |slot| {
+        if (slot.id == tabs_id) tabs_rect = slot.widget.tabs.rect;
+    }
+    // Header (36) + short panel (30) -- the tall panel isn't declared to
+    // Clay at all this frame, so it can't inflate the fit height.
+    try std.testing.expectApproxEqAbs(@as(f32, Tabs.header_height) + 30, tabs_rect.h, 0.5);
+
+    // Switch to the tall tab -- setActiveTab must bump layout_generation
+    // (see ClayStyle.visible's doc comment) for this next layoutIfNeeded
+    // call to actually pick up the change rather than reusing the cached
+    // pre-switch pass.
+    _ = runtime.widgets.setActiveTab(io, tabs_id, 1) orelse return error.ValueUnchanged;
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == tabs_id) tabs_rect = slot.widget.tabs.rect;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, Tabs.header_height) + 150, tabs_rect.h, 0.5);
+
+    // And back down again -- proves it's not a one-way "grow and stay"
+    // artifact; the short panel's own height genuinely isn't padded out by
+    // the now-hidden tall one.
+    _ = runtime.widgets.setActiveTab(io, tabs_id, 0) orelse return error.ValueUnchanged;
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == tabs_id) tabs_rect = slot.widget.tabs.rect;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, Tabs.header_height) + 30, tabs_rect.h, 0.5);
+}
+
+test "W19: natyv_clay_create_tabs/_tab_panel round-trip through a real compiled guest, and switching tabs flips the real panel graph's visible flags" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    var snap: [56]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var tabs_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .tabs) tabs_id = slot.id;
+    }
+    const tid = tabs_id orelse return error.MissingTabs;
+
+    // Panel 0's Container (the "Details panel content" Label's own
+    // parent) is initially visible; panel 1's ("History panel content"'s
+    // parent) is not. Checked on the panel Container itself, not the
+    // Label -- `ClayStyle.visible` isn't propagated down to children, only
+    // the panel's own flag is ever set; a hidden panel's child Label keeps
+    // its own default `visible == true`, it's just never declared to Clay
+    // at all because `openChildren` never recurses into its (invisible)
+    // parent in the first place -- see that function's own doc comment.
+    var details_panel_id: ?u32 = null;
+    var history_panel_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Details panel content")) details_panel_id = slot.parent_id;
+        if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "History panel content")) history_panel_id = slot.parent_id;
+    }
+    const dpid = details_panel_id orelse return error.MissingDetailsPanel;
+    const hpid = history_panel_id orelse return error.MissingHistoryPanel;
+    for (snap[0..n]) |slot| {
+        if (slot.id == dpid) try std.testing.expect(slot.clay_style.visible);
+        if (slot.id == hpid) try std.testing.expect(!slot.clay_style.visible);
+    }
+
+    // Switch to tab index 1 ("History") -- same `WidgetHost.setActiveTab`
+    // call `notifyTabsValue` makes from a real header click in main.zig
+    // (see the W17 setSegmentedIndex test's own doc comment for why this
+    // codebase's tests exercise the host mechanism directly rather than
+    // synthesizing pixel coordinates just to re-derive the same index).
+    // Unlike Popover, Tabs is host-authoritative with no guest dispatch
+    // case to route through -- the guest only ever finds out via `.change`
+    // if it registered OnChange, which this static demo doesn't.
+    const resolved = runtime.widgets.setActiveTab(io, tid, 1);
+    try std.testing.expectEqual(@as(?usize, 1), resolved);
+    clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0);
+
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == dpid) try std.testing.expect(!slot.clay_style.visible);
+        if (slot.id == hpid) try std.testing.expect(slot.clay_style.visible);
+    }
+}
+
+test "W19 follow-up: WidgetHost.isEffectivelyVisible checks the full ancestor chain, not just a slot's own flag" {
+    // Reproduces the real bug Quinn caught via click-through: a Tabs
+    // panel's own `visible` flag correctly flips to false on tab switch,
+    // but `ClayStyle.visible` is never propagated down to children -- a
+    // hidden panel's Label child keeps its own default `visible == true`.
+    // main.zig's draw/hit-test loops must walk the parent chain (this
+    // function), not just read a slot's own flag, or a switched-away
+    // tab's content stays visually stacked on screen using its last real
+    // (now-stale) rect instead of disappearing.
+    const grandparent: WidgetHost.Slot = .{ .id = 1, .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, .parent_id = null, .clay_style = .{ .visible = false } };
+    const parent: WidgetHost.Slot = .{ .id = 2, .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, .parent_id = 1, .clay_style = .{ .visible = true } };
+    const child: WidgetHost.Slot = .{ .id = 3, .widget = .{ .label = Label.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "") }, .parent_id = 2, .clay_style = .{ .visible = true } };
+    const slots = [_]WidgetHost.Slot{ grandparent, parent, child };
+
+    // The child's own flag is true, but its grandparent's is false -- the
+    // whole chain must be treated as not visible.
+    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, child));
+    // The parent's own flag is true too, but it's under the same hidden
+    // grandparent.
+    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, parent));
+    // The grandparent's own flag alone already makes it invisible.
+    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, grandparent));
+
+    // Flip the grandparent visible again -- every level's own flag is now
+    // true, so the whole chain resolves to effectively visible.
+    var slots2 = slots;
+    slots2[0].clay_style.visible = true;
+    try std.testing.expect(WidgetHost.isEffectivelyVisible(&slots2, slots2[2]));
 }
