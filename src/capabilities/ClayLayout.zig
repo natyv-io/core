@@ -24,6 +24,7 @@ const WidgetHost = @import("../widgets/WidgetHost.zig");
 const timing = @import("../timing.zig");
 const ScrollBar = @import("../ScrollBar.zig");
 const Tabs = @import("../widgets/Tabs.zig");
+const FloatingOrder = @import("../FloatingOrder.zig");
 
 const Self = @This();
 
@@ -487,7 +488,21 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
 /// count back" idiom `WidgetHost.snapshot` already uses. Always `0` on the
 /// early-return "nothing changed at all" path below, since no scroll
 /// container's data could have moved if this function didn't even run.
-pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32, scrolled_ids_out: []u32) usize {
+///
+/// Multi-window Stage 3: `window_root_id` scopes this whole pass to one
+/// window's own widget subtree (`null` for the original startup window,
+/// exactly today's single-window meaning; a real window root's own id for
+/// any other open window) -- see `FloatingOrder.windowSubset`'s own doc
+/// comment. This instance's own Clay context (`self.context`, see Stage 2)
+/// only ever sees that one window's widgets declared into it, so two open
+/// windows' independent Clay trees can never cross-contaminate each other's
+/// layout. `currentGeneration` is still one registry-wide counter (not
+/// per-window) -- a deliberate v1 scope cut, see the multi-window plan's own
+/// "not worth per-surface generation tracking" note: an edit in window A's
+/// subtree forces window B's independent instance to also recompute that
+/// frame even though nothing in B changed, correct just not maximally
+/// efficient.
+pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32, scrolled_ids_out: []u32, window_root_id: ?u32) usize {
     // Multi-window Stage 2: selects *this* instance's own Clay context
     // before touching any Clay global state -- a defensive no-op today
     // (exactly one `ClayLayout` instance ever exists), but required once a
@@ -498,8 +513,19 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
     const scrolled = scroll_dx != 0 or scroll_dy != 0;
     if (!content_changed and !scrolled) return 0;
 
+    var full_snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    const full_n = widgets.snapshot(io, &full_snap);
+    const full = full_snap[0..full_n];
+    var subset_ids: [WidgetHost.max_widgets]u32 = undefined;
+    const subset_n = FloatingOrder.windowSubset(full, window_root_id, &subset_ids);
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
-    const n = widgets.snapshot(io, &snap);
+    var n: usize = 0;
+    for (full) |s| {
+        if (containsId(subset_ids[0..subset_n], s.id)) {
+            snap[n] = s;
+            n += 1;
+        }
+    }
     const slots = snap[0..n];
 
     // deltaTime is seconds since the *last real recompute* (not literal
@@ -527,7 +553,13 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
     root_decl.layout.sizing.height = .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = window_h, .max = window_h } } };
     c.Clay__OpenElementWithId(rootElementId());
     c.Clay__ConfigureOpenElement(root_decl);
-    openChildren(slots, null, .{});
+    // Multi-window Stage 3: `window_root_id` (not always `null`) is this
+    // window's own top-of-tree parent_id -- for any window other than the
+    // original startup one, its own window-root widget's *children* are what
+    // this Clay context's top-level content actually is (the window-root
+    // widget itself is never declared here; it's a registry-only marker, not
+    // a Clay element in its own context -- see `WidgetHost.ClayStyle.window_root`).
+    openChildren(slots, window_root_id, .{});
     c.Clay__CloseElement();
 
     _ = c.Clay_EndLayout(0.0);
@@ -584,7 +616,7 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         c.Clay_BeginLayout();
         c.Clay__OpenElementWithId(rootElementId());
         c.Clay__ConfigureOpenElement(root_decl);
-        openChildren(slots, null, .{ .v_ids = v_flip_ids[0..v_flip_count], .h_ids = h_flip_ids[0..h_flip_count] });
+        openChildren(slots, window_root_id, .{ .v_ids = v_flip_ids[0..v_flip_count], .h_ids = h_flip_ids[0..h_flip_count] });
         c.Clay__CloseElement();
         _ = c.Clay_EndLayout(0.0);
         self.recompute_count += 1;

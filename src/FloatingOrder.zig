@@ -114,16 +114,73 @@ pub fn isDescendantOfOrSelf(slots: []const WidgetHost.Slot, id: u32, root_id: u3
 /// off which modal (if any) the event's own widget is nested under, so a
 /// future NativeWindow surface can reuse the same wire field without a
 /// contract change -- see EventQueue.zig/Dispatch.zig.
+///
+/// Multi-window Stage 3: `window_root` joins `modal` here, exactly the
+/// extension this function's own doc comment above already promised --
+/// window-scoped content gets the window's own root id as its surface_id,
+/// same "topmost relevant container" precedent modal already establishes.
+/// A modal opened *inside* a window still resolves to the modal's own id,
+/// not the window's -- the `while` loop below finds whichever is nearer,
+/// and a modal can never be an ancestor of the window root that contains it
+/// (window roots are always `parent_id == null`), so no explicit ordering
+/// between the two checks is needed beyond "modal on the same slot wins,
+/// since a slot can't be both."
 pub fn surfaceIdFor(slots: []const WidgetHost.Slot, id: u32) u32 {
     const slot = findSlot(slots, id) orelse return 0;
     if (slot.clay_style.modal) return slot.id;
+    if (slot.clay_style.window_root) return slot.id;
     var current = slot.parent_id;
     while (current) |pid| {
         const parent = findSlot(slots, pid) orelse break;
         if (parent.clay_style.modal) return parent.id;
+        if (parent.clay_style.window_root) return parent.id;
         current = parent.parent_id;
     }
     return 0;
+}
+
+/// The id of `id`'s window: the nearest ancestor (or `id` itself) with
+/// `clay_style.window_root == true`, or `null` if `id` belongs to the
+/// original startup window (no window-root ancestor at all). A window root
+/// can never nest inside another (every window root is created with
+/// `parent_id == null`, see `WidgetHost.ClayStyle.window_root`'s own doc
+/// comment), so this walk never needs to consider more than one window-root
+/// ancestor being possible.
+fn nearestWindowRoot(slots: []const WidgetHost.Slot, id: u32) ?u32 {
+    const slot = findSlot(slots, id) orelse return null;
+    if (slot.clay_style.window_root) return slot.id;
+    var current = slot.parent_id;
+    while (current) |pid| {
+        const parent = findSlot(slots, pid) orelse break;
+        if (parent.clay_style.window_root) return parent.id;
+        current = parent.parent_id;
+    }
+    return null;
+}
+
+/// Multi-window Stage 3: the ids of every slot belonging to one window's own
+/// subset -- `window_root_id`'s own slot plus every descendant, when
+/// non-null; or every slot with *no* window-root ancestor at all (ordinary
+/// top-level content, exactly today's single-window behavior) when `null`,
+/// which is what the original startup window's own `root_widget_id == null`
+/// resolves to. This is the one filter every per-window pass (layout,
+/// hit-test, hover, draw, text-sync) needs -- a window root can't nest
+/// inside another (see `nearestWindowRoot`'s own doc comment), so a widget
+/// belongs to exactly one window, never a partial/ambiguous membership.
+/// `out` receives ids, not `Slot` copies -- callers that need real `Slot`
+/// data (e.g. `ClayLayout.layoutIfNeeded`) filter their own already-taken
+/// snapshot by these ids instead of this function copying data a caller may
+/// not even need.
+pub fn windowSubset(slots: []const WidgetHost.Slot, window_root_id: ?u32, out: []u32) usize {
+    var n: usize = 0;
+    for (slots) |slot| {
+        if (n >= out.len) break;
+        if (nearestWindowRoot(slots, slot.id) == window_root_id) {
+            out[n] = slot.id;
+            n += 1;
+        }
+    }
+    return n;
 }
 
 fn findSlot(slots: []const WidgetHost.Slot, id: u32) ?WidgetHost.Slot {
@@ -160,6 +217,16 @@ fn toastSlot(id: u32, parent_id: ?u32) WidgetHost.Slot {
         .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) },
         .parent_id = parent_id,
         .clay_style = .{ .toast = true },
+        .clay_managed = true,
+    };
+}
+
+fn windowRootSlot(id: u32) WidgetHost.Slot {
+    return .{
+        .id = id,
+        .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) },
+        .parent_id = null,
+        .clay_style = .{ .window_root = true },
         .clay_managed = true,
     };
 }
@@ -316,4 +383,62 @@ test "surfaceIdFor resolves nested modals to the nearest (innermost) one" {
     };
     try std.testing.expectEqual(@as(u32, 3), surfaceIdFor(&slots, 4));
     try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 2));
+}
+
+test "surfaceIdFor resolves a window-scoped widget to its own window's root id" {
+    var slots = [_]WidgetHost.Slot{
+        windowRootSlot(1),
+        containerSlot(2, 1, false),
+        containerSlot(3, 2, false), // two levels deep inside the window
+    };
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 1));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 2));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 3));
+}
+
+test "surfaceIdFor resolves a modal opened inside a window to the modal, not the window" {
+    var slots = [_]WidgetHost.Slot{
+        windowRootSlot(1),
+        containerSlot(2, 1, false), // trigger, inside the window
+        modalSlot(3, 2), // a modal opened inside that window
+        containerSlot(4, 3, false), // content inside the modal
+    };
+    try std.testing.expectEqual(@as(u32, 3), surfaceIdFor(&slots, 4));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 2));
+}
+
+test "windowSubset returns only the original window's content when no window root exists" {
+    var slots = [_]WidgetHost.Slot{
+        containerSlot(1, null, false),
+        containerSlot(2, 1, false),
+    };
+    var out: [2]u32 = undefined;
+    const n = windowSubset(&slots, null, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, out[0..n]);
+}
+
+test "windowSubset excludes a second window's whole subtree from the original window" {
+    var slots = [_]WidgetHost.Slot{
+        containerSlot(1, null, false), // original window content
+        windowRootSlot(2), // second window's root
+        containerSlot(3, 2, false), // content inside the second window
+    };
+    var out: [3]u32 = undefined;
+    const n = windowSubset(&slots, null, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u32, 1), out[0]);
+}
+
+test "windowSubset returns a window's own root plus every descendant, given its root id" {
+    var slots = [_]WidgetHost.Slot{
+        containerSlot(1, null, false), // original window content, must be excluded
+        windowRootSlot(2),
+        containerSlot(3, 2, false),
+        containerSlot(4, 3, false), // two levels deep inside the window
+    };
+    var out: [4]u32 = undefined;
+    const n = windowSubset(&slots, 2, &out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, out[0..n]);
 }

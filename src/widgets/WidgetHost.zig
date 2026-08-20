@@ -395,6 +395,24 @@ pub const ClayStyle = struct {
     /// appear. Defaults `true` so every existing widget kind (which never
     /// sets this) keeps behaving exactly as before.
     visible: bool = true,
+    /// Multi-window Stage 3: marks this slot as the root of a real second OS
+    /// window (a plain `.container` underneath, same shape as any other
+    /// Clay-managed root -- see `WindowManager.WindowContext` for the real
+    /// `SDL_Window`/`SDL_Renderer`/`ClayLayout`/`TTF_TextEngine` this widget
+    /// is paired with, owned outside the registry since those are main-
+    /// thread-only OS resources). Always `parent_id == null` -- a real OS
+    /// window can't be a Clay child of anything. Distinct from `floating`/
+    /// `modal`/`toast`: those all layer content *within one window's own
+    /// Clay context and draw pass*; this instead marks the boundary between
+    /// two *separate* Clay contexts/renderers entirely, so it deliberately
+    /// does NOT participate in `isFloatingOrDescendant`/`nearestFloatingRoot`
+    /// (see those functions' own doc comments) -- there's no cross-window
+    /// z-order question for them to answer. `FloatingOrder.windowSubset` is
+    /// the corresponding per-window scoping helper: given a window's own
+    /// root id (or `null` for the original startup window), it returns which
+    /// widgets belong to that window's own subtree, for main.zig's per-
+    /// window layout/hit-test/draw/text-sync passes to filter against.
+    window_root: bool = false,
 };
 
 pub const Slot = struct {
@@ -828,11 +846,25 @@ pub fn findLocked(self: *Self, id: u32) ?*Slot {
 /// established for computed geometry (see main.zig's frame loop). Each
 /// widget's own `syncText` decides whether it actually needs to touch
 /// SDL_ttf at all this frame (see e.g. `Button.syncText`'s doc comment).
-pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font: *c.TTF_Font) void {
+///
+/// Multi-window Stage 3: `allowed_ids` scopes this call to one window's own
+/// widget subset -- required, not optional, once a second `TTF_TextEngine`
+/// can exist: a `TTF_Text` is renderer-specific (created against whichever
+/// engine `syncText` is handed), so syncing a widget that belongs to window
+/// B against window A's engine would produce a `TTF_Text` window A's own
+/// renderer can't draw. Callers compute this once per frame per window via
+/// `FloatingOrder.windowSubset` over a structural snapshot (parent_id/
+/// window_root don't change from text syncing itself, so a snapshot taken
+/// just before this loop, not necessarily this exact frame's final one, is
+/// fine -- see main.zig's own per-frame ordering). This file can't import
+/// `FloatingOrder.zig` directly (that file already imports this one), so the
+/// filtering happens caller-side; this just takes the resolved id list.
+pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font: *c.TTF_Font, allowed_ids: []const u32) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     for (&self.slots) |*slot| {
         if (slot.*) |*s| {
+            if (std.mem.indexOfScalar(u32, allowed_ids, s.id) == null) continue;
             switch (s.widget) {
                 .button => |*b| b.syncText(engine, font),
                 .textfield => |*t| t.syncText(engine, font),
@@ -961,6 +993,23 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
             }
         }
     }
+}
+
+/// Multi-window Stage 3: destroys a window's own root (a `window_root`
+/// slot) and every descendant -- the cascading counterpart
+/// `natyv_destroy_widget` deliberately doesn't provide (see that function's
+/// own no-cascade contract, and `destroyExpiredWidgets`'s doc comment for
+/// why a whole-window teardown needs the cascade the same way an expired
+/// toast's does). Reuses the same two-phase `destroySubtreeLocked` every
+/// other cascading destroy path in this file already goes through. Called
+/// from `main.zig` once a window's own `WindowContext` is being torn down
+/// (an OS close request, or -- Stage 3 dev scaffolding -- a click on that
+/// window's own hardcoded close button), main thread only, same as every
+/// other window-lifecycle call.
+pub fn destroyWindowSubtree(self: *Self, call_io: Io, root_id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    self.destroySubtreeLocked(root_id);
 }
 
 /// True when `id` is a strict descendant of `root_id` (walks `parent_id`
