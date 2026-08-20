@@ -548,6 +548,43 @@ pending_scroll_into_view: ?u32 = null,
 /// already ran into this session).
 pending_file_dialog_request: ?PendingFileDialogRequest = null,
 
+/// Multi-window Stage 4: same cross-thread hand-off shape as
+/// `pending_file_dialog_request` above (real SDL/Clay/TTF window creation
+/// must happen on the main thread, but `natyv_clay_create_window` runs on
+/// the worker thread), but a real bounded *array*, not a single slot -- the
+/// file-dialog precedent's single-pending-slot shape doesn't transfer here.
+/// File dialogs are gated by a real one-at-a-time OS-modal interaction;
+/// window creation isn't -- a guest could call `natyv_clay_create_window`
+/// several times in one `natyv_dispatch` handler before the main thread ever
+/// drains anything, and a single slot would silently lose all but the last
+/// request. `main.zig`'s frame loop drains this in full every frame (not one
+/// per frame -- each materialization is cheap, no reason to throttle),
+/// calling `WindowManager.createWindowContext` for each. The widget's own
+/// `window_root` `Slot` already exists in the registry by the time this is
+/// queued (`createClayWindowHostFn` inserts it synchronously, same as every
+/// other `natyv_clay_create_*`, so the guest can parent children under it
+/// immediately) -- this queue only carries what's needed to materialize the
+/// *real* OS window a frame or so later. Named types (`PendingWindowRequest`,
+/// `max_pending_window_requests`) declared below, after every field -- same
+/// Zig field-then-decl ordering requirement `PendingFileDialogRequest` right
+/// below already runs into.
+pending_window_requests: [max_pending_window_requests]?PendingWindowRequest = [_]?PendingWindowRequest{null} ** max_pending_window_requests,
+pending_window_request_count: usize = 0,
+
+/// Multi-window Stage 4: the teardown counterpart to
+/// `pending_window_requests` above -- widget ids of `window_root` slots
+/// whose real OS resources (`WindowManager.WindowContext`) `main.zig` should
+/// tear down next frame. `natyv_destroy_window` (worker thread) has already
+/// destroyed the widget subtree itself (via `destroyWindowSubtree`, safe to
+/// call from any thread the same way every other destroy path in this file
+/// already is) by the time this is queued -- this only carries the
+/// still-pending *real* SDL/Clay/TTF teardown, which is main-thread-only.
+/// Same bounded-array-not-single-slot reasoning as the request queue above
+/// (a guest could call `natyv_destroy_window` on more than one window in a
+/// single dispatch handler).
+pending_window_teardowns: [max_pending_window_requests]?u32 = [_]?u32{null} ** max_pending_window_requests,
+pending_window_teardown_count: usize = 0,
+
 /// `allow_many` is ignored for `.save` -- `SDL_ShowSaveFileDialog` has no
 /// such parameter, only `SDL_ShowOpenFileDialog` does.
 pub const PendingFileDialogRequest = struct {
@@ -555,6 +592,76 @@ pub const PendingFileDialogRequest = struct {
     widget_id: u32,
     allow_many: bool,
 };
+
+/// Multi-window Stage 4: small fixed cap on in-flight window creation/
+/// teardown requests per frame -- same "bump later if a real need shows up"
+/// precedent `max_widgets`/`WindowManager.max_open_windows` already set. A
+/// guest realistically never queues anywhere near this many window
+/// operations in the time between two frames.
+pub const max_pending_window_requests = 8;
+
+/// A guest's requested window title, copied into this owned fixed buffer at
+/// request time -- guest memory isn't guaranteed to outlive the host call,
+/// same precedent `Button.label_buf` already established for exactly this
+/// reason. `title_len` bytes of `title_buf` are the real title; the rest is
+/// unspecified.
+pub const PendingWindowRequest = struct {
+    widget_id: u32,
+    title_buf: [64]u8,
+    title_len: usize,
+    width: f32,
+    height: f32,
+};
+
+/// Worker-thread side of the window-creation hand-off -- returns `false`
+/// (queues nothing) if the queue is already full this frame, so the caller
+/// can undo its own registry insert instead of leaving an orphaned
+/// `window_root` widget with no real window ever materializing for it.
+pub fn queueWindowRequest(self: *Self, call_io: Io, req: PendingWindowRequest) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.pending_window_request_count >= self.pending_window_requests.len) return false;
+    self.pending_window_requests[self.pending_window_request_count] = req;
+    self.pending_window_request_count += 1;
+    return true;
+}
+
+/// Main-thread side -- drains every pending request into `out` (bounded by
+/// `out.len`, though it's always sized `max_pending_window_requests` by
+/// every real caller), returns how many were written.
+pub fn takePendingWindowRequests(self: *Self, call_io: Io, out: []PendingWindowRequest) usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const n = @min(self.pending_window_request_count, out.len);
+    for (0..n) |i| out[i] = self.pending_window_requests[i].?;
+    self.pending_window_request_count = 0;
+    return n;
+}
+
+/// Worker-thread side of the window-teardown hand-off -- silently drops the
+/// request if the queue is already full this frame (same "tiny, practically
+/// unreachable leak preferable to a panic in a guest-facing host function"
+/// precedent `queuePendingTextDestroy` already establishes); the widget
+/// subtree itself is already gone from the registry by the time this would
+/// be called regardless (see this field's own doc comment), so a dropped
+/// entry here only delays real OS resource cleanup, not a correctness gap.
+pub fn queueWindowTeardown(self: *Self, call_io: Io, widget_id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.pending_window_teardown_count >= self.pending_window_teardowns.len) return;
+    self.pending_window_teardowns[self.pending_window_teardown_count] = widget_id;
+    self.pending_window_teardown_count += 1;
+}
+
+/// Main-thread side -- same drain-in-full shape as `takePendingWindowRequests`.
+pub fn takePendingWindowTeardowns(self: *Self, call_io: Io, out: []u32) usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const n = @min(self.pending_window_teardown_count, out.len);
+    for (0..n) |i| out[i] = self.pending_window_teardowns[i].?;
+    self.pending_window_teardown_count = 0;
+    return n;
+}
 
 pub const EnabledKinds = struct {
     button: bool = true,
@@ -692,7 +799,13 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
 // for Table/data grid's future virtualization.
 // W27: +1 for natyv_clay_create_range_slider.
 // W29: +1 for natyv_clay_create_spinner.
-pub const clay_host_function_count = 20;
+// Multi-window Stage 4: +2 for natyv_clay_create_window/natyv_destroy_window
+// -- the latter deliberately isn't `_clay_`-prefixed (semantically closer to
+// the generic `natyv_destroy_widget` family, just cascading), but it's a
+// real second OS window that categorically doesn't exist outside the Clay
+// backend, so it's registered here alongside its create counterpart, not in
+// registerInto's always-on block.
+pub const clay_host_function_count = 22;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
@@ -728,6 +841,8 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[17] = c.extism_function_new("natyv_scroll_into_view", &in_types[0], 1, &out_types[0], 1, HostFunctions.scrollIntoViewHostFn, self, null);
     funcs_out[18] = c.extism_function_new("natyv_clay_create_range_slider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayRangeSliderHostFn, self, null);
     funcs_out[19] = c.extism_function_new("natyv_clay_create_spinner", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySpinnerHostFn, self, null);
+    funcs_out[20] = c.extism_function_new("natyv_clay_create_window", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayWindowHostFn, self, null);
+    funcs_out[21] = c.extism_function_new("natyv_destroy_window", &in_types[0], 1, &out_types[0], 1, HostFunctions.destroyWindowHostFn, self, null);
     return clay_host_function_count;
 }
 

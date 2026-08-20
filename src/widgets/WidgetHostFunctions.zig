@@ -148,6 +148,16 @@ const ClayTabsRequest = struct { layout: ClayLayoutRequest = .{}, labels: []cons
 // checks that *some* widget exists at that id, not its kind).
 const ClayTabPanelRequest = struct { layout: ClayLayoutRequest = .{} };
 
+// Multi-window Stage 4: deliberately its own request shape, not a
+// `ClayLayoutRequest` wrapper like every widget-kind request above -- a real
+// OS window has no `parent_id` (it can't be anyone's Clay child), no
+// floating/modal/toast/scroll_* (those are all "within one window's own
+// Clay context" concepts, meaningless for the boundary between two separate
+// ones -- see `ClayStyle.window_root`'s own doc comment), and its sizing is
+// always exactly `width`/`height`, not a guest-chosen sizing *type* -- so
+// there's nothing in `ClayLayoutRequest` this would actually reuse.
+const ClayWindowRequest = struct { title: []const u8 = "", width: f32 = 400, height: f32 = 300 };
+
 fn toSizingAxis(req: ClaySizingAxisRequest) c.Clay_SizingAxis {
     return switch (req.type) {
         .fit => .{ .type = c.CLAY__SIZING_TYPE_FIT, .size = .{ .minMax = .{ .min = req.min, .max = req.max } } },
@@ -1227,4 +1237,106 @@ pub fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
         }
     }
     host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+}
+
+/// Multi-window Stage 4: creates a real second OS window. Two-part, same
+/// shape the multi-window plan's own design settled on: the `window_root`
+/// `Slot` is inserted directly into the registry right here (worker thread,
+/// safe under the same lock every other `natyv_clay_create_*` already uses)
+/// so the guest can parent children under the returned `widget_id`
+/// immediately -- but the real `SDL_Window`/`SDL_Renderer`/`ClayLayout`/
+/// `TTF_TextEngine` can only be created on the main thread, so that part is
+/// queued via `queueWindowRequest` for `main.zig`'s frame loop to drain.
+/// `parent_id` is always `null` -- a real OS window can't be a Clay child of
+/// anything, so unlike `insertClayWidget`'s shared body, there's no guest-
+/// supplied parent to validate here at all.
+pub fn createClayWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayWindowRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    var title_buf: [64]u8 = undefined;
+    const title_len = @min(req.title.len, title_buf.len);
+    @memcpy(title_buf[0..title_len], req.title[0..title_len]);
+
+    const style: ClayStyle = .{
+        .window_root = true,
+        .sizing = .{
+            .width = .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = req.width, .max = req.width } } },
+            .height = .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = req.height, .max = req.height } } },
+        },
+    };
+    const container = Container.init(std.mem.zeroes(c.SDL_FRect), false);
+
+    const call_io = self.io();
+    self.mutex.lockUncancelable(call_io);
+    const result = self.insertLockedWithLayoutValidated(.{ .container = container }, null, style, null);
+    self.mutex.unlock(call_io);
+
+    const widget_id = result catch |err| {
+        switch (err) {
+            error.NoSuchParent => unreachable, // parent_id is always null above
+            error.RegistryFull => host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{}),
+        }
+        return;
+    };
+
+    if (!self.queueWindowRequest(call_io, .{
+        .widget_id = widget_id,
+        .title_buf = title_buf,
+        .title_len = title_len,
+        .width = req.width,
+        .height = req.height,
+    })) {
+        // Too many windows requested this same frame -- undo the registry
+        // insert rather than leaving an orphaned window_root widget with no
+        // real window ever materializing for it. See
+        // `WidgetHost.pending_window_requests`' own doc comment.
+        self.destroyWindowSubtree(call_io, widget_id);
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "too many windows requested this frame", .{});
+        return;
+    }
+
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+/// Multi-window Stage 4: the cascading counterpart to `natyv_destroy_widget`
+/// for a whole window -- deliberately a separate host function, not a
+/// special case of `destroyWidgetHostFn` above, since that one's contract is
+/// explicitly no-cascade (every existing composed widget destroys its own
+/// children manually, which is untenable for "close this whole window").
+/// Rejects a `widget_id` that doesn't name a `window_root` slot, same
+/// "report a meaningful error rather than silently doing the wrong thing"
+/// precedent every other guest-facing validation in this file follows.
+/// Destroys the widget subtree immediately (safe from the worker thread,
+/// same as every other destroy path -- see `destroyWindowSubtree`'s own doc
+/// comment) and queues the real OS-resource teardown for `main.zig`'s frame
+/// loop to drain, same two-part shape `createClayWindowHostFn` above uses.
+pub fn destroyWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const call_io = self.io();
+    self.mutex.lockUncancelable(call_io);
+    const slot = self.findLocked(req.widget_id);
+    const is_window = if (slot) |s| s.clay_style.window_root else false;
+    self.mutex.unlock(call_io);
+
+    if (!is_window) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "widget {d} is not a window", .{req.widget_id});
+        return;
+    }
+
+    self.destroyWindowSubtree(call_io, req.widget_id);
+    self.queueWindowTeardown(call_io, req.widget_id);
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }

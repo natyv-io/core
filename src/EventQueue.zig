@@ -56,7 +56,17 @@ const Self = @This();
 /// fires. Discrete, not coalesced -- a guest awaiting a real dialog result needs the actual result,
 /// not whatever happened to still be queued, same reasoning `.click`/`.dismiss`/`.blur`/`.key_nav`
 /// already established.
-pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll, file_selected };
+///
+/// Multi-window Stage 4: `.window_close_requested` (empty payload) is fired to a window's own
+/// `window_root` widget id when the OS reports `SDL_EVENT_WINDOW_CLOSE_REQUESTED` for that window (see
+/// `main.zig`'s own doc comment on this handling) -- never fired for the original startup window,
+/// which quits the whole app unconditionally instead. The host does not destroy anything on its own;
+/// if the guest never handles this (or handles it and does nothing), the window just stays open. Same
+/// deliberate idiom as Escape-on-a-modal-with-no-handler already being a no-op (see `ClayStyle.modal`'s
+/// own doc comment), and what makes an "unsaved changes?" veto flow possible at near-zero extra cost.
+/// Discrete, not coalesced -- same reasoning `.dismiss` already established: a guest deciding whether
+/// to actually close needs every request, not just whichever happened to still be queued.
+pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll, file_selected, window_close_requested };
 
 pub const Entry = struct {
     widget_id: u32,

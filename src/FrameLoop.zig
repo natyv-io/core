@@ -398,9 +398,6 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
 /// single-window body already established: before any event in this
 /// window is processed).
 ///
-/// Stage 3 dev scaffolding: a click that resolves to `wctx.dev_close_button_id`
-/// sets `wctx.pending_close` -- see that field's own doc comment. Deleted in
-/// Stage 4 once a real guest-facing close affordance exists.
 pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []const WidgetHost.Slot, is_floating: []const bool, topmost_modal: ?u32, event: c.SDL_Event) void {
     switch (event.type) {
         c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
@@ -437,11 +434,6 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                     }
                 }
                 updateFocus(widgets, io, queue, wctx, slots, hit_focusable);
-
-                // Stage 3 dev scaffolding -- see WindowContext.dev_close_button_id.
-                if (wctx.dev_close_button_id) |close_id| {
-                    if (hit_focusable == close_id) wctx.pending_close = true;
-                }
             }
         },
         c.SDL_EVENT_MOUSE_BUTTON_UP => {

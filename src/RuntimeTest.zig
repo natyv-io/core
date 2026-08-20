@@ -31,6 +31,7 @@ const ScrollBar = @import("ScrollBar.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
+const FloatingOrder = @import("FloatingOrder.zig");
 
 test "bookstore example: guest-declared UI end to end through natyv_init + natyv_dispatch" {
     const allocator = std.testing.allocator;
@@ -4646,4 +4647,152 @@ test "Multi-window Stage 2: two ClayLayout instances alive at once don't clobber
     // some corrupted mix of the two -- and B independently tracked its own.
     try std.testing.expectApproxEqAbs(@as(f32, 300), rect_a_w, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 600), width_b, 0.01);
+}
+
+// Multi-window Stage 4: the fixture guest's own "CreateWindowTest"/
+// "DestroyWindowTest" natyv_test_hook cases (see clay-fixture/guest/main.go's
+// own doc comment on them) exist purely so these two tests can exercise
+// natyv_clay_create_window/natyv_destroy_window through a real compiled
+// guest -- real JSON over real guest memory (host_fn_util.readGuestBytes/
+// writeGuestBytes need a real ExtismCurrentPlugin*, which only exists during
+// an actual plugin call), not a hand-constructed Extism call a host-side-only
+// unit test could fake. No sdk/go/widgets/window.go wrapper exists yet
+// (that's Stage 5) -- the fixture declares its own minimal
+// //go:wasmimport natyv_clay_create_window/natyv_destroy_window instead,
+// same low-level shape every real sdk/go/widgets/*.go file already uses.
+const CreateWindowTestResponse = struct { widget_id: u32, child_id: u32 };
+
+test "Multi-window Stage 4: natyv_clay_create_window returns a usable widget_id immediately, and its subtree resolves through FloatingOrder like any other window" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    const resp_bytes = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"CreateWindowTest\"}") orelse return error.CallFailed;
+    const parsed = try std.json.parseFromSlice(CreateWindowTestResponse, allocator, resp_bytes, .{});
+    defer parsed.deinit();
+    const window_id = parsed.value.widget_id;
+    const child_id = parsed.value.child_id;
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+
+    var window_slot: ?WidgetHost.Slot = null;
+    var child_slot: ?WidgetHost.Slot = null;
+    for (snap[0..n]) |slot| {
+        if (slot.id == window_id) window_slot = slot;
+        if (slot.id == child_id) child_slot = slot;
+    }
+    const ws = window_slot orelse return error.MissingWindow;
+    const cs = child_slot orelse return error.MissingChild;
+
+    // The window_root marker flag round-tripped, `parent_id` is always
+    // null (a real OS window can't be a Clay child), and sizing was forced
+    // to Fixed(400, 300) -- the fixture's own createWindowTest request
+    // values, see main.go's own doc comment on the test-hook case.
+    try std.testing.expect(ws.clay_style.window_root);
+    try std.testing.expectEqual(@as(?u32, null), ws.parent_id);
+    try std.testing.expectEqual(c.CLAY__SIZING_TYPE_FIXED, ws.clay_style.sizing.width.type);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), ws.clay_style.sizing.width.size.minMax.min, 0.01);
+    try std.testing.expectEqual(c.CLAY__SIZING_TYPE_FIXED, ws.clay_style.sizing.height.type);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), ws.clay_style.sizing.height.size.minMax.min, 0.01);
+
+    // The child button was parented under the window's own widget_id --
+    // proves a guest can parent children onto a just-created window
+    // immediately, before the real OS window has even materialized on the
+    // main thread (that only happens once main.zig's frame loop drains
+    // WidgetHost.pending_window_requests, which never runs in this
+    // headless test at all).
+    try std.testing.expectEqual(@as(?u32, window_id), cs.parent_id);
+
+    // surface_id resolution: FloatingOrder.surfaceIdFor recognizes
+    // window_root the same way it already recognizes modal -- the window's
+    // own widget_id is its own surface_id, and its child's surface_id
+    // resolves to the same window, not 0 (root/main surface).
+    try std.testing.expectEqual(window_id, FloatingOrder.surfaceIdFor(snap[0..n], window_id));
+    try std.testing.expectEqual(window_id, FloatingOrder.surfaceIdFor(snap[0..n], child_id));
+
+    // windowSubset returns exactly this window's own root + child, nothing
+    // from the fixture's own baseline (original-window) content.
+    var subset_ids: [WidgetHost.max_widgets]u32 = undefined;
+    const subset_n = FloatingOrder.windowSubset(snap[0..n], window_id, &subset_ids);
+    try std.testing.expectEqual(@as(usize, 2), subset_n);
+    try std.testing.expect(std.mem.indexOfScalar(u32, subset_ids[0..subset_n], window_id) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u32, subset_ids[0..subset_n], child_id) != null);
+}
+
+test "Multi-window Stage 4: natyv_destroy_window cascades to the whole window subtree, mirroring destroyWindowSubtree's own contract" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    const create_resp = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"CreateWindowTest\"}") orelse return error.CallFailed;
+    const parsed = try std.json.parseFromSlice(CreateWindowTestResponse, allocator, create_resp, .{});
+    defer parsed.deinit();
+    const window_id = parsed.value.widget_id;
+    const child_id = parsed.value.child_id;
+
+    var before_snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    const before_n = runtime.widgets.snapshot(io, &before_snap);
+
+    var buf: [64]u8 = undefined;
+    const destroy_payload = try std.fmt.bufPrint(&buf, "{{\"widget_id\":{d},\"event_type\":\"DestroyWindowTest\"}}", .{window_id});
+    _ = runtime.call(io, "natyv_test_hook", destroy_payload) orelse return error.CallFailed;
+
+    var after_snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    const after_n = runtime.widgets.snapshot(io, &after_snap);
+
+    // Exactly the window's own root + its one child are gone -- nothing
+    // else in the registry (the fixture's own large baseline content) was
+    // touched, same "narrowly-scoped cascade" contract destroyWindowSubtree
+    // documents for itself.
+    try std.testing.expectEqual(before_n - 2, after_n);
+    for (after_snap[0..after_n]) |slot| {
+        try std.testing.expect(slot.id != window_id);
+        try std.testing.expect(slot.id != child_id);
+    }
+}
+
+test "Multi-window Stage 4: a synthetic .window_close_requested event round-trips through EventQueue like any other discrete event" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var queue = EventQueue.init(allocator);
+    defer queue.deinit();
+
+    // Discrete, not coalesced -- pushing it twice for the same widget_id
+    // must leave both entries queued, same "every request matters" reasoning
+    // .dismiss already established (see EventType's own doc comment).
+    queue.push(io, 7, .window_close_requested, "", 7);
+    queue.push(io, 7, .window_close_requested, "", 7);
+
+    const first = queue.pop(io) orelse return error.MissingEvent;
+    defer queue.freeEntry(first);
+    try std.testing.expectEqual(@as(u32, 7), first.widget_id);
+    try std.testing.expectEqual(EventQueue.EventType.window_close_requested, first.event_type);
+    try std.testing.expectEqualStrings("", first.payload);
+    try std.testing.expectEqual(@as(u32, 7), first.surface_id);
+
+    const second = queue.pop(io) orelse return error.MissingEvent;
+    defer queue.freeEntry(second);
+    try std.testing.expectEqual(EventQueue.EventType.window_close_requested, second.event_type);
 }

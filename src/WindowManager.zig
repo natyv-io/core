@@ -14,15 +14,12 @@
 //! existed). `FloatingOrder.windowSubset` is the query that turns this id
 //! into "which widgets belong to this window."
 //!
-//! Stage 3 scope: a hardcoded second window, created directly via
-//! `createWindowContext` from main.zig's own dev-only scaffolding (no
-//! guest-facing wire surface exists yet). The real guest-facing
-//! `natyv_clay_create_window`/`natyv_destroy_window` host functions, their
-//! bounded pending-request queue, and the async create/teardown flow the
-//! multi-window plan describes are Stage 4 -- this file's `createWindowContext`/
-//! `destroyWindowContext` are the synchronous, main-thread-only mechanics
-//! Stage 4's queue-draining code will call into, not a replacement for the
-//! queue itself.
+//! Multi-window Stage 4: `createWindowContext`/`destroyWindowContext` are
+//! the synchronous, main-thread-only mechanics -- `main.zig`'s frame loop
+//! calls into them once per frame while draining `WidgetHost`'s own
+//! `pending_window_requests`/`pending_window_teardowns` queues (see those
+//! fields' own doc comments for the guest-facing `natyv_clay_create_window`/
+//! `natyv_destroy_window` host functions that populate them).
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -55,22 +52,6 @@ pub const WindowContext = struct {
     /// establish.
     scrolled_ids: [WidgetHost.max_widgets]u32 = undefined,
     scrolled_count: usize = 0,
-    /// Set once (by an `SDL_EVENT_WINDOW_CLOSE_REQUESTED` for this window,
-    /// or -- Stage 3 dev scaffolding, see `dev_close_button_id` below -- a
-    /// click on this window's own hardcoded close button) and drained once
-    /// per frame after that frame's drawing finishes: this window's own
-    /// layout/text-sync/draw passes are skipped for the remainder of the
-    /// frame they're set on, and the window is torn down right after. Never
-    /// set for the original startup window (`root_widget_id == null`) --
-    /// closing that one sets `running = false` instead, unconditional quit,
-    /// same as today.
-    pending_close: bool = false,
-    /// Stage 3 dev-only scaffolding: the widget id of this window's own
-    /// hardcoded "close this window" Button, if it has one -- deleted in
-    /// Stage 4 once a real guest-facing close affordance (a guest-declared
-    /// Button calling `natyv_destroy_window` itself) supersedes it. `null`
-    /// for the original startup window, which has no such button.
-    dev_close_button_id: ?u32 = null,
 };
 
 /// Creates a real second OS window: `SDL_Window` + `SDL_Renderer` + (when
