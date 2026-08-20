@@ -18,6 +18,7 @@ const DrawBatcher = @import("DrawBatcher.zig");
 const ScrollClip = @import("ScrollClip.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
+const InteractionState = @import("InteractionState.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -592,32 +593,12 @@ pub fn main(init: std.process.Init) !void {
     defer if (arrow_cursor) |cur| c.SDL_DestroyCursor(cur);
     const pointer_cursor = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_POINTER);
     defer if (pointer_cursor) |cur| c.SDL_DestroyCursor(cur);
-    var cursor_is_pointer = false;
-
-    var focused_widget_id: ?u32 = null;
-    // W3: which slider (if any) is currently being dragged -- set on
-    // MOUSE_BUTTON_DOWN when the click lands on a slider, cleared
-    // unconditionally on MOUSE_BUTTON_UP regardless of where the mouse
-    // currently is (standard drag semantics: releasing outside the widget's
-    // bounds still ends the drag). Not stored on the widget itself, same
-    // "main.zig owns interaction state, WidgetHost owns widget state"
-    // split `focused_widget_id` already establishes.
-    var dragging_slider_id: ?u32 = null;
-    // W27: which handle `dragging_slider_id` (above) is currently moving,
-    // when it names a RangeSlider -- see tryHitWidget's own doc comment for
-    // why this can't just be read back from the widget itself via
-    // `widget_snapshot` in the same frame it was chosen.
-    var dragging_range_handle: ?RangeSlider.Handle = null;
-
-    // W15: which widget (if any) the mouse is currently continuously over,
-    // when that hover started, and which widget (if any) we've already
-    // fired `.hover true` for -- `tooltip_active_for` is tracked
-    // separately from `hovered_widget_id` so hover-out only ever fires
-    // `.hover false` for a widget that actually crossed the threshold and
-    // got a `true` sent, never for one the mouse merely brushed past.
-    var hovered_widget_id: ?u32 = null;
-    var hover_start_ms: ?i64 = null;
-    var tooltip_active_for: ?u32 = null;
+    // Multi-window Stage 1: every per-frame interaction local that used to
+    // be declared bare right here (focus, drag, hover/tooltip, cursor,
+    // pending scroll, mouse position) now lives on one bundled struct -- see
+    // InteractionState.zig's own doc comment for why. Pure extraction, same
+    // fields, same defaults, same lifetime as before.
+    var interaction: InteractionState = .{};
 
     std.debug.print("[main] window open -- close it to quit.\n", .{});
 
@@ -644,9 +625,8 @@ pub fn main(init: std.process.Init) !void {
     // events runs after layoutIfNeeded's call site (see the ordering note
     // below), so this is a deliberate one-frame lag, same idea as
     // EventQueue's own "drain once per frame" discrete-event handling
-    // elsewhere in this codebase.
-    var pending_scroll_dx: f32 = 0;
-    var pending_scroll_dy: f32 = 0;
+    // elsewhere in this codebase. Lives on `interaction` now -- see
+    // InteractionState.zig.
     // Pixels of scroll per SDL wheel "notch" (event.wheel.x/y), before
     // Clay's own internal *10 multiplier on top of that (see
     // Clay_UpdateScrollContainers) -- tuned so one notch moves roughly one
@@ -654,9 +634,7 @@ pub fn main(init: std.process.Init) !void {
     const wheel_pixels_per_notch: f32 = 4.0;
 
     while (running) {
-        var mouse_x: f32 = undefined;
-        var mouse_y: f32 = undefined;
-        const mouse_buttons = c.SDL_GetMouseState(&mouse_x, &mouse_y);
+        const mouse_buttons = c.SDL_GetMouseState(&interaction.mouse_x, &interaction.mouse_y);
 
         // Must run before this frame's snapshot below, not after -- so
         // that if a real Clay recompute happens this frame, the freshly
@@ -672,10 +650,10 @@ pub fn main(init: std.process.Init) !void {
             var win_w: c_int = undefined;
             var win_h: c_int = undefined;
             _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
-            scrolled_count = clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), mouse_x, mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0, pending_scroll_dx, pending_scroll_dy, &scrolled_ids);
+            scrolled_count = clay_layout.layoutIfNeeded(&runtime.widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), interaction.mouse_x, interaction.mouse_y, (mouse_buttons & c.SDL_BUTTON_LMASK) != 0, interaction.pending_scroll_dx, interaction.pending_scroll_dy, &scrolled_ids);
         }
-        pending_scroll_dx = 0;
-        pending_scroll_dy = 0;
+        interaction.pending_scroll_dx = 0;
+        interaction.pending_scroll_dy = 0;
 
         // F3: a guest destroying a widget (natyv_destroy_widget, called on
         // the worker thread inside natyv_dispatch) can't destroy its
@@ -794,7 +772,7 @@ pub fn main(init: std.process.Init) !void {
                             // close one.
                             for (widget_snapshot[0..widget_count]) |slot| {
                                 if (!FloatingOrder.isDescendantOfOrSelf(widget_snapshot[0..widget_count], slot.id, modal_id)) continue;
-                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id, &dragging_range_handle)) |id| hit_focusable = id;
+                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &interaction.dragging_slider_id, &interaction.dragging_range_handle)) |id| hit_focusable = id;
                             }
                         } else {
                             // W4: floating content (e.g. an open dropdown's
@@ -845,16 +823,16 @@ pub fn main(init: std.process.Init) !void {
                                 if (topmost_floating_root) |root| {
                                     if (FloatingOrder.nearestFloatingRoot(widget_snapshot[0..widget_count], slot.id) != root) continue;
                                 }
-                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id, &dragging_range_handle)) |id| hit_focusable = id;
+                                if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &interaction.dragging_slider_id, &interaction.dragging_range_handle)) |id| hit_focusable = id;
                             }
                             if (hit_focusable == null) {
                                 for (widget_snapshot[0..widget_count], is_floating[0..widget_count]) |slot, floating| {
                                     if (floating) continue;
-                                    if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &dragging_slider_id, &dragging_range_handle)) |id| hit_focusable = id;
+                                    if (tryHitWidget(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count], slot, mx, my, &interaction.dragging_slider_id, &interaction.dragging_range_handle)) |id| hit_focusable = id;
                                 }
                             }
                         }
-                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &focused_widget_id, hit_focusable);
+                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &interaction.focused_widget_id, hit_focusable);
                     }
                 },
                 c.SDL_EVENT_MOUSE_BUTTON_UP => {
@@ -863,12 +841,12 @@ pub fn main(init: std.process.Init) !void {
                     // semantics (releasing outside the widget's bounds
                     // still stops it).
                     if (event.button.button == c.SDL_BUTTON_LEFT) {
-                        dragging_slider_id = null;
-                        dragging_range_handle = null;
+                        interaction.dragging_slider_id = null;
+                        interaction.dragging_range_handle = null;
                     }
                 },
                 c.SDL_EVENT_TEXT_INPUT => {
-                    if (focused_widget_id) |id| {
+                    if (interaction.focused_widget_id) |id| {
                         var text_buf: [max_text_widget_len]u8 = undefined;
                         if (runtime.widgets.appendTextTo(io, id, std.mem.span(event.text.text), &text_buf)) |n| {
                             notifyTextChanged(&queue, io, id, text_buf[0..n], widget_snapshot[0..widget_count]);
@@ -881,11 +859,11 @@ pub fn main(init: std.process.Init) !void {
                     // directly with SDL's raw wheel.x/y sign, not inverted.
                     // The original negation was based on a scroll-convention
                     // assumption that turned out backwards in practice.
-                    pending_scroll_dx += event.wheel.x * wheel_pixels_per_notch;
-                    pending_scroll_dy += event.wheel.y * wheel_pixels_per_notch;
+                    interaction.pending_scroll_dx += event.wheel.x * wheel_pixels_per_notch;
+                    interaction.pending_scroll_dy += event.wheel.y * wheel_pixels_per_notch;
                 },
                 c.SDL_EVENT_KEY_DOWN => switch (event.key.key) {
-                    c.SDLK_BACKSPACE => if (focused_widget_id) |id| {
+                    c.SDLK_BACKSPACE => if (interaction.focused_widget_id) |id| {
                         var text_buf: [max_text_widget_len]u8 = undefined;
                         if (runtime.widgets.backspaceOn(io, id, &text_buf)) |n| {
                             notifyTextChanged(&queue, io, id, text_buf[0..n], widget_snapshot[0..widget_count]);
@@ -895,8 +873,8 @@ pub fn main(init: std.process.Init) !void {
                         var focusable_ids: [max_widgets_on_screen]u32 = undefined;
                         const focusable_count = runtime.widgets.focusableIdsSorted(io, &focusable_ids);
                         const forward = (event.key.mod & c.SDL_KMOD_SHIFT) == 0;
-                        const next = WidgetHost.nextFocusable(focusable_ids[0..focusable_count], focused_widget_id, forward);
-                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &focused_widget_id, next);
+                        const next = WidgetHost.nextFocusable(focusable_ids[0..focusable_count], interaction.focused_widget_id, forward);
+                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &interaction.focused_widget_id, next);
                     },
                     c.SDLK_RETURN, c.SDLK_KP_ENTER, c.SDLK_SPACE => {
                         // Activates a focused Button/Checkbox/RadioButton --
@@ -905,7 +883,7 @@ pub fn main(init: std.process.Init) !void {
                         // SDL_EVENT_TEXT_INPUT instead, not this key-down
                         // path. `activateWidget` itself no-ops for any kind
                         // that isn't activatable.
-                        if (focused_widget_id) |id| {
+                        if (interaction.focused_widget_id) |id| {
                             for (widget_snapshot[0..widget_count]) |slot| {
                                 if (slot.id == id) {
                                     activateWidget(&runtime.widgets, io, &queue, id, std.meta.activeTag(slot.widget), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
@@ -947,7 +925,7 @@ pub fn main(init: std.process.Init) !void {
                     c.SDLK_ESCAPE => if (topmost_modal) |modal_id| {
                         queue.push(io, modal_id, .dismiss, "", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], modal_id));
                     } else {
-                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &focused_widget_id, null);
+                        updateFocus(&runtime.widgets, io, window, &queue, widget_snapshot[0..widget_count], &interaction.focused_widget_id, null);
                     },
                     // W3: nudges the *focused* widget's value if it's a
                     // slider -- confirmed unbound by anything else in this
@@ -972,7 +950,7 @@ pub fn main(init: std.process.Init) !void {
                     // new host concept: the guest just handles `key_nav`
                     // "left"/"right" for the two button ids it cares about
                     // and ignores it for every other focused Button.
-                    c.SDLK_LEFT => if (focused_widget_id) |id| {
+                    c.SDLK_LEFT => if (interaction.focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             const surface_id = FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id);
                             if (slot.id != id) continue;
@@ -994,7 +972,7 @@ pub fn main(init: std.process.Init) !void {
                             }
                         }
                     },
-                    c.SDLK_RIGHT => if (focused_widget_id) |id| {
+                    c.SDLK_RIGHT => if (interaction.focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             const surface_id = FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id);
                             if (slot.id != id) continue;
@@ -1009,7 +987,7 @@ pub fn main(init: std.process.Init) !void {
                             }
                         }
                     },
-                    c.SDLK_DOWN => if (focused_widget_id) |id| {
+                    c.SDLK_DOWN => if (interaction.focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
@@ -1027,7 +1005,7 @@ pub fn main(init: std.process.Init) !void {
                             }
                         }
                     },
-                    c.SDLK_UP => if (focused_widget_id) |id| {
+                    c.SDLK_UP => if (interaction.focused_widget_id) |id| {
                         for (widget_snapshot[0..widget_count]) |slot| {
                             if (slot.id == id and slot.widget == .slider) {
                                 notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
@@ -1052,10 +1030,10 @@ pub fn main(init: std.process.Init) !void {
         // rather than a dedicated MOUSE_MOTION handler. This one block
         // covers both "jump to click position" and "continue following the
         // drag" -- no separate code path needed for the click-to-jump case.
-        if (dragging_slider_id) |id| {
+        if (interaction.dragging_slider_id) |id| {
             for (widget_snapshot[0..widget_count]) |slot| {
                 if (slot.id == id and slot.widget == .slider) {
-                    notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.valueFromX(mouse_x), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                    notifySliderValue(&runtime.widgets, io, &queue, id, slot.widget.slider.valueFromX(interaction.mouse_x), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                 } else if (slot.id == id and slot.widget == .range_slider) {
                     // W27: moves whichever handle tryHitWidget's mouse-down
                     // resolved as active (RangeSlider.closestHandle) --
@@ -1066,8 +1044,8 @@ pub fn main(init: std.process.Init) !void {
                     // tryHitWidget's own doc comment for the same-frame
                     // staleness bug that distinction fixes (a real one,
                     // Quinn's own click-through caught it).
-                    const handle = dragging_range_handle orelse slot.widget.range_slider.active_handle;
-                    notifyRangeSliderValue(&runtime.widgets, io, &queue, id, handle, slot.widget.range_slider.valueFromX(mouse_x), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
+                    const handle = interaction.dragging_range_handle orelse slot.widget.range_slider.active_handle;
+                    notifyRangeSliderValue(&runtime.widgets, io, &queue, id, handle, slot.widget.range_slider.valueFromX(interaction.mouse_x), FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
                 }
             }
         }
@@ -1094,47 +1072,47 @@ pub fn main(init: std.process.Init) !void {
             // `visible` skip, ancestor-aware for the same reason.
             if (!WidgetHost.isEffectivelyVisible(widget_snapshot[0..widget_count], slot)) continue;
             switch (slot.widget) {
-                .button => |b| if (b.containsPoint(mouse_x, mouse_y)) {
+                .button => |b| if (b.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .textfield => |t| if (t.containsPoint(mouse_x, mouse_y)) {
+                .textfield => |t| if (t.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .textarea => |ta| if (ta.containsPoint(mouse_x, mouse_y)) {
+                .textarea => |ta| if (ta.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .checkbox => |cb| if (cb.containsPoint(mouse_x, mouse_y)) {
+                .checkbox => |cb| if (cb.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .toggle => |tg| if (tg.containsPoint(mouse_x, mouse_y)) {
+                .toggle => |tg| if (tg.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .radio_button => |r| if (r.containsPoint(mouse_x, mouse_y)) {
+                .radio_button => |r| if (r.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .slider => |s| if (s.containsPoint(mouse_x, mouse_y)) {
+                .slider => |s| if (s.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .range_slider => |rs| if (rs.containsPoint(mouse_x, mouse_y)) {
+                .range_slider => |rs| if (rs.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .numeric_stepper => |ns| if (ns.containsPoint(mouse_x, mouse_y)) {
+                .numeric_stepper => |ns| if (ns.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .segmented_control => |sc| if (sc.containsPoint(mouse_x, mouse_y)) {
+                .segmented_control => |sc| if (sc.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
-                .tabs => |tb| if (tb.containsPoint(mouse_x, mouse_y)) {
+                .tabs => |tb| if (tb.containsPoint(interaction.mouse_x, interaction.mouse_y)) {
                     hovering_any = true;
                     hovered_widget_id_this_frame = slot.id;
                 },
@@ -1146,8 +1124,8 @@ pub fn main(init: std.process.Init) !void {
                 .spinner => {},
             }
         }
-        if (hovering_any != cursor_is_pointer) {
-            cursor_is_pointer = hovering_any;
+        if (hovering_any != interaction.cursor_is_pointer) {
+            interaction.cursor_is_pointer = hovering_any;
             _ = c.SDL_SetCursor(if (hovering_any) pointer_cursor else arrow_cursor);
         }
 
@@ -1159,23 +1137,23 @@ pub fn main(init: std.process.Init) !void {
         // been hovered continuously past the threshold, fire `.hover true`
         // exactly once (guarded by `tooltip_active_for` so it doesn't
         // refire every subsequent frame).
-        if (hovered_widget_id_this_frame != hovered_widget_id) {
-            if (tooltip_active_for) |active_id| {
-                if (hovered_widget_id) |prev_id| {
+        if (hovered_widget_id_this_frame != interaction.hovered_widget_id) {
+            if (interaction.tooltip_active_for) |active_id| {
+                if (interaction.hovered_widget_id) |prev_id| {
                     if (active_id == prev_id) {
                         queue.push(io, prev_id, .hover, "{\"hovering\":false}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], prev_id));
                     }
                 }
-                tooltip_active_for = null;
+                interaction.tooltip_active_for = null;
             }
-            hovered_widget_id = hovered_widget_id_this_frame;
-            hover_start_ms = if (hovered_widget_id_this_frame != null) timing.nowMs() else null;
+            interaction.hovered_widget_id = hovered_widget_id_this_frame;
+            interaction.hover_start_ms = if (hovered_widget_id_this_frame != null) timing.nowMs() else null;
         } else if (hovered_widget_id_this_frame) |id| {
-            if (hover_start_ms) |start| {
-                const already_active = if (tooltip_active_for) |active_id| active_id == id else false;
+            if (interaction.hover_start_ms) |start| {
+                const already_active = if (interaction.tooltip_active_for) |active_id| active_id == id else false;
                 if (timing.nowMs() - start >= tooltip_hover_threshold_ms and !already_active) {
                     queue.push(io, id, .hover, "{\"hovering\":true}", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], id));
-                    tooltip_active_for = id;
+                    interaction.tooltip_active_for = id;
                 }
             }
         }
