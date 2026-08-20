@@ -4021,7 +4021,7 @@ test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen chi
     // Clamped to exactly -80 (content_h 180 - container_h 100), not merely
     // "moved some amount" -- same clamp-exactness discipline the W2 scroll
     // test above already holds itself to.
-    var sd = ClayLayout.scrollContainerData(scroll_id) orelse return error.MissingScrollData;
+    var sd = clay_layout.scrollContainerData(scroll_id) orelse return error.MissingScrollData;
     try std.testing.expectApproxEqAbs(@as(f32, -80), sd.scroll_offset_y, 0.5);
 
     // The correction is live in Clay's own storage immediately, but `.rect`
@@ -4042,7 +4042,7 @@ test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen chi
     // above -- a 100px viewport can't show all 180px of content at once --
     // so it's not a valid "already visible" case to test here.)
     ClayLayout.applyScrollIntoView(snap[0..n], &runtime.widgets, child_ids[2]);
-    sd = ClayLayout.scrollContainerData(scroll_id) orelse return error.MissingScrollData;
+    sd = clay_layout.scrollContainerData(scroll_id) orelse return error.MissingScrollData;
     try std.testing.expectApproxEqAbs(@as(f32, -80), sd.scroll_offset_y, 0.5);
 }
 
@@ -4091,7 +4091,7 @@ test "Scroll-into-view: natyv_get_scroll_position's Slot.scroll_data mirror matc
     }
     const scid = scroll_id orelse return error.MissingScrollContainer;
 
-    const live = ClayLayout.scrollContainerData(scid) orelse return error.MissingScrollData;
+    const live = clay_layout.scrollContainerData(scid) orelse return error.MissingScrollData;
     var mirrored: ?ScrollBar.Data = null;
     for (snap[0..n]) |slot| {
         if (slot.id == scid) mirrored = slot.scroll_data;
@@ -4176,7 +4176,7 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
     // below the fold at the default scroll position, not merely assumed to.
     try std.testing.expect(header_rect.y > root_rect.y + root_rect.h);
 
-    const scroll_before = ClayLayout.scrollContainerData(rid) orelse return error.MissingScrollData;
+    const scroll_before = clay_layout.scrollContainerData(rid) orelse return error.MissingScrollData;
 
     var dispatch_buf: [256]u8 = undefined;
     const payload = try buildDispatchEnvelope(&dispatch_buf, h1, "click", "");
@@ -4194,7 +4194,7 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
         return error.NoScrollIntoViewQueued;
     }
 
-    const scroll_after = ClayLayout.scrollContainerData(rid) orelse return error.MissingScrollData;
+    const scroll_after = clay_layout.scrollContainerData(rid) orelse return error.MissingScrollData;
     // The real regression proof: the click didn't just reveal the content
     // (already covered by the plain Accordion Pattern B test above), it
     // also actually moved the viewport -- not left it clipped off-screen,
@@ -4533,4 +4533,88 @@ test "File picker: a real .file_selected event reaches OnFileSelected for the ri
         if (slot.widget == .label and std.mem.eql(u8, slot.widget.label.text(), "Save: cancelled")) save_cancelled_seen = true;
     }
     try std.testing.expect(save_cancelled_seen);
+}
+
+test "Multi-window Stage 2: two ClayLayout instances alive at once don't clobber each other's Clay context" {
+    // Real regression catcher for the bug this stage fixes: `ClayLayout.init`
+    // used to discard `Clay_Initialize`'s real context handle entirely, and
+    // neither `layoutIfNeeded` nor `scrollContainerData` ever called
+    // `Clay_SetCurrentContext` to select a specific instance -- silently
+    // correct only because exactly one `ClayLayout` had ever existed in the
+    // process. This creates two, back-to-back, and interleaves real layout
+    // passes on both -- provable *before* main.zig ever runs two at once
+    // (that's Stage 3). If context switching were still missing, running
+    // instance B's own Clay_BeginLayout/EndLayout in between A's two passes
+    // would corrupt or misattribute A's own state (Clay's "current context"
+    // is process-global C state), showing up here as A's geometry silently
+    // becoming wrong or Clay's own error handler firing after B runs.
+    //
+    // Deliberately synthetic widgets (`insertWithLayout`, same pattern the
+    // W16 flip tests above already use), not the real clay-fixture wasm --
+    // a single GROW-width child with no siblings is a known, deterministic
+    // relationship to whatever window_w gets passed, unlike the real app's
+    // widgets (e.g. "Grow Button" lives inside a *fixed*-width 300px
+    // column, so varying window_w wouldn't move it at all and would prove
+    // nothing either way -- caught by this test's own first draft actually
+    // failing that comparison, not by inspection).
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime_a = try Runtime.init(allocator, null);
+    defer runtime_a.deinit();
+    var runtime_b = try Runtime.init(allocator, null);
+    defer runtime_b.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    // Different widths (300 vs 600) so a real mixup between the two
+    // instances is directly observable -- a lone GROW-width child of the
+    // synthetic root has no siblings/fixed-width ancestors to absorb the
+    // extra space, so it must track window_w exactly.
+    var clay_layout_a = try ClayLayout.init(allocator, 300, 100, font_cap.font);
+    defer clay_layout_a.deinit(allocator);
+    var clay_layout_b = try ClayLayout.init(allocator, 600, 100, font_cap.font);
+    defer clay_layout_b.deinit(allocator);
+
+    const grow_axis: c.Clay_Sizing = .{ .width = .{ .type = c.CLAY__SIZING_TYPE_GROW, .size = .{ .minMax = .{ .min = 0, .max = std.math.floatMax(f32) } } }, .height = fixedAxis(50) };
+    const child_a_id = runtime_a.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = grow_axis,
+    }) orelse return error.RegistryFull;
+    const child_b_id = runtime_b.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = grow_axis,
+    }) orelse return error.RegistryFull;
+
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+
+    // Interleaved on purpose -- A, then B, then A again -- so any state
+    // leakage between the two would have a chance to show up on A's second
+    // pass, not just on whichever instance happened to run last.
+    _ = clay_layout_a.layoutIfNeeded(&runtime_a.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch);
+    _ = clay_layout_b.layoutIfNeeded(&runtime_b.widgets, io, 600, 100, 0, 0, false, 0, 0, &scroll_scratch);
+    _ = clay_layout_a.layoutIfNeeded(&runtime_a.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch);
+
+    var snap_a: [8]WidgetHost.Slot = undefined;
+    const n_a = runtime_a.widgets.snapshot(io, &snap_a);
+    var width_a: ?f32 = null;
+    for (snap_a[0..n_a]) |slot| {
+        if (slot.id == child_a_id) width_a = slot.widget.container.rect.w;
+    }
+    const rect_a_w = width_a orelse return error.MissingChildA;
+
+    var snap_b: [8]WidgetHost.Slot = undefined;
+    const n_b = runtime_b.widgets.snapshot(io, &snap_b);
+    var rect_b_w: ?f32 = null;
+    for (snap_b[0..n_b]) |slot| {
+        if (slot.id == child_b_id) rect_b_w = slot.widget.container.rect.w;
+    }
+    const width_b = rect_b_w orelse return error.MissingChildB;
+
+    // A's third pass (run *after* B's real Clay_BeginLayout/EndLayout ran
+    // in between) still tracked its own 300px window, not B's 600px one or
+    // some corrupted mix of the two -- and B independently tracked its own.
+    try std.testing.expectApproxEqAbs(@as(f32, 300), rect_a_w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 600), width_b, 0.01);
 }

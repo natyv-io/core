@@ -1269,11 +1269,11 @@ pub fn main(init: std.process.Init) !void {
         // declared. Drawn unclipped -- ScrollBar.zig insets the thumb inside
         // its own container's rect already, so it never needs cropping
         // against an ancestor's clip rect the way scrolled *content* does.
-        if (maybe_clay_layout != null) {
+        if (maybe_clay_layout) |clay_layout| {
             for (widget_snapshot[0..widget_count]) |slot| {
                 if (!slot.clay_managed or slot.widget != .container) continue;
                 if (!(slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal)) continue;
-                const data = ClayLayout.scrollContainerData(slot.id) orelse continue;
+                const data = clay_layout.scrollContainerData(slot.id) orelse continue;
                 const container_rect = slot.widget.container.rect;
 
                 _ = c.SDL_SetRenderDrawColor(renderer, 150, 150, 160, 190);

@@ -157,7 +157,15 @@ fn rootElementId() c.Clay_ElementId {
 /// persistent per-context state directly, not tied to being inside a
 /// BeginLayout/EndLayout pass. Returns `ScrollBar.Data` directly (rather
 /// than a second identical struct here) since that's its only consumer.
-pub fn scrollContainerData(widget_id: u32) ?ScrollBar.Data {
+///
+/// Multi-window Stage 2: now a method, not a bare namespaced function --
+/// switches to `self`'s own Clay context first (same reasoning as
+/// `layoutIfNeeded`'s own call, see `context`'s doc comment), since this is
+/// called both from within `layoutIfNeeded` (already current, a no-op
+/// re-select) and directly from main.zig's own draw loop (not necessarily
+/// current once a second `ClayLayout` instance can exist).
+pub fn scrollContainerData(self: Self, widget_id: u32) ?ScrollBar.Data {
+    c.Clay_SetCurrentContext(self.context);
     const data = c.Clay_GetScrollContainerData(elementId(widget_id));
     if (!data.found) return null;
     const pos = data.scrollPosition orelse return null;
@@ -172,6 +180,16 @@ pub fn scrollContainerData(widget_id: u32) ?ScrollBar.Data {
 }
 
 arena_memory: []u8,
+/// Multi-window Stage 2: the real context handle `Clay_Initialize` returns
+/// -- previously discarded (`_ = c.Clay_Initialize(...)`), safe only because
+/// exactly one `ClayLayout` instance has ever existed in the process at
+/// once. Clay keeps "current context" as global state by design, to support
+/// exactly this multi-instance pattern (see `proveTwoGrowChildrenSplitEvenly`'s
+/// own comment above) -- `layoutIfNeeded`/`scrollContainerData` now switch to
+/// this instance's own context before touching Clay, so a second concurrent
+/// instance (a second open window, once one exists) can't have its layout
+/// pass clobbered by whichever instance happened to run last.
+context: *c.Clay_Context,
 /// The generation `layoutIfNeeded` last actually ran Clay for -- `null`
 /// means "never," so the very first call always computes regardless of
 /// what `WidgetHost.layout_generation` happens to be.
@@ -199,12 +217,18 @@ pub fn init(allocator: std.mem.Allocator, window_w: f32, window_h: f32, default_
     const arena_size = c.Clay_MinMemorySize();
     const memory = try allocator.alloc(u8, arena_size);
     const clay_arena = c.Clay_CreateArenaWithCapacityAndMemory(arena_size, memory.ptr);
-    _ = c.Clay_Initialize(clay_arena, .{ .width = window_w, .height = window_h }, .{
+    // Clay_Initialize returns `?*Clay_Context` (null only on a real
+    // allocation/arena failure, per Clay's own docs) -- previously discarded
+    // outright (`_ = c.Clay_Initialize(...)`), which silently ignored that
+    // failure case entirely on top of never capturing the handle this file
+    // now needs for multi-instance context switching (see `context`'s own
+    // doc comment above).
+    const context = c.Clay_Initialize(clay_arena, .{ .width = window_w, .height = window_h }, .{
         .errorHandlerFunction = onClayError,
         .userData = null,
-    });
+    }) orelse return error.ClayInitializeFailed;
     c.Clay_SetMeasureTextFunction(measureText, default_font);
-    return .{ .arena_memory = memory };
+    return .{ .arena_memory = memory, .context = context };
 }
 
 pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -464,6 +488,11 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
 /// early-return "nothing changed at all" path below, since no scroll
 /// container's data could have moved if this function didn't even run.
 pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32, scrolled_ids_out: []u32) usize {
+    // Multi-window Stage 2: selects *this* instance's own Clay context
+    // before touching any Clay global state -- a defensive no-op today
+    // (exactly one `ClayLayout` instance ever exists), but required once a
+    // second one can. See `context`'s own doc comment.
+    c.Clay_SetCurrentContext(self.context);
     const current_generation = widgets.currentGeneration(io);
     const content_changed = self.last_computed_generation == null or self.last_computed_generation.? != current_generation;
     const scrolled = scroll_dx != 0 or scroll_dy != 0;
@@ -651,7 +680,7 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         // `.rect` above already established -- see `Slot.scroll_data`'s own
         // doc comment.
         if (slot.clay_managed and (slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal)) {
-            if (scrollContainerData(slot.id)) |sd| {
+            if (self.scrollContainerData(slot.id)) |sd| {
                 // Tree view: compare against what was already stored --
                 // this is the one moment old and new are both available,
                 // see this function's own doc comment -- and report a real
