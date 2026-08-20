@@ -576,9 +576,13 @@ pending_window_request_count: usize = 0,
 /// whose real OS resources (`WindowManager.WindowContext`) `main.zig` should
 /// tear down next frame. `natyv_destroy_window` (worker thread) has already
 /// destroyed the widget subtree itself (via `destroyWindowSubtree`, safe to
-/// call from any thread the same way every other destroy path in this file
-/// already is) by the time this is queued -- this only carries the
-/// still-pending *real* SDL/Clay/TTF teardown, which is main-thread-only.
+/// call from any thread -- it queues each widget's `TTF_Text` for the main
+/// thread to actually destroy via `pending_text_destroys`, the same
+/// `destroyWidgetHostFn` already relies on, rather than calling
+/// `TTF_DestroyText` directly; see `destroySubtreeLocked`'s own doc comment
+/// for a real cross-thread crash this exact queuing was added to fix) by the
+/// time this is queued -- this only carries the still-pending *real*
+/// SDL/Clay/TTF teardown, which is main-thread-only.
 /// Same bounded-array-not-single-slot reasoning as the request queue above
 /// (a guest could call `natyv_destroy_window` on more than one window in a
 /// single dispatch handler).
@@ -1087,20 +1091,27 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
         if (slot.*) |*s| {
             for (to_destroy[0..count]) |id| {
                 if (s.id == id) {
-                    switch (s.widget) {
-                        .button => |*b| b.destroyText(),
-                        .textfield => |*t| t.destroyText(),
-                        .textarea => |*ta| ta.destroyText(),
-                        .label => |*l| l.destroyText(),
-                        .checkbox => |*cb| cb.destroyText(),
-                        .toggle => |*tg| tg.destroyText(),
-                        .radio_button => |*r| r.destroyText(),
-                        .badge => |*bd| bd.destroyText(),
-                        .numeric_stepper => |*ns| ns.destroyText(),
-                        .segmented_control => |*sc| sc.destroyText(),
-                        .tabs => |*tb| tb.destroyText(),
-                        .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
-                    }
+                    // Multi-window Stage 5 fix: queues each widget's
+                    // TTF_Text for the main thread to actually destroy next
+                    // frame (see queueWidgetTextDestroysLocked's own doc
+                    // comment), rather than calling TTF_DestroyText
+                    // directly here. This function's only caller used to be
+                    // destroyExpiredWidgets, always main-thread (called from
+                    // main.zig's own frame loop) -- direct destruction was
+                    // only ever safe by virtue of that, not because this
+                    // function is inherently thread-safe. destroyWindowSubtree
+                    // (Stage 4) calls this too, from the *worker* thread
+                    // (natyv_destroy_window's host function) -- a real,
+                    // confirmed cross-thread SDL_ttf corruption bug, caught
+                    // via a real crash ("member access within misaligned
+                    // address... TTF_TextData") clicking a window's own
+                    // Close button live, not by inspection. The doc comment
+                    // on destroyWindowSubtree that claimed this was already
+                    // safe "the same way every other destroy path in this
+                    // file already is" was wrong -- it asserted an unverified
+                    // claim about a function whose only real caller had
+                    // never actually exercised the worker-thread path.
+                    self.queueWidgetTextDestroysLocked(&s.widget);
                     if (s.clay_managed) self.layout_generation +%= 1;
                     slot.* = null;
                     break;
@@ -1110,17 +1121,17 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
     }
 }
 
-/// Multi-window Stage 3: destroys a window's own root (a `window_root`
-/// slot) and every descendant -- the cascading counterpart
-/// `natyv_destroy_widget` deliberately doesn't provide (see that function's
-/// own no-cascade contract, and `destroyExpiredWidgets`'s doc comment for
-/// why a whole-window teardown needs the cascade the same way an expired
-/// toast's does). Reuses the same two-phase `destroySubtreeLocked` every
-/// other cascading destroy path in this file already goes through. Called
-/// from `main.zig` once a window's own `WindowContext` is being torn down
-/// (an OS close request, or -- Stage 3 dev scaffolding -- a click on that
-/// window's own hardcoded close button), main thread only, same as every
-/// other window-lifecycle call.
+/// Destroys a window's own root (a `window_root` slot) and every
+/// descendant -- the cascading counterpart `natyv_destroy_widget`
+/// deliberately doesn't provide (see that function's own no-cascade
+/// contract, and `destroyExpiredWidgets`'s doc comment for why a
+/// whole-window teardown needs the cascade the same way an expired toast's
+/// does). Reuses the same two-phase `destroySubtreeLocked` every other
+/// cascading destroy path in this file already goes through -- safe to call
+/// from any thread, including the worker thread `natyv_destroy_window`
+/// (Stage 4) calls this from, since `destroySubtreeLocked` only ever queues
+/// each widget's `TTF_Text` for later main-thread destruction, never calls
+/// `TTF_DestroyText` itself.
 pub fn destroyWindowSubtree(self: *Self, call_io: Io, root_id: u32) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);

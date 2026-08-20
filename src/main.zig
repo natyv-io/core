@@ -171,7 +171,28 @@ pub fn main(init: std.process.Init) !void {
     var per_window_topmost_modal: [WindowManager.max_open_windows]?u32 = [_]?u32{null} ** WindowManager.max_open_windows;
 
     while (running) {
-        // Multi-window Stage 4: settle this frame's open-window set first --
+        // F3: a guest destroying a widget can't destroy its TTF_Text right
+        // then -- see WidgetHost.pending_text_destroys' own doc comment.
+        // Registry-wide, not per-window: a single queue drained once per
+        // frame regardless of how many windows are open.
+        //
+        // Multi-window Stage 5 fix: this must run *before* the window-set
+        // draining step below, not after -- draining a window teardown
+        // calls WindowManager.destroyWindowContext, which destroys that
+        // window's own TTF_TextEngine. SDL_ttf requires every TTF_Text be
+        // destroyed before the engine that created it; `natyv_destroy_window`
+        // already queued that window's own widgets' TTF_Text pointers here
+        // (via destroyWindowSubtree, synchronously, before it ever queues
+        // the teardown itself -- see queueWindowTeardown's own doc comment),
+        // so flushing first is what actually satisfies that ordering.
+        // Reversed (as this originally shipped) it was a real, confirmed
+        // crash: `TTF_DestroyText` called against an already-destroyed
+        // engine, "Segmentation fault... aborting due to recursive panic",
+        // caught by clicking a window's own Close button live, not by
+        // inspection.
+        runtime.widgets.flushPendingTextDestroys(io);
+
+        // Multi-window Stage 4: settle this frame's open-window set --
         // drain any guest-requested teardown, then any guest-requested
         // creation -- before anything else this frame touches `windows[]`,
         // so a just-opened window gets a real layout/draw pass this same
@@ -218,14 +239,13 @@ pub fn main(init: std.process.Init) !void {
             FrameLoop.layoutWindow(&runtime.widgets, io, wctx, global_mouse_x, global_mouse_y, global_buttons);
         }
 
-        // F3: a guest destroying a widget can't destroy its TTF_Text right
-        // then -- see WidgetHost.pending_text_destroys' own doc comment.
-        // Registry-wide, not per-window: a single queue drained once per
-        // frame regardless of how many windows are open.
-        runtime.widgets.flushPendingTextDestroys(io);
-
         // W7: destroys any widget (and cascades to its descendants) whose
-        // expiry has passed -- registry-wide, same reasoning as above.
+        // expiry has passed -- registry-wide, same reasoning as the flush
+        // above. Its own newly-queued text destroys (if any) aren't flushed
+        // until *next* frame's flush call above -- same one-frame-max
+        // latency `natyv_destroy_widget`'s own worker-thread queued path
+        // already has, harmless since nothing tears down a text engine
+        // between here and then this same frame.
         runtime.widgets.destroyExpiredWidgets(io, timing.nowMs());
 
         // F3: per-window text sync -- each window's own TTF_TextEngine is

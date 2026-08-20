@@ -508,9 +508,13 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // (W29: +1 -- the Spinner itself, a real new WidgetKind but a single
     // widget with no children/status label of its own -- see spinner's own
     // doc comment in main.go.)
+    // (Multi-window Stage 5: +1 -- the "Open New Window" trigger only; the
+    // second window and its own content are created on demand by a real
+    // click, same as the modal trigger's own baseline exclusion -- see
+    // openSecondWindow's own doc comment in main.go.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 118), n);
+    try std.testing.expectEqual(@as(usize, 119), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
