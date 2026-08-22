@@ -27,7 +27,7 @@ const ClayLayout = @import("capabilities/ClayLayout.zig");
 const InteractionState = @import("InteractionState.zig");
 const DrawBatcher = @import("DrawBatcher.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
-const ShapeShader = @import("capabilities/ShapeShader.zig");
+const ShapeCache = @import("capabilities/ShapeCache.zig");
 
 /// Small fixed cap, same "bump later if a real need shows up" precedent
 /// `WidgetHost.max_widgets` itself already set.
@@ -41,13 +41,11 @@ pub const WindowContext = struct {
     /// didn't declare costs you nothing."
     clay_layout: ?ClayLayout,
     text_engine: *c.TTF_TextEngine,
-    /// Styling system Stage 1: `null` means this window is on the Tier 1
-    /// (feathered tessellation, not yet built) fallback path -- either no
-    /// shared `ShapeShader.GpuState` was available process-wide (software
-    /// renderer, or no GPU device on this machine), or this specific
-    /// window's own `SDL_CreateGPURenderState` call failed. No widget's
-    /// draw path reads this yet.
-    shape_render: ?ShapeShader.WindowRenderState,
+    /// Styling system Stage 3 (post-pivot): per-window cache of the
+    /// anti-aliased circle/ring masks widgets like RadioButton draw through
+    /// -- see ShapeCache.zig's own doc comment. Textures are
+    /// renderer-scoped, so this can't be shared across windows.
+    shape_cache: ShapeCache.Cache = .{},
     /// See file doc comment -- `null` for the original startup window.
     root_widget_id: ?u32,
     interaction: InteractionState = .{},
@@ -66,45 +64,18 @@ pub const WindowContext = struct {
 /// `clay_enabled`) an owned `ClayLayout` sized to it + its own
 /// renderer-backed `TTF_TextEngine`. Main-thread-only, same as every SDL/
 /// Clay/TTF call this mirrors from `main.zig`'s own primary-window setup.
-///
-/// Styling system Stage 1: `shared_gpu` is `main.zig`'s single process-wide
-/// `ShapeShader.GpuState` (or `null` if none could be created). When
-/// present, tries `SDL_CreateGPURenderer` against that shared device first
-/// -- every window shares one `SDL_GPUShader`, only the renderer-scoped
-/// `SDL_GPURenderState` is per-window (see ShapeShader.zig's own doc
-/// comment on why this differs from the original single-window prototype's
-/// `SDL_CreateRenderer(window, SDL_GPU_RENDERER)`, which would silently
-/// create a *new*, unshared device per window). Falls back to the plain
-/// `SDL_CreateRenderer(window, null)` renderer (Tier 1, not yet built) if
-/// `shared_gpu` is `null`, if `SDL_CreateGPURenderer` itself fails, or if
-/// this window's own `SDL_CreateGPURenderState` fails -- a real, expected
-/// outcome on some devices, not treated as fatal.
-pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, width: f32, height: f32, default_font: *c.TTF_Font, clay_enabled: bool, root_widget_id: ?u32, shared_gpu: ?*const ShapeShader.GpuState) !WindowContext {
+pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, width: f32, height: f32, default_font: *c.TTF_Font, clay_enabled: bool, root_widget_id: ?u32) !WindowContext {
     const window = c.SDL_CreateWindow(title.ptr, @intFromFloat(width), @intFromFloat(height), 0) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlWindowFailed;
     };
     errdefer c.SDL_DestroyWindow(window);
 
-    var renderer: *c.SDL_Renderer = undefined;
-    if (shared_gpu) |gpu| {
-        renderer = c.SDL_CreateGPURenderer(gpu.device, window) orelse blk: {
-            std.debug.print("[WindowManager] SDL_CreateGPURenderer failed ({s}), falling back to Tier 1\n", .{c.SDL_GetError()});
-            break :blk c.SDL_CreateRenderer(window, null) orelse {
-                std.debug.print("SDL_CreateRenderer failed: {s}\n", .{c.SDL_GetError()});
-                return error.SdlRendererFailed;
-            };
-        };
-    } else {
-        renderer = c.SDL_CreateRenderer(window, null) orelse {
-            std.debug.print("SDL_CreateRenderer failed: {s}\n", .{c.SDL_GetError()});
-            return error.SdlRendererFailed;
-        };
-    }
+    const renderer: *c.SDL_Renderer = c.SDL_CreateRenderer(window, null) orelse {
+        std.debug.print("SDL_CreateRenderer failed: {s}\n", .{c.SDL_GetError()});
+        return error.SdlRendererFailed;
+    };
     errdefer c.SDL_DestroyRenderer(renderer);
-
-    const shape_render: ?ShapeShader.WindowRenderState = if (shared_gpu) |gpu| ShapeShader.createForWindow(gpu, renderer) else null;
-    errdefer if (shape_render) |*sr| ShapeShader.destroyForWindow(@constCast(sr));
 
     const text_engine = c.TTF_CreateRendererTextEngine(renderer) orelse {
         std.debug.print("TTF_CreateRendererTextEngine failed: {s}\n", .{c.SDL_GetError()});
@@ -119,7 +90,6 @@ pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, wi
         .renderer = renderer,
         .clay_layout = clay_layout,
         .text_engine = text_engine,
-        .shape_render = shape_render,
         .root_widget_id = root_widget_id,
     };
 }
@@ -131,7 +101,7 @@ pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, wi
 /// destroyed this window's own widgets' text objects before calling this).
 pub fn destroyWindowContext(self: *WindowContext, allocator: std.mem.Allocator) void {
     if (self.clay_layout) |*cl| cl.deinit(allocator);
-    if (self.shape_render) |*sr| ShapeShader.destroyForWindow(sr);
+    self.shape_cache.deinit();
     c.TTF_DestroyRendererTextEngine(self.text_engine);
     c.SDL_DestroyRenderer(self.renderer);
     c.SDL_DestroyWindow(self.window);

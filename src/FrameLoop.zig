@@ -34,6 +34,7 @@ const ScrollClip = @import("ScrollClip.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
 const WindowManager = @import("WindowManager.zig");
+const ShapeCache = @import("capabilities/ShapeCache.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -378,7 +379,7 @@ fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
     };
 }
 
-fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding) void {
+fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding, shape_cache: *ShapeCache.Cache) void {
     const padding = WidgetHost.effectiveTextPadding(raw_padding);
     switch (widget) {
         .button => |b| b.drawDecorations(renderer, padding),
@@ -387,7 +388,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, 
         .label => |l| l.drawDecorations(renderer, padding),
         .checkbox => |cb| cb.drawDecorations(renderer),
         .toggle => |tg| tg.drawDecorations(renderer),
-        .radio_button => |r| r.drawDecorations(renderer),
+        .radio_button => |r| r.drawDecorations(renderer, shape_cache),
         .progress_bar => |p| p.drawDecorations(renderer),
         .slider => |s| s.drawDecorations(renderer),
         .range_slider => |rs| rs.drawDecorations(renderer),
@@ -401,7 +402,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, 
     }
 }
 
-fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer) void {
+fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache) void {
     const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
     if (slot.widget.fillRect()) |fr| {
@@ -409,7 +410,7 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
         _ = c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
         _ = c.SDL_RenderFillRect(renderer, &fr.rect);
     }
-    drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding);
+    drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding, shape_cache);
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
 }
 
@@ -730,7 +731,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
         const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-        drawWidgetDecorations(slot.widget, wctx.renderer, slot.clay_style.padding);
+        drawWidgetDecorations(slot.widget, wctx.renderer, slot.clay_style.padding, &wctx.shape_cache);
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
     }
 
@@ -740,7 +741,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (topmost_modal) |modal_id| {
             if (FloatingOrder.isDescendantOfOrSelf(slots, slot.id, modal_id)) continue;
         }
-        drawFloatingWidget(slot, clip, wctx.renderer);
+        drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache);
     }
     if (topmost_modal) |modal_id| {
         var win_w: c_int = undefined;
@@ -756,7 +757,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             if (!floating) continue;
             if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
             if (!FloatingOrder.isDescendantOfOrSelf(slots, slot.id, modal_id)) continue;
-            drawFloatingWidget(slot, clip, wctx.renderer);
+            drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache);
         }
     }
 

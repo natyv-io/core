@@ -11,13 +11,16 @@
 //! meaningful for Clay-managed widgets and would silently break grouping
 //! for a plain absolute-pixel app.
 //!
-//! Visual note, deliberate scoping: v1 reuses the same square box visual as
-//! `Checkbox` rather than a proper circle (SDL has no native circle
-//! primitive) -- real visual distinction between the two kinds is the next
-//! milestone's job (styling), not this one's. Functionally correct grouping
-//! now, visual polish later.
+//! Styling system Stage 3 (post-pivot): the box is a genuine circle now,
+//! not the square-box-reused-for-radio placeholder this file's own doc
+//! comment used to describe -- drawn via `ShapeCache`'s tessellate +
+//! 4x-supersample + cache masks (ShapeCache.zig's own doc comment has the
+//! full technique and why it replaced the earlier SDF shader attempt). The
+//! ring uses `border_width = 2`; the checked dot is a plain filled circle
+//! inset from the box.
 
 const c = @import("../c.zig").c;
+const ShapeCache = @import("../capabilities/ShapeCache.zig");
 
 const Self = @This();
 
@@ -79,16 +82,14 @@ pub fn deselect(self: *Self) void {
 /// `.radio_button` and everything (outline + dot) is drawn directly here
 /// instead, the same "opt out of batching" treatment `ProgressBar` uses for
 /// its own two-color-per-widget case.
-pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache) void {
     const box = self.boxRect();
-    _ = c.SDL_SetRenderDrawColor(renderer, 140, 140, 150, 255);
-    _ = c.SDL_RenderRect(renderer, &box);
+    ShapeCache.drawRing(shape_cache, renderer, box, 2, .{ .r = 140, .g = 140, .b = 150, .a = 255 });
 
     if (self.checked) {
-        _ = c.SDL_SetRenderDrawColor(renderer, 150, 100, 220, 255);
         const inset = box.w * 0.3;
         const dot = c.SDL_FRect{ .x = box.x + inset / 2, .y = box.y + inset / 2, .w = box.w - inset, .h = box.h - inset };
-        _ = c.SDL_RenderFillRect(renderer, &dot);
+        ShapeCache.drawCircle(shape_cache, renderer, dot, .{ .r = 150, .g = 100, .b = 220, .a = 255 });
     }
 
     if (self.text_obj) |obj| {

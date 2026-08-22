@@ -12,7 +12,6 @@ const Dispatch = @import("Dispatch.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
 const WindowManager = @import("WindowManager.zig");
 const FrameLoop = @import("FrameLoop.zig");
-const ShapeShader = @import("capabilities/ShapeShader.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -146,18 +145,9 @@ pub fn main(init: std.process.Init) !void {
     // than as a special case. Every window after it is opened/closed by a
     // guest's own `natyv_clay_create_window`/`natyv_destroy_window` calls,
     // drained from `WidgetHost`'s pending queues each frame below.
-    // Styling system Stage 1: one shared GPU device + shape shader for the
-    // whole process, created before any window -- `null` (no GPU-capable
-    // device, or MSL unsupported/SPIR-V+DXIL bytecode not yet checked in)
-    // is a real, non-fatal outcome; every window then falls back to Tier 1
-    // (feathered tessellation, not yet built) via `WindowManager` itself.
-    var shared_gpu = ShapeShader.initShared();
-    defer if (shared_gpu) |*gpu| ShapeShader.deinitShared(gpu);
-    const shared_gpu_ptr: ?*const ShapeShader.GpuState = if (shared_gpu) |*gpu| gpu else null;
-
     var windows: [WindowManager.max_open_windows]WindowManager.WindowContext = undefined;
     var window_count: usize = 0;
-    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, null, shared_gpu_ptr);
+    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, null);
     window_count += 1;
 
     const arrow_cursor = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT);
@@ -228,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
                 @memcpy(title_buf[0..req.title_len], req.title_buf[0..req.title_len]);
                 title_buf[req.title_len] = 0;
                 const title_z: [:0]const u8 = title_buf[0..req.title_len :0];
-                windows[window_count] = WindowManager.createWindowContext(allocator, title_z, req.width, req.height, default_font.font, clay_enabled, req.widget_id, shared_gpu_ptr) catch |err| {
+                windows[window_count] = WindowManager.createWindowContext(allocator, title_z, req.width, req.height, default_font.font, clay_enabled, req.widget_id) catch |err| {
                     std.debug.print("[main] failed to create window for widget {d}: {}\n", .{ req.widget_id, err });
                     continue;
                 };
