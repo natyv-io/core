@@ -95,13 +95,16 @@ pub fn fillColor(self: Self) c.SDL_Color {
 /// as before, now against real `TTF_Text` objects kept in sync by
 /// `syncText` (see `Button.drawDecorations`'s doc comment for why creation
 /// can't happen here).
-pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
+// Styling system Stage 2: horizontal offset is the widget's own real
+// padding (`WidgetHost.effectiveTextPadding`) instead of the original
+// hardcoded `+ 6`.
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_Padding) void {
     const active = if (self.len > 0) self.text_obj else self.placeholder_obj;
     if (active) |obj| {
         var w: c_int = 0;
         var h: c_int = 0;
         _ = c.TTF_GetTextSize(obj, &w, &h);
-        _ = c.TTF_DrawRendererText(obj, self.rect.x + 6, self.rect.y + self.rect.h / 2 - @as(f32, @floatFromInt(h)) / 2);
+        _ = c.TTF_DrawRendererText(obj, self.rect.x + @as(f32, @floatFromInt(padding.left)), self.rect.y + self.rect.h / 2 - @as(f32, @floatFromInt(h)) / 2);
     }
 
     if (self.focused) {

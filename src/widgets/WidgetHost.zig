@@ -194,7 +194,10 @@ pub const max_widgets = 192;
 // picker, generic (unrelated to any WidgetKind at all -- these trigger a
 // native OS dialog, not a Clay widget), same "always registered" reasoning
 // as the block above.
-pub const host_function_count = 26;
+// + natyv_set_style (1) -- Styling system Stage 2, generic per-slot
+// resolved-style application, same "guest-composed, no new WidgetKind"
+// reasoning as natyv_set_visible/natyv_set_size.
+pub const host_function_count = 27;
 
 pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner };
 pub const Widget = union(WidgetKind) {
@@ -335,6 +338,18 @@ pub const Widget = union(WidgetKind) {
 pub const ClayStyle = struct {
     sizing: c.Clay_Sizing = std.mem.zeroes(c.Clay_Sizing),
     padding: c.Clay_Padding = std.mem.zeroes(c.Clay_Padding),
+    /// Styling system Stage 2: `null` means "use this widget kind's own
+    /// hardcoded default fill" (e.g. Container's `background: bool`
+    /// still picks its fixed panel color) -- set only via `setStyle`
+    /// below, real end-to-end proof that a resolved stylesheet token can
+    /// actually change a widget's rendering, ahead of Stage 3's SDF-shader
+    /// migration (which is what will eventually let cornerRadius/border/
+    /// gradient/texture render too). Consulted at the two `fillRect()`
+    /// draw call sites in FrameLoop.zig, not inside each widget's own
+    /// `fillColor()` -- keeps this override generic across every widget
+    /// kind that already participates in the plain-fill draw path, with
+    /// zero changes to their individual `fillColor()` methods.
+    background_color: ?c.SDL_FColor = null,
     child_gap: u16 = 0,
     direction: c.Clay_LayoutDirection = c.CLAY_LEFT_TO_RIGHT,
     child_alignment: c.Clay_ChildAlignment = std.mem.zeroes(c.Clay_ChildAlignment),
@@ -414,6 +429,28 @@ pub const ClayStyle = struct {
     /// window layout/hit-test/draw/text-sync passes to filter against.
     window_root: bool = false,
 };
+
+/// Styling system Stage 2: the fallback natyv applies to a text-bearing
+/// widget's own draw position/wrap-width calculation when its configured
+/// `clay_style.padding` is entirely zero on all four sides. `padding`
+/// itself already flows real guest-requested values end-to-end (see
+/// `WidgetHostFunctions.toClayStyle`) -- this only covers the common case
+/// of a guest never having set it at all, which parses to the same all-
+/// zero `ClayPaddingRequest{}` default as an explicit `padding: 0` request
+/// (the wire format has no "unset" distinct from "zero," a real, accepted
+/// imprecision rather than reworking every padding field into an Optional
+/// for this). Text-bearing widgets (Label/Button/TextArea/TextField) call
+/// `effectiveTextPadding` instead of reading `clay_style.padding` raw, so
+/// text stops sitting flush against a widget's edge by default while still
+/// respecting any real non-zero padding a guest actually configured.
+pub const default_text_padding: u16 = 4;
+
+pub fn effectiveTextPadding(p: c.Clay_Padding) c.Clay_Padding {
+    if (p.left == 0 and p.right == 0 and p.top == 0 and p.bottom == 0) {
+        return .{ .left = default_text_padding, .right = default_text_padding, .top = default_text_padding, .bottom = default_text_padding };
+    }
+    return p;
+}
 
 pub const Slot = struct {
     id: u32,
@@ -776,6 +813,13 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
     // registered" reasoning as the block above.
     funcs_out[n] = c.extism_function_new("natyv_set_size", &in_types[0], 1, &out_types[0], 1, HostFunctions.setSizeHostFn, self, null);
     n += 1;
+    // Styling system Stage 2: applies already-resolved style values
+    // (background color, padding) to an existing widget -- generic,
+    // guest-composed, same "always registered" reasoning as the rest of
+    // this block. See `HostFunctions.setStyleHostFn`'s own doc comment for
+    // why this takes resolved values, never style-token names.
+    funcs_out[n] = c.extism_function_new("natyv_set_style", &in_types[0], 1, &out_types[0], 1, HostFunctions.setStyleHostFn, self, null);
+    n += 1;
     // File picker: generic, unrelated to any WidgetKind (a native OS
     // dialog, not a Clay widget) -- same "always registered" reasoning as
     // the block above.
@@ -987,8 +1031,8 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
             switch (s.widget) {
                 .button => |*b| b.syncText(engine, font),
                 .textfield => |*t| t.syncText(engine, font),
-                .textarea => |*ta| ta.syncText(engine, font),
-                .label => |*l| l.syncText(engine, font),
+                .textarea => |*ta| ta.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
+                .label => |*l| l.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
                 .checkbox => |*cb| cb.syncText(engine, font),
                 .toggle => |*tg| tg.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),
@@ -1642,5 +1686,36 @@ pub fn setHeight(self: *Self, call_io: Io, id: u32, height: f32) bool {
     self.mutex.unlock(call_io);
 
     if (changed) self.layout_generation +%= 1;
+    return true;
+}
+
+/// Styling system Stage 2: applies already-resolved style values to an
+/// existing widget -- `background_color`/`padding` are `null` when the
+/// guest's call didn't include that property (leaves it unchanged), not
+/// "set it to zero/none." Deliberately takes resolved values, not style-
+/// token names -- see `natyv_jsx_markup_layer` memory's "Corrected
+/// 2026-08-21" note: the host stays completely ignorant of tokens, same as
+/// every other host wire contract in this project (it already only ever
+/// receives fully-resolved property values, e.g. `ClayContainerRequest`'s
+/// `padding` today). Name-to-value resolution/merging lives in the Go SDK's
+/// `ApplyStyle` helper, one layer up.
+pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding) bool {
+    self.mutex.lockUncancelable(call_io);
+    const slot = self.findLocked(id) orelse {
+        self.mutex.unlock(call_io);
+        return false;
+    };
+    var changed = false;
+    if (background_color) |bg| {
+        changed = changed or slot.clay_style.background_color == null or !std.meta.eql(slot.clay_style.background_color.?, bg);
+        slot.clay_style.background_color = bg;
+    }
+    if (padding) |p| {
+        changed = changed or !std.meta.eql(slot.clay_style.padding, p);
+        slot.clay_style.padding = p;
+    }
+    self.mutex.unlock(call_io);
+
+    if (changed and slot.clay_managed) self.layout_generation +%= 1;
     return true;
 }

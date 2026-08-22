@@ -512,9 +512,14 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // second window and its own content are created on demand by a real
     // click, same as the modal trigger's own baseline exclusion -- see
     // openSecondWindow's own doc comment in main.go.)
+    // (Styling system Stage 2: +4 -- styleDemoPanel Container + its own
+    // title Label + styleApplyButton + styleStatus Label, real end-to-end
+    // proof that a resolved stylesheet token can change a widget's
+    // rendering at runtime -- see styleDemoPanel's own doc comment in
+    // main.go.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 119), n);
+    try std.testing.expectEqual(@as(usize, 123), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
@@ -1481,7 +1486,7 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
         // shared atlas state while the worker thread destroys a text object,
         // not just the destroy call in isolation.
         for (snap[0..n]) |slot| {
-            if (slot.widget == .button) slot.widget.button.drawDecorations(renderer);
+            if (slot.widget == .button) slot.widget.button.drawDecorations(renderer, WidgetHost.effectiveTextPadding(slot.clay_style.padding));
             if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Recreated Button")) {
                 relabeled = true;
             }

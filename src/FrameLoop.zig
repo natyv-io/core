@@ -357,12 +357,34 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
     return null;
 }
 
-fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer) void {
+// Styling system Stage 2: `padding` is the owning slot's real
+// `clay_style.padding`, resolved through `WidgetHost.effectiveTextPadding`
+// once here rather than per text-bearing arm below -- only the four
+// text-drawing kinds actually read it.
+/// Styling system Stage 2: converts a resolved-style `background_color`
+/// override (0..1 floats, matching the stylesheet resolver's own `Color`
+/// and the SDF shader's eventual uniform convention) into the plain 0-255
+/// `SDL_Color` the existing fill-rect draw path already uses -- `null`
+/// means "no override was ever set on this widget," not "the color is
+/// black," so callers must fall back to the widget's own `fillColor()`
+/// result, not to a default color here.
+fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
+    const fc = fcolor orelse return null;
+    return .{
+        .r = @intFromFloat(@round(std.math.clamp(fc.r, 0, 1) * 255)),
+        .g = @intFromFloat(@round(std.math.clamp(fc.g, 0, 1) * 255)),
+        .b = @intFromFloat(@round(std.math.clamp(fc.b, 0, 1) * 255)),
+        .a = @intFromFloat(@round(std.math.clamp(fc.a, 0, 1) * 255)),
+    };
+}
+
+fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding) void {
+    const padding = WidgetHost.effectiveTextPadding(raw_padding);
     switch (widget) {
-        .button => |b| b.drawDecorations(renderer),
-        .textfield => |t| t.drawDecorations(renderer),
-        .textarea => |ta| ta.drawDecorations(renderer),
-        .label => |l| l.drawDecorations(renderer),
+        .button => |b| b.drawDecorations(renderer, padding),
+        .textfield => |t| t.drawDecorations(renderer, padding),
+        .textarea => |ta| ta.drawDecorations(renderer, padding),
+        .label => |l| l.drawDecorations(renderer, padding),
         .checkbox => |cb| cb.drawDecorations(renderer),
         .toggle => |tg| tg.drawDecorations(renderer),
         .radio_button => |r| r.drawDecorations(renderer),
@@ -383,10 +405,11 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
     const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
     if (slot.widget.fillRect()) |fr| {
-        _ = c.SDL_SetRenderDrawColor(renderer, fr.color.r, fr.color.g, fr.color.b, fr.color.a);
+        const color = styleOverrideColor(slot.clay_style.background_color) orelse fr.color;
+        _ = c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
         _ = c.SDL_RenderFillRect(renderer, &fr.rect);
     }
-    drawWidgetDecorations(slot.widget, renderer);
+    drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding);
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
 }
 
@@ -688,14 +711,15 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (floating) continue;
         if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
         if (slot.widget.fillRect()) |fr| {
+            const color = styleOverrideColor(slot.clay_style.background_color) orelse fr.color;
             if (clip) |cr| {
                 const sdl_clip = toClipRect(cr);
                 _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-                _ = c.SDL_SetRenderDrawColor(wctx.renderer, fr.color.r, fr.color.g, fr.color.b, fr.color.a);
+                _ = c.SDL_SetRenderDrawColor(wctx.renderer, color.r, color.g, color.b, color.a);
                 _ = c.SDL_RenderFillRect(wctx.renderer, &fr.rect);
                 _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
             } else {
-                wctx.draw_batcher.add(fr.color, fr.rect);
+                wctx.draw_batcher.add(color, fr.rect);
             }
         }
     }
@@ -706,7 +730,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
         const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-        drawWidgetDecorations(slot.widget, wctx.renderer);
+        drawWidgetDecorations(slot.widget, wctx.renderer, slot.clay_style.padding);
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
     }
 

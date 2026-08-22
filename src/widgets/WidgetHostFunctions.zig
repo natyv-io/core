@@ -82,6 +82,18 @@ const SetRangeRequest = struct { widget_id: u32, min: f32, max: f32 };
 const SetVisibleRequest = struct { widget_id: u32, visible: bool };
 const SetSizeRequest = struct { widget_id: u32, height: f32 };
 
+// Styling system Stage 2: 0..1 floats, matching the stylesheet resolver's
+// own `Color` (src/styling/Resolver.zig) and the SDF shader's eventual
+// uniform convention -- not the 0-255 `SDL_Color` the plain-fill draw path
+// happens to want today (that conversion is FrameLoop.zig's
+// `styleOverrideColor`'s job, not this wire format's).
+const ColorRequest = struct { r: f32, g: f32, b: f32, a: f32 = 1 };
+// `null` fields mean "the guest's ApplyStyle call didn't touch this
+// property," not "set it to zero/none" -- see `setStyleHostFn`'s doc
+// comment. Reuses `ClayPaddingRequest` (declared below) rather than a
+// second padding shape.
+const SetStyleRequest = struct { widget_id: u32, background_color: ?ColorRequest = null, padding: ?ClayPaddingRequest = null };
+
 // L3: wire-format mirrors of Clay's real C types (Clay_SizingAxis,
 // Clay_Padding, Clay_LayoutDirection, Clay_ChildAlignment -- see clay.h)
 // with JSON-friendly enum tags instead of Clay's C enum constants.
@@ -1029,6 +1041,35 @@ pub fn setSizeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
     const req = parsed.value;
 
     if (!self.setHeight(self.io(), req.widget_id, req.height)) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// Styling system Stage 2: thin wire adapter over `WidgetHost.setStyle`,
+/// same "host function just parses JSON and calls a plain `WidgetHost`
+/// method" split every other `set*HostFn` here already establishes.
+/// **Deliberately takes already-resolved property values, never style-
+/// token names** -- the host stays completely ignorant of "tokens" as a
+/// concept, matching the token model's own "resolution happens entirely
+/// guest-side" principle (CLAUDE.md's styling section). The Go SDK's
+/// `ApplyStyle` helper does the name-to-value lookup/merge (later-wins
+/// cascade) against `natyv prepare`'s generated `StyleTokens` map and
+/// calls this with the resolved result -- this function never sees a
+/// token name at all.
+pub fn setStyleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetStyleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    const bg: ?c.SDL_FColor = if (req.background_color) |bc| .{ .r = bc.r, .g = bc.g, .b = bc.b, .a = bc.a } else null;
+    const padding: ?c.Clay_Padding = if (req.padding) |p| .{ .left = p.left, .right = p.right, .top = p.top, .bottom = p.bottom } else null;
+
+    if (!self.setStyle(self.io(), req.widget_id, bg, padding)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }

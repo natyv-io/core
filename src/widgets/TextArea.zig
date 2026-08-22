@@ -133,7 +133,10 @@ pub fn fillColor(self: Self) c.SDL_Color {
 /// is a renderer-wide draw state, not a param passed to
 /// TTF_DrawRendererText), cleared right after so it can't leak into
 /// anything drawn after this widget in the same frame.
-pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
+// Styling system Stage 2: draw offset is the widget's own real padding
+// (`WidgetHost.effectiveTextPadding`) instead of the original hardcoded
+// `+ 6`.
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_Padding) void {
     const active = if (self.len > 0) self.text_obj else self.placeholder_obj;
     if (active) |obj| {
         const clip = c.SDL_Rect{
@@ -143,7 +146,7 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
             .h = @intFromFloat(@ceil(self.rect.h)),
         };
         _ = c.SDL_SetRenderClipRect(renderer, &clip);
-        _ = c.TTF_DrawRendererText(obj, self.rect.x + 6, self.rect.y + 6);
+        _ = c.TTF_DrawRendererText(obj, self.rect.x + @as(f32, @floatFromInt(padding.left)), self.rect.y + @as(f32, @floatFromInt(padding.top)));
         _ = c.SDL_SetRenderClipRect(renderer, null);
     }
 
@@ -171,10 +174,11 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
 /// without calling TTF_SetTextWrapWidth every single frame regardless
 /// (its own doc comment warns it may rebuild the text's internal
 /// representation, not something to churn unconditionally).
-/// `- 12` leaves a small margin on both sides so wrapped text doesn't sit
-/// flush against the box's border.
-pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font) void {
-    const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - 12);
+/// Styling system Stage 2: `padding` (already resolved via
+/// `WidgetHost.effectiveTextPadding` by the caller) replaces the original
+/// hardcoded `- 12` -- wrap width shrinks by the real left+right padding.
+pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, padding: c.Clay_Padding) void {
+    const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - @as(i32, padding.left) - @as(i32, padding.right));
     const wrap_changed = target_wrap != self.wrapped_width;
 
     if (self.text_obj) |obj| {

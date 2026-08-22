@@ -87,12 +87,17 @@ pub fn fillColor(self: Self) c.SDL_Color {
 /// same treatment (color, inset) as `TextField.drawDecorations`'s existing
 /// border, so focus reads consistently across widget kinds regardless of
 /// whether it was reached by Tab or by a mouse click.
-pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
+// Styling system Stage 2: horizontal offset is the widget's own real
+// padding (`WidgetHost.effectiveTextPadding`) instead of the original
+// hardcoded `+ 10`. Vertical position stays centered against the full
+// rect height regardless of padding, same as before -- top/bottom padding
+// isn't relevant to a single-line, vertically-centered label.
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_Padding) void {
     if (self.text_obj) |obj| {
         var w: c_int = 0;
         var h: c_int = 0;
         _ = c.TTF_GetTextSize(obj, &w, &h);
-        _ = c.TTF_DrawRendererText(obj, self.rect.x + 10, self.rect.y + self.rect.h / 2 - @as(f32, @floatFromInt(h)) / 2);
+        _ = c.TTF_DrawRendererText(obj, self.rect.x + @as(f32, @floatFromInt(padding.left)), self.rect.y + self.rect.h / 2 - @as(f32, @floatFromInt(h)) / 2);
     }
 
     if (self.focused) {

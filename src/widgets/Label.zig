@@ -56,20 +56,24 @@ pub fn text(self: *const Self) []const u8 {
 //
 // F3: draws the real `text_obj` kept in sync by `syncText` -- see
 // `Button.drawDecorations`'s doc comment for why creation can't happen here.
-pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
+// Styling system Stage 2: drawn inset from `rect`'s top-left by the
+// widget's own real padding (`WidgetHost.effectiveTextPadding`) instead of
+// flush at `rect.x, rect.y` -- see that function's doc comment.
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_Padding) void {
     _ = renderer;
     if (self.text_obj) |obj| {
-        _ = c.TTF_DrawRendererText(obj, self.rect.x, self.rect.y);
+        _ = c.TTF_DrawRendererText(obj, self.rect.x + @as(f32, @floatFromInt(padding.left)), self.rect.y + @as(f32, @floatFromInt(padding.top)));
     }
 }
 
 /// F3: see `Button.syncText`'s doc comment for the text-content sync shape.
-/// W15 follow-up: see this file's own doc comment and
-/// `TextArea.syncText`'s for the wrap-width tracking shape -- `- 8` leaves
-/// a small margin so wrapped text doesn't sit flush against the box edge
-/// (TextArea uses `- 12` for its own, slightly larger, padding).
-pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font) void {
-    const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - 8);
+/// W15 follow-up: see this file's own doc comment for the original
+/// hardcoded-margin wrap-width tracking shape. Styling system Stage 2:
+/// `padding` (already resolved via `WidgetHost.effectiveTextPadding` by the
+/// caller) replaces that hardcoded `- 8` -- wrap width shrinks by the real
+/// left+right padding instead of a fixed magic number.
+pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, padding: c.Clay_Padding) void {
+    const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - @as(i32, padding.left) - @as(i32, padding.right));
     const wrap_changed = target_wrap != self.wrapped_width;
 
     if (self.text_obj) |obj| {
