@@ -12,15 +12,15 @@
 //! compared against 2x/3x/5x in the scratchpad `aa_passes_demo.zig`
 //! reference; Quinn's confirmed default is 4x (`aa_level` below).
 //!
-//! Scope, deliberate: only a filled circle and a ring (annulus) mask exist
-//! today, matching RadioButton's own real need -- a proper circle outline
-//! plus a filled dot, replacing the square-box-reused-for-radio placeholder
-//! its own doc comment flagged as "next milestone's job." Checkbox needs no
-//! mask at all: `SDL_RenderRect` already draws a perfectly sharp square
-//! with zero anti-aliasing artifacts, which is exactly what `cornerRadius =
-//! 0` wants -- there is no bug to fix there. General rounded-rect masks
-//! (non-zero, non-half-size radius) are real future work once a Stage 5
-//! widget (Card/Panel) actually needs one, not built speculatively here.
+//! Stage 3 scope, deliberate: shipped with only a filled circle and a ring
+//! (annulus) mask, matching RadioButton's own real need -- a proper circle
+//! outline plus a filled dot, replacing the square-box-reused-for-radio
+//! placeholder its own doc comment flagged as "next milestone's job."
+//! Checkbox needed no mask at all: `SDL_RenderRect` already draws a
+//! perfectly sharp square with zero anti-aliasing artifacts, which is
+//! exactly what `cornerRadius = 0` wants -- there was no bug to fix there.
+//! General rounded-rect masks (non-zero, non-half-size, independent
+//! per-corner radius) are Stage 5a's real addition below.
 //!
 //! The ring mask is a true annulus baked directly into alpha (draw the
 //! outer circle, then draw the inner circle with `SDL_BLENDMODE_NONE` and
@@ -36,6 +36,17 @@
 //! sizes. One `Cache` per window (masks are textures, textures are
 //! renderer-scoped) -- owned by `WindowManager.WindowContext`, same
 //! per-window-resource shape its `text_engine` field already established.
+//!
+//! Styling system Stage 5a: generalized beyond circle/ring to a real
+//! per-corner-radius rounded rectangle (`drawRoundedRect`) and its matching
+//! border (`drawRoundedRectBorder`) -- what Container/Button-style widgets
+//! actually need (arbitrary radius 0..half-size per corner, usually
+//! non-square). `drawCircle`/`drawRing` are left untouched rather than
+//! reimplemented on top of the new general path -- they're already
+//! verified correct (real click-through, RadioButton), and the general
+//! rect path covers a genuinely different shape (non-square, independent
+//! w/h) with its own clamping rules, so unifying them would trade proven
+//! code for a refactor with no functional upside.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -43,13 +54,24 @@ const c = @import("../c.zig").c;
 pub const aa_level: u32 = 4;
 const max_entries = 32;
 const circle_segments = 48;
+// Each of the 4 corners gets an independent quarter-turn arc; the space
+// between one corner's arc and the next is implicitly the straight edge
+// (the fan triangulation connects consecutive listed points directly, and
+// that connecting chord *is* the real boundary when it's genuinely
+// straight) -- same technique the scratchpad `aa_passes_demo.zig`
+// reference used for its (uniform-radius) rounded rect. `corner_segments`
+// is chosen so 4 corners produce exactly `circle_segments` total points,
+// reusing `fillConvexPolygon`'s existing fixed-size backing arrays as-is.
+const corner_segments = circle_segments / 4 - 1;
 
-const MaskKind = enum { circle, ring };
+const MaskKind = enum { circle, ring, rect, rect_border };
 
 const MaskKey = struct {
     kind: MaskKind,
-    size: i32,
-    border_width: i32 = 0, // only meaningful for .ring
+    w: i32,
+    h: i32,
+    radii: [4]i32 = .{ 0, 0, 0, 0 }, // unused (zero) for .circle/.ring
+    border_width: i32 = 0, // only meaningful for .ring/.rect_border
 };
 
 const Entry = struct {
@@ -73,7 +95,7 @@ pub const Cache = struct {
     fn find(self: *Cache, key: MaskKey) ?*c.SDL_Texture {
         for (self.entries[0..self.count]) |entry| {
             if (entry) |e| {
-                if (e.key.kind == key.kind and e.key.size == key.size and e.key.border_width == key.border_width) return e.texture;
+                if (std.meta.eql(e.key, key)) return e.texture;
             }
         }
         return null;
@@ -128,11 +150,11 @@ fn fillConvexPolygon(renderer: ?*c.SDL_Renderer, points: []const [2]f32, color: 
     _ = c.SDL_RenderGeometry(renderer, null, &verts, @intCast(points.len + 1), &indices, @intCast(points.len * 3));
 }
 
-/// Renders `super_tex`'s content down to a new `size`x`size` texture via a
+/// Renders `super_tex`'s content down to a new `w`x`h` texture via a
 /// single linear-filtered blit -- this one blit is the entire anti-aliasing
 /// step. Caller owns the returned texture (and `super_tex`, still).
-fn downsample(renderer: ?*c.SDL_Renderer, super_tex: *c.SDL_Texture, size: i32) ?*c.SDL_Texture {
-    const final_tex = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGBA8888, c.SDL_TEXTUREACCESS_TARGET, size, size) orelse return null;
+fn downsample(renderer: ?*c.SDL_Renderer, super_tex: *c.SDL_Texture, w: i32, h: i32) ?*c.SDL_Texture {
+    const final_tex = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGBA8888, c.SDL_TEXTUREACCESS_TARGET, w, h) orelse return null;
     _ = c.SDL_SetTextureBlendMode(final_tex, c.SDL_BLENDMODE_BLEND);
     _ = c.SDL_SetTextureScaleMode(super_tex, c.SDL_SCALEMODE_LINEAR);
 
@@ -168,7 +190,7 @@ fn renderCircleMask(renderer: ?*c.SDL_Renderer, size: i32) ?*c.SDL_Texture {
     fillConvexPolygon(renderer, &pts, white);
 
     _ = c.SDL_SetRenderTarget(renderer, prev_target);
-    return downsample(renderer, super_tex, size);
+    return downsample(renderer, super_tex, size, size);
 }
 
 fn renderRingMask(renderer: ?*c.SDL_Renderer, size: i32, border_width: i32) ?*c.SDL_Texture {
@@ -203,7 +225,7 @@ fn renderRingMask(renderer: ?*c.SDL_Renderer, size: i32, border_width: i32) ?*c.
     fillConvexPolygon(renderer, &inner_pts, clear);
 
     _ = c.SDL_SetRenderTarget(renderer, prev_target);
-    return downsample(renderer, super_tex, size);
+    return downsample(renderer, super_tex, size, size);
 }
 
 /// Draws a filled circle inscribed in `rect` (uses `min(w, h)` as the
@@ -211,7 +233,7 @@ fn renderRingMask(renderer: ?*c.SDL_Renderer, size: i32, border_width: i32) ?*c.
 pub fn drawCircle(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, color: c.SDL_Color) void {
     const size: i32 = @intFromFloat(@round(@min(rect.w, rect.h)));
     if (size <= 0) return;
-    const key = MaskKey{ .kind = .circle, .size = size };
+    const key = MaskKey{ .kind = .circle, .w = size, .h = size };
     const tex = if (cache.find(key)) |t| t else blk: {
         const t = renderCircleMask(renderer, size) orelse return;
         cache.insert(key, t);
@@ -238,7 +260,7 @@ pub fn drawRing(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, bo
     const size: i32 = @intFromFloat(@round(@min(rect.w, rect.h)));
     if (size <= 0) return;
     const bw: i32 = @intFromFloat(@max(border_width, 1));
-    const key = MaskKey{ .kind = .ring, .size = size, .border_width = bw };
+    const key = MaskKey{ .kind = .ring, .w = size, .h = size, .border_width = bw };
     const tex = if (cache.find(key)) |t| t else blk: {
         const t = renderRingMask(renderer, size, bw) orelse return;
         cache.insert(key, t);
@@ -249,5 +271,161 @@ pub fn drawRing(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, bo
     _ = c.SDL_SetTextureAlphaMod(tex, color.a);
     // See drawCircle's doc comment -- same reasoning, `rect` is the real
     // destination, not a rect rebuilt from the integer `size`.
+    _ = c.SDL_RenderTexture(renderer, tex, null, &rect);
+}
+
+/// Each corner radius clamped to `min(w, h) / 2` -- prevents adjacent
+/// corners' arcs from overlapping/inverting on a radius larger than the
+/// shape can actually support, same safety margin every real rounded-rect
+/// implementation needs regardless of technique.
+fn clampRadii(radii: [4]f32, w: f32, h: f32) [4]f32 {
+    const max_r = @min(w, h) / 2.0;
+    var out: [4]f32 = undefined;
+    for (radii, 0..) |r, i| out[i] = std.math.clamp(r, 0, max_r);
+    return out;
+}
+
+fn quantizeRadii(radii: [4]f32) [4]i32 {
+    var out: [4]i32 = undefined;
+    for (radii, 0..) |r, i| out[i] = @intFromFloat(@round(r));
+    return out;
+}
+
+/// Per-corner-radius rounded rect, traced as 4 independent quarter-turn
+/// arcs (TL, TR, BR, BL -- matches the stylesheet's real CSS-clockwise
+/// order) with the straight edges between them left implicit (see this
+/// file's own `corner_segments` doc comment for why that's exact, not an
+/// approximation).
+fn roundedRectPoints(x: f32, y: f32, w: f32, h: f32, radii: [4]f32) [circle_segments][2]f32 {
+    var pts: [circle_segments][2]f32 = undefined;
+    const half_pi = std.math.pi / 2.0;
+    const Corner = struct { cx: f32, cy: f32, start: f32, r: f32 };
+    const corners = [4]Corner{
+        .{ .cx = x + radii[0], .cy = y + radii[0], .start = std.math.pi, .r = radii[0] }, // TL
+        .{ .cx = x + w - radii[1], .cy = y + radii[1], .start = -half_pi, .r = radii[1] }, // TR
+        .{ .cx = x + w - radii[2], .cy = y + h - radii[2], .start = 0, .r = radii[2] }, // BR
+        .{ .cx = x + radii[3], .cy = y + h - radii[3], .start = half_pi, .r = radii[3] }, // BL
+    };
+    var idx: usize = 0;
+    for (corners) |corner| {
+        for (0..corner_segments + 1) |i| {
+            const t = corner.start + half_pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(corner_segments));
+            pts[idx] = .{ corner.cx + corner.r * @cos(t), corner.cy + corner.r * @sin(t) };
+            idx += 1;
+        }
+    }
+    return pts;
+}
+
+fn renderRectMask(renderer: ?*c.SDL_Renderer, w: i32, h: i32, radii: [4]f32) ?*c.SDL_Texture {
+    const aa_i: i32 = @intCast(aa_level);
+    const super_w: i32 = w * aa_i;
+    const super_h: i32 = h * aa_i;
+    const white: c.SDL_FColor = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
+
+    const super_tex = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGBA8888, c.SDL_TEXTUREACCESS_TARGET, super_w, super_h) orelse return null;
+    defer c.SDL_DestroyTexture(super_tex);
+    _ = c.SDL_SetTextureBlendMode(super_tex, c.SDL_BLENDMODE_BLEND);
+
+    const prev_target = c.SDL_GetRenderTarget(renderer);
+    _ = c.SDL_SetRenderTarget(renderer, super_tex);
+    _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_NONE);
+    _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+    _ = c.SDL_RenderClear(renderer);
+    _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND);
+
+    const aa_f: f32 = @floatFromInt(aa_level);
+    const clamped = clampRadii(radii, @floatFromInt(w), @floatFromInt(h));
+    const scaled_radii = [4]f32{ clamped[0] * aa_f, clamped[1] * aa_f, clamped[2] * aa_f, clamped[3] * aa_f };
+    const pts = roundedRectPoints(0, 0, @floatFromInt(super_w), @floatFromInt(super_h), scaled_radii);
+    fillConvexPolygon(renderer, &pts, white);
+
+    _ = c.SDL_SetRenderTarget(renderer, prev_target);
+    return downsample(renderer, super_tex, w, h);
+}
+
+fn renderRectBorderMask(renderer: ?*c.SDL_Renderer, w: i32, h: i32, radii: [4]f32, border_width: f32) ?*c.SDL_Texture {
+    const aa_i: i32 = @intCast(aa_level);
+    const super_w: i32 = w * aa_i;
+    const super_h: i32 = h * aa_i;
+    const white: c.SDL_FColor = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
+    const clear: c.SDL_FColor = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+
+    const super_tex = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGBA8888, c.SDL_TEXTUREACCESS_TARGET, super_w, super_h) orelse return null;
+    defer c.SDL_DestroyTexture(super_tex);
+    _ = c.SDL_SetTextureBlendMode(super_tex, c.SDL_BLENDMODE_BLEND);
+
+    const prev_target = c.SDL_GetRenderTarget(renderer);
+    _ = c.SDL_SetRenderTarget(renderer, super_tex);
+    _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_NONE);
+    _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+    _ = c.SDL_RenderClear(renderer);
+
+    const aa_f: f32 = @floatFromInt(aa_level);
+    const clamped = clampRadii(radii, @floatFromInt(w), @floatFromInt(h));
+    const outer_scaled = [4]f32{ clamped[0] * aa_f, clamped[1] * aa_f, clamped[2] * aa_f, clamped[3] * aa_f };
+    const super_w_f: f32 = @floatFromInt(super_w);
+    const super_h_f: f32 = @floatFromInt(super_h);
+
+    _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND);
+    const outer_pts = roundedRectPoints(0, 0, super_w_f, super_h_f, outer_scaled);
+    fillConvexPolygon(renderer, &outer_pts, white);
+
+    // Erase the interior back to real transparency, same reasoning as
+    // renderRingMask -- BLENDMODE_NONE + alpha 0 genuinely punches a hole
+    // rather than drawing a color-matched fake fill that would only look
+    // right against one specific background.
+    const super_border: f32 = border_width * aa_f;
+    const inner_w = @max(super_w_f - 2 * super_border, 0);
+    const inner_h = @max(super_h_f - 2 * super_border, 0);
+    var inner_radii: [4]f32 = undefined;
+    for (outer_scaled, 0..) |r, i| inner_radii[i] = @max(r - super_border, 0);
+    _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_NONE);
+    const inner_pts = roundedRectPoints(super_border, super_border, inner_w, inner_h, inner_radii);
+    fillConvexPolygon(renderer, &inner_pts, clear);
+
+    _ = c.SDL_SetRenderTarget(renderer, prev_target);
+    return downsample(renderer, super_tex, w, h);
+}
+
+/// Draws a filled, per-corner-rounded rectangle (`radii` in TL/TR/BR/BL
+/// order, matching the stylesheet's real CSS-clockwise convention) in
+/// `color`, using/populating `cache`. Unlike `drawCircle`, `rect` need not
+/// be square -- this is the shape Container/Button-style widgets actually
+/// want (e.g. 8px corners on a 200x40 button).
+pub fn drawRoundedRect(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, color: c.SDL_Color) void {
+    const w: i32 = @intFromFloat(@round(rect.w));
+    const h: i32 = @intFromFloat(@round(rect.h));
+    if (w <= 0 or h <= 0) return;
+    const key = MaskKey{ .kind = .rect, .w = w, .h = h, .radii = quantizeRadii(radii) };
+    const tex = if (cache.find(key)) |t| t else blk: {
+        const t = renderRectMask(renderer, w, h, radii) orelse return;
+        cache.insert(key, t);
+        break :blk t;
+    };
+
+    _ = c.SDL_SetTextureColorMod(tex, color.r, color.g, color.b);
+    _ = c.SDL_SetTextureAlphaMod(tex, color.a);
+    // See drawCircle's doc comment -- `rect` is the real destination, not a
+    // rect rebuilt from the integer w/h used only for the mask/cache key.
+    _ = c.SDL_RenderTexture(renderer, tex, null, &rect);
+}
+
+/// Draws a per-corner-rounded rectangle's border (`border_width` thick,
+/// inset from the outer edge) in `color`, using/populating `cache`.
+pub fn drawRoundedRectBorder(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, border_width: f32, color: c.SDL_Color) void {
+    const w: i32 = @intFromFloat(@round(rect.w));
+    const h: i32 = @intFromFloat(@round(rect.h));
+    if (w <= 0 or h <= 0) return;
+    const bw: i32 = @intFromFloat(@max(@round(border_width), 1));
+    const key = MaskKey{ .kind = .rect_border, .w = w, .h = h, .radii = quantizeRadii(radii), .border_width = bw };
+    const tex = if (cache.find(key)) |t| t else blk: {
+        const t = renderRectBorderMask(renderer, w, h, radii, @floatFromInt(bw)) orelse return;
+        cache.insert(key, t);
+        break :blk t;
+    };
+
+    _ = c.SDL_SetTextureColorMod(tex, color.r, color.g, color.b);
+    _ = c.SDL_SetTextureAlphaMod(tex, color.a);
     _ = c.SDL_RenderTexture(renderer, tex, null, &rect);
 }

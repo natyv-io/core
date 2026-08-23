@@ -88,11 +88,15 @@ const SetSizeRequest = struct { widget_id: u32, height: f32 };
 // happens to want today (that conversion is FrameLoop.zig's
 // `styleOverrideColor`'s job, not this wire format's).
 const ColorRequest = struct { r: f32, g: f32, b: f32, a: f32 = 1 };
+// Styling system Stage 5a: `[4]f32` in TL/TR/BR/BL order, matching the
+// stylesheet's real CSS-clockwise convention -- same representation
+// Resolver.zig already resolves cornerRadius into, no reshaping needed.
+const BorderRequest = struct { width: f32, color: ColorRequest };
 // `null` fields mean "the guest's ApplyStyle call didn't touch this
 // property," not "set it to zero/none" -- see `setStyleHostFn`'s doc
 // comment. Reuses `ClayPaddingRequest` (declared below) rather than a
 // second padding shape.
-const SetStyleRequest = struct { widget_id: u32, background_color: ?ColorRequest = null, padding: ?ClayPaddingRequest = null };
+const SetStyleRequest = struct { widget_id: u32, background_color: ?ColorRequest = null, padding: ?ClayPaddingRequest = null, corner_radius: ?[4]f32 = null, border: ?BorderRequest = null };
 
 // L3: wire-format mirrors of Clay's real C types (Clay_SizingAxis,
 // Clay_Padding, Clay_LayoutDirection, Clay_ChildAlignment -- see clay.h)
@@ -1068,8 +1072,9 @@ pub fn setStyleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
 
     const bg: ?c.SDL_FColor = if (req.background_color) |bc| .{ .r = bc.r, .g = bc.g, .b = bc.b, .a = bc.a } else null;
     const padding: ?c.Clay_Padding = if (req.padding) |p| .{ .left = p.left, .right = p.right, .top = p.top, .bottom = p.bottom } else null;
+    const border: ?WidgetHost.Border = if (req.border) |b| .{ .width = b.width, .color = .{ .r = b.color.r, .g = b.color.g, .b = b.color.b, .a = b.color.a } } else null;
 
-    if (!self.setStyle(self.io(), req.widget_id, bg, padding)) {
+    if (!self.setStyle(self.io(), req.widget_id, bg, padding, req.corner_radius, border)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }

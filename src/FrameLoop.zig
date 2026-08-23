@@ -369,14 +369,39 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
 /// means "no override was ever set on this widget," not "the color is
 /// black," so callers must fall back to the widget's own `fillColor()`
 /// result, not to a default color here.
-fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
-    const fc = fcolor orelse return null;
+fn fcolorToColor(fc: c.SDL_FColor) c.SDL_Color {
     return .{
         .r = @intFromFloat(@round(std.math.clamp(fc.r, 0, 1) * 255)),
         .g = @intFromFloat(@round(std.math.clamp(fc.g, 0, 1) * 255)),
         .b = @intFromFloat(@round(std.math.clamp(fc.b, 0, 1) * 255)),
         .a = @intFromFloat(@round(std.math.clamp(fc.a, 0, 1) * 255)),
     };
+}
+
+fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
+    const fc = fcolor orelse return null;
+    return fcolorToColor(fc);
+}
+
+/// Styling system Stage 5a: shared by both `fillRect()` draw call sites
+/// below (the batched path can't use this -- it opts a styled widget out of
+/// batching entirely, same "opt out for a shape that isn't a plain solid
+/// rect" precedent RadioButton's own dot already established). Widgets with
+/// neither `corner_radius` nor `border` set keep the exact plain
+/// `SDL_RenderFillRect` path, unchanged -- this only branches into
+/// `ShapeCache` for a widget that actually opted into styling.
+fn drawStyledFill(renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, clay_style: WidgetHost.ClayStyle, rect: c.SDL_FRect, default_color: c.SDL_Color) void {
+    const color = styleOverrideColor(clay_style.background_color) orelse default_color;
+    if (clay_style.corner_radius == null and clay_style.border == null) {
+        _ = c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
+        _ = c.SDL_RenderFillRect(renderer, &rect);
+        return;
+    }
+    const radii = clay_style.corner_radius orelse .{ 0, 0, 0, 0 };
+    ShapeCache.drawRoundedRect(shape_cache, renderer, rect, radii, color);
+    if (clay_style.border) |b| {
+        ShapeCache.drawRoundedRectBorder(shape_cache, renderer, rect, radii, b.width, fcolorToColor(b.color));
+    }
 }
 
 fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding, shape_cache: *ShapeCache.Cache) void {
@@ -406,9 +431,7 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
     const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
     if (slot.widget.fillRect()) |fr| {
-        const color = styleOverrideColor(slot.clay_style.background_color) orelse fr.color;
-        _ = c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
-        _ = c.SDL_RenderFillRect(renderer, &fr.rect);
+        drawStyledFill(renderer, shape_cache, slot.clay_style, fr.rect, fr.color);
     }
     drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding, shape_cache);
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
@@ -712,6 +735,23 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (floating) continue;
         if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
         if (slot.widget.fillRect()) |fr| {
+            if (slot.clay_style.corner_radius != null or slot.clay_style.border != null) {
+                // Flush whatever's pending first -- a styled shape draws
+                // immediately (it can't join the plain-rect batch), so
+                // without this, a batched sibling queued earlier in this
+                // same loop would render *after* this one instead of
+                // before it, silently reordering overlapping widgets.
+                wctx.draw_batcher.flush(wctx.renderer);
+                if (clip) |cr| {
+                    const sdl_clip = toClipRect(cr);
+                    _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
+                    drawStyledFill(wctx.renderer, &wctx.shape_cache, slot.clay_style, fr.rect, fr.color);
+                    _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
+                } else {
+                    drawStyledFill(wctx.renderer, &wctx.shape_cache, slot.clay_style, fr.rect, fr.color);
+                }
+                continue;
+            }
             const color = styleOverrideColor(slot.clay_style.background_color) orelse fr.color;
             if (clip) |cr| {
                 const sdl_clip = toClipRect(cr);

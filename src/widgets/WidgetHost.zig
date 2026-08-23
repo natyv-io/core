@@ -335,6 +335,13 @@ pub const Widget = union(WidgetKind) {
 /// guest-supplied absolute pixels. Stored per-slot (not recomputed) so the
 /// render loop can redeclare each node to Clay every frame from data it
 /// already has, without a second guest round trip.
+/// Styling system Stage 5a. Named (not an inline anonymous struct) so the
+/// same type identity can be shared between `ClayStyle.border`, `setStyle`,
+/// and the host-function request shape -- two separately-written anonymous
+/// `struct { ... }` literals are distinct types in Zig even when
+/// structurally identical.
+pub const Border = struct { width: f32, color: c.SDL_FColor };
+
 pub const ClayStyle = struct {
     sizing: c.Clay_Sizing = std.mem.zeroes(c.Clay_Sizing),
     padding: c.Clay_Padding = std.mem.zeroes(c.Clay_Padding),
@@ -342,14 +349,25 @@ pub const ClayStyle = struct {
     /// hardcoded default fill" (e.g. Container's `background: bool`
     /// still picks its fixed panel color) -- set only via `setStyle`
     /// below, real end-to-end proof that a resolved stylesheet token can
-    /// actually change a widget's rendering, ahead of Stage 3's SDF-shader
-    /// migration (which is what will eventually let cornerRadius/border/
-    /// gradient/texture render too). Consulted at the two `fillRect()`
-    /// draw call sites in FrameLoop.zig, not inside each widget's own
-    /// `fillColor()` -- keeps this override generic across every widget
-    /// kind that already participates in the plain-fill draw path, with
-    /// zero changes to their individual `fillColor()` methods.
+    /// actually change a widget's rendering. Consulted at the two
+    /// `fillRect()` draw call sites in FrameLoop.zig, not inside each
+    /// widget's own `fillColor()` -- keeps this override generic across
+    /// every widget kind that already participates in the plain-fill draw
+    /// path, with zero changes to their individual `fillColor()` methods.
     background_color: ?c.SDL_FColor = null,
+    /// Styling system Stage 5a: same "`null` means use this widget's own
+    /// default (square corners)" precedent as `background_color`. Order is
+    /// TL/TR/BR/BL, matching the stylesheet's real CSS-clockwise
+    /// convention (see `Resolver.zig`). Consulted at the same two
+    /// `fillRect()` call sites -- when set, those sites draw through
+    /// `ShapeCache.drawRoundedRect` instead of a plain `SDL_RenderFillRect`.
+    corner_radius: ?[4]f32 = null,
+    /// Styling system Stage 5a: `null` means no border drawn at all (not
+    /// "zero-width border", which would be a wasted draw). Drawn via
+    /// `ShapeCache.drawRoundedRectBorder` using the same `corner_radius`
+    /// above, so a bordered widget's border always matches its own
+    /// corners -- there's no separate border-radius concept.
+    border: ?Border = null,
     child_gap: u16 = 0,
     direction: c.Clay_LayoutDirection = c.CLAY_LEFT_TO_RIGHT,
     child_alignment: c.Clay_ChildAlignment = std.mem.zeroes(c.Clay_ChildAlignment),
@@ -1689,17 +1707,21 @@ pub fn setHeight(self: *Self, call_io: Io, id: u32, height: f32) bool {
     return true;
 }
 
-/// Styling system Stage 2: applies already-resolved style values to an
-/// existing widget -- `background_color`/`padding` are `null` when the
-/// guest's call didn't include that property (leaves it unchanged), not
-/// "set it to zero/none." Deliberately takes resolved values, not style-
-/// token names -- see `natyv_jsx_markup_layer` memory's "Corrected
-/// 2026-08-21" note: the host stays completely ignorant of tokens, same as
-/// every other host wire contract in this project (it already only ever
-/// receives fully-resolved property values, e.g. `ClayContainerRequest`'s
-/// `padding` today). Name-to-value resolution/merging lives in the Go SDK's
-/// `ApplyStyle` helper, one layer up.
-pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding) bool {
+/// Styling system Stage 2 (Stage 5a added `corner_radius`/`border`):
+/// applies already-resolved style values to an existing widget -- every
+/// param is `null` when the guest's call didn't include that property
+/// (leaves it unchanged), not "set it to zero/none." Deliberately takes
+/// resolved values, not style-token names -- see `natyv_jsx_markup_layer`
+/// memory's "Corrected 2026-08-21" note: the host stays completely
+/// ignorant of tokens, same as every other host wire contract in this
+/// project (it already only ever receives fully-resolved property values,
+/// e.g. `ClayContainerRequest`'s `padding` today). Name-to-value
+/// resolution/merging lives in the Go SDK's `ApplyStyle` helper, one layer
+/// up. `corner_radius`/`border` are purely visual (Clay never sees them),
+/// so unlike `padding` they never bump `layout_generation` -- FrameLoop.zig
+/// reads them live off `Slot.clay_style` every frame, no dirty-tracking
+/// needed.
+pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding, corner_radius: ?[4]f32, border: ?Border) bool {
     self.mutex.lockUncancelable(call_io);
     const slot = self.findLocked(id) orelse {
         self.mutex.unlock(call_io);
@@ -1714,6 +1736,8 @@ pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FCol
         changed = changed or !std.meta.eql(slot.clay_style.padding, p);
         slot.clay_style.padding = p;
     }
+    if (corner_radius) |cr| slot.clay_style.corner_radius = cr;
+    if (border) |b| slot.clay_style.border = b;
     self.mutex.unlock(call_io);
 
     if (changed and slot.clay_managed) self.layout_generation +%= 1;
