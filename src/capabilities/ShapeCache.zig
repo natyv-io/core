@@ -429,3 +429,74 @@ pub fn drawRoundedRectBorder(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.
     _ = c.SDL_SetTextureAlphaMod(tex, color.a);
     _ = c.SDL_RenderTexture(renderer, tex, null, &rect);
 }
+
+fn lerpColor(a: c.SDL_FColor, b: c.SDL_FColor, t: f32) c.SDL_FColor {
+    return .{
+        .r = a.r + (b.r - a.r) * t,
+        .g = a.g + (b.g - a.g) * t,
+        .b = a.b + (b.b - a.b) * t,
+        .a = a.a + (b.a - a.a) * t,
+    };
+}
+
+/// Draws a filled, per-corner-rounded rectangle with a linear gradient
+/// fill, using/populating `cache` for the shape mask exactly like
+/// `drawRoundedRect` (the mask is shape-only -- fill is applied at draw
+/// time regardless of mode, per this file's own doc comment). Deliberately
+/// anchor-agnostic: `start_uv`/`end_uv` are plain 0..1 shape-space
+/// positions (0,0 = top-left, 1,1 = bottom-right), not the stylesheet's
+/// named 8-direction vocabulary -- resolving an anchor name like `topLeft`
+/// to a UV position is a stylesheet/codegen concern (Codegen.zig bakes it
+/// in at `natyv prepare` time, the same place hex colors already get
+/// resolved to floats), not something this rendering module needs to know.
+///
+/// The gradient axis runs from `start_uv` to `end_uv`; each of the
+/// rectangle's 4 real corners gets a color by projecting its own position
+/// onto that axis (`t = clamp(dot(corner - start, axis) / |axis|^2, 0, 1)`,
+/// the standard two-point linear-gradient projection) and lerping
+/// `start_color`/`end_color` by `t`. `SDL_RenderGeometry`'s native
+/// per-vertex color interpolation then does the actual per-pixel blend
+/// between those 4 corners while sampling the shape mask for alpha --
+/// first real use of that interpolation in this codebase, but the same
+/// mechanism `fillConvexPolygon` already relies on for flat colors (just
+/// with a texture bound this time instead of `null`), not a new technique.
+pub fn drawRoundedRectGradient(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, start_uv: [2]f32, start_color: c.SDL_FColor, end_uv: [2]f32, end_color: c.SDL_FColor) void {
+    const w: i32 = @intFromFloat(@round(rect.w));
+    const h: i32 = @intFromFloat(@round(rect.h));
+    if (w <= 0 or h <= 0) return;
+    const key = MaskKey{ .kind = .rect, .w = w, .h = h, .radii = quantizeRadii(radii) };
+    const tex = if (cache.find(key)) |t| t else blk: {
+        const t = renderRectMask(renderer, w, h, radii) orelse return;
+        cache.insert(key, t);
+        break :blk t;
+    };
+    // Reset any leftover flat-fill mod from a previous drawRoundedRect call
+    // against this same cached texture -- the gradient's own per-vertex
+    // colors below are the only modulation that should apply here.
+    _ = c.SDL_SetTextureColorMod(tex, 255, 255, 255);
+    _ = c.SDL_SetTextureAlphaMod(tex, 255);
+
+    const axis: [2]f32 = .{ end_uv[0] - start_uv[0], end_uv[1] - start_uv[1] };
+    const axis_len_sq = axis[0] * axis[0] + axis[1] * axis[1];
+
+    const corner_uvs = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } }; // TL,TR,BR,BL
+    var corner_colors: [4]c.SDL_FColor = undefined;
+    for (corner_uvs, 0..) |uv, i| {
+        const rel: [2]f32 = .{ uv[0] - start_uv[0], uv[1] - start_uv[1] };
+        const t: f32 = if (axis_len_sq > 0) std.math.clamp((rel[0] * axis[0] + rel[1] * axis[1]) / axis_len_sq, 0, 1) else 0;
+        corner_colors[i] = lerpColor(start_color, end_color, t);
+    }
+
+    const corner_pos = [4][2]f32{
+        .{ rect.x, rect.y },
+        .{ rect.x + rect.w, rect.y },
+        .{ rect.x + rect.w, rect.y + rect.h },
+        .{ rect.x, rect.y + rect.h },
+    };
+    var verts: [4]c.SDL_Vertex = undefined;
+    for (0..4) |i| {
+        verts[i] = .{ .position = .{ .x = corner_pos[i][0], .y = corner_pos[i][1] }, .color = corner_colors[i], .tex_coord = .{ .x = corner_uvs[i][0], .y = corner_uvs[i][1] } };
+    }
+    var indices = [6]c_int{ 0, 1, 2, 0, 2, 3 };
+    _ = c.SDL_RenderGeometry(renderer, tex, &verts, 4, &indices, 6);
+}

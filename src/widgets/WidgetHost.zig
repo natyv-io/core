@@ -342,6 +342,13 @@ pub const Widget = union(WidgetKind) {
 /// structurally identical.
 pub const Border = struct { width: f32, color: c.SDL_FColor };
 
+/// Styling system Stage 5b. `start_uv`/`end_uv` are plain 0..1 shape-space
+/// positions, already resolved from the stylesheet's named anchor
+/// vocabulary (`topLeft`, etc.) at `natyv prepare` time -- see
+/// ShapeCache.drawRoundedRectGradient's own doc comment for why this host
+/// type stays anchor-agnostic.
+pub const Gradient = struct { start_uv: [2]f32, start_color: c.SDL_FColor, end_uv: [2]f32, end_color: c.SDL_FColor };
+
 pub const ClayStyle = struct {
     sizing: c.Clay_Sizing = std.mem.zeroes(c.Clay_Sizing),
     padding: c.Clay_Padding = std.mem.zeroes(c.Clay_Padding),
@@ -368,6 +375,14 @@ pub const ClayStyle = struct {
     /// above, so a bordered widget's border always matches its own
     /// corners -- there's no separate border-radius concept.
     border: ?Border = null,
+    /// Styling system Stage 5b: `null` means flat `background_color` fill
+    /// (or the widget's own default, per that field's doc comment) --
+    /// when set, takes precedence over `background_color` for the fill
+    /// itself. Drawn via `ShapeCache.drawRoundedRectGradient` using the
+    /// same `corner_radius` above; `border` (if also set) still draws its
+    /// own flat color on top, borders don't have a gradient concept in
+    /// this vocabulary.
+    gradient: ?Gradient = null,
     child_gap: u16 = 0,
     direction: c.Clay_LayoutDirection = c.CLAY_LEFT_TO_RIGHT,
     child_alignment: c.Clay_ChildAlignment = std.mem.zeroes(c.Clay_ChildAlignment),
@@ -1721,7 +1736,7 @@ pub fn setHeight(self: *Self, call_io: Io, id: u32, height: f32) bool {
 /// so unlike `padding` they never bump `layout_generation` -- FrameLoop.zig
 /// reads them live off `Slot.clay_style` every frame, no dirty-tracking
 /// needed.
-pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding, corner_radius: ?[4]f32, border: ?Border) bool {
+pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding, corner_radius: ?[4]f32, border: ?Border, gradient: ?Gradient) bool {
     self.mutex.lockUncancelable(call_io);
     const slot = self.findLocked(id) orelse {
         self.mutex.unlock(call_io);
@@ -1738,6 +1753,7 @@ pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FCol
     }
     if (corner_radius) |cr| slot.clay_style.corner_radius = cr;
     if (border) |b| slot.clay_style.border = b;
+    if (gradient) |g| slot.clay_style.gradient = g;
     self.mutex.unlock(call_io);
 
     if (changed and slot.clay_managed) self.layout_generation +%= 1;

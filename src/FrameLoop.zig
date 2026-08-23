@@ -392,13 +392,17 @@ fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
 /// `ShapeCache` for a widget that actually opted into styling.
 fn drawStyledFill(renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, clay_style: WidgetHost.ClayStyle, rect: c.SDL_FRect, default_color: c.SDL_Color) void {
     const color = styleOverrideColor(clay_style.background_color) orelse default_color;
-    if (clay_style.corner_radius == null and clay_style.border == null) {
+    if (clay_style.corner_radius == null and clay_style.border == null and clay_style.gradient == null) {
         _ = c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
         _ = c.SDL_RenderFillRect(renderer, &rect);
         return;
     }
     const radii = clay_style.corner_radius orelse .{ 0, 0, 0, 0 };
-    ShapeCache.drawRoundedRect(shape_cache, renderer, rect, radii, color);
+    if (clay_style.gradient) |g| {
+        ShapeCache.drawRoundedRectGradient(shape_cache, renderer, rect, radii, g.start_uv, g.start_color, g.end_uv, g.end_color);
+    } else {
+        ShapeCache.drawRoundedRect(shape_cache, renderer, rect, radii, color);
+    }
     if (clay_style.border) |b| {
         ShapeCache.drawRoundedRectBorder(shape_cache, renderer, rect, radii, b.width, fcolorToColor(b.color));
     }
@@ -735,7 +739,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (floating) continue;
         if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
         if (slot.widget.fillRect()) |fr| {
-            if (slot.clay_style.corner_radius != null or slot.clay_style.border != null) {
+            if (slot.clay_style.corner_radius != null or slot.clay_style.border != null or slot.clay_style.gradient != null) {
                 // Flush whatever's pending first -- a styled shape draws
                 // immediately (it can't join the plain-rect batch), so
                 // without this, a batched sibling queued earlier in this
