@@ -69,8 +69,13 @@ pub fn main(init: std.process.Init) !void {
     };
     defer config.deinit();
 
+    // Only ever consulted in the non-embedded (local dev/testing) branch
+    // below -- `<name>.wasm` under `guest/`, the same convention the now-
+    // removed `app_wasm` field always held in practice.
     const config_dir = std.fs.path.dirname(config_path) orelse ".";
-    const app_wasm_path = try std.fs.path.join(allocator, &.{ config_dir, config.value.app_wasm });
+    const wasm_filename = try config.value.wasmFilename(allocator);
+    defer allocator.free(wasm_filename);
+    const app_wasm_path = try std.fs.path.join(allocator, &.{ config_dir, "guest", wasm_filename });
     defer allocator.free(app_wasm_path);
 
     const app_name_z = try allocator.dupeZ(u8, config.value.name);
