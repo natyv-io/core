@@ -3,6 +3,8 @@ const c = @import("c.zig").c;
 const Config = @import("Config.zig");
 const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
+const build_options = @import("build_options");
+const EmbeddedWasm = @import("EmbeddedWasm");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const timing = @import("timing.zig");
 const ClayLayout = @import("capabilities/ClayLayout.zig");
@@ -102,13 +104,27 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    std.debug.print("[main] app: {s} ({s})\n[main] database: {s}\n", .{ config.value.name, app_wasm_path, db_path orelse "(sqlite disabled)" });
+    // `.ntx` tooling Stage 7's bundling step: a binary built via
+    // `zig build -Dembed-app-wasm=true` (only ever `natyv build` itself)
+    // uses the wasm embedded at compile time instead of reading
+    // `app_wasm` from disk -- `wasm_buf` (and its `defer`) only exists to
+    // free the runtime-loaded copy; `EmbeddedWasm.bytes` is static
+    // program data and must never be passed to `allocator.free`.
+    var wasm_buf: ?[]const u8 = null;
+    defer if (wasm_buf) |w| allocator.free(w);
 
-    const wasm = std.Io.Dir.cwd().readFileAlloc(io, app_wasm_path, allocator, .unlimited) catch |err| {
-        std.debug.print("[main] failed to read {s}: {}\n", .{ app_wasm_path, err });
-        return err;
+    const wasm: []const u8 = if (build_options.embed_app_wasm) blk: {
+        std.debug.print("[main] app: {s} (embedded wasm)\n[main] database: {s}\n", .{ config.value.name, db_path orelse "(sqlite disabled)" });
+        break :blk EmbeddedWasm.bytes;
+    } else blk: {
+        std.debug.print("[main] app: {s} ({s})\n[main] database: {s}\n", .{ config.value.name, app_wasm_path, db_path orelse "(sqlite disabled)" });
+        const w = std.Io.Dir.cwd().readFileAlloc(io, app_wasm_path, allocator, .unlimited) catch |err| {
+            std.debug.print("[main] failed to read {s}: {}\n", .{ app_wasm_path, err });
+            return err;
+        };
+        wasm_buf = w;
+        break :blk w;
     };
-    defer allocator.free(wasm);
 
     var runtime = try Runtime.init(allocator, db_path);
     defer runtime.deinit();
