@@ -50,10 +50,17 @@ const ProgressBar = @import("widgets/ProgressBar.zig");
 const Font = @import("capabilities/Font.zig");
 const EventQueue = @import("EventQueue.zig");
 const Dispatch = @import("Dispatch.zig");
+// Stage 2.2 of the binding generator arc: a build.zig-injected named
+// module (mirrors `EmbeddedWasm`'s own injection) -- either the empty
+// `BindingsAbsent.zig` stub (a normal dev build, `-Dhas-bindings` unset)
+// or a real, `natyv bind`-generated `BindingsGenerated.zig` (written by
+// `natyv build` immediately before this build runs, whenever the app
+// declared any `conf.natyv.json` `bindings` entries).
+const Bindings = @import("Bindings");
 
 const Self = @This();
 
-const max_host_functions = SqliteCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count;
+const max_host_functions = SqliteCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
 
 allocator: std.mem.Allocator,
 /// `null` when conf.natyv.json's `sqlite.enabled` is false -- no connection
@@ -94,6 +101,10 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, widget_kind
     if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
     n += self.widgets.registerInto(funcs[n..], widget_kinds);
     if (clay_enabled) n += self.widgets.registerClayInto(funcs[n..]);
+    // `[]?*anyopaque`, not `[]?*const c.ExtismFunction` -- see
+    // `BindingsAbsent.zig`'s own doc comment on why this cross-module
+    // boundary has to go through an untyped opaque pointer cast.
+    n += Bindings.registerInto(@ptrCast(funcs[n..]));
 
     const manifest_json = manifest.build(self.allocator, wasm) catch {
         std.debug.print("[runtime] failed to build plugin manifest\n", .{});
