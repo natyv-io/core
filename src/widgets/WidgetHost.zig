@@ -569,6 +569,11 @@ pub fn isEffectivelyVisible(slots: []const Slot, index: SnapshotIndex, slot: Slo
 /// even when every slot is live at once, keeping the average probe chain
 /// short.
 pub const SnapshotIndex = struct {
+    // Coupled to `max_widgets` (192) the same way DrawBatcher/ClayLayout's
+    // own snapshot buffers already are -- comfortably above it (~0.375 load
+    // factor at the hard cap) so probe chains stay short. If `max_widgets`
+    // is ever bumped again (it's been bumped twice already), revisit this
+    // alongside it.
     const capacity = 512;
     const empty: u32 = std.math.maxInt(u32);
 
