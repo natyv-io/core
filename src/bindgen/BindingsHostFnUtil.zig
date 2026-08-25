@@ -31,3 +31,33 @@ pub fn writeErrorJson(plugin: ?*c.ExtismCurrentPlugin, out_val: *allowzero c.Ext
     const json = std.fmt.bufPrint(&out_buf, "{{\"error\":\"{s}\"}}", .{msg}) catch "{\"error\":\"unknown\"}";
     writeGuestBytes(plugin, out_val, json);
 }
+
+// Real drift-protection test added during the post-Stage-2.10
+// maintainability pass: this file's own doc comment already says it's
+// "kept in sync by hand" with `src/host_fn_util.zig`, but nothing
+// actually verified that until now -- a real risk (if a small one,
+// given how stable this logic is) that a future bug fix lands in one
+// file and is forgotten in the other. Compares everything from the
+// first `pub fn` onward (not the whole file -- each file's own doc
+// comment and `c` import line are legitimately different by design,
+// since each parameterizes against its own real `@cImport` instance).
+test "stays byte-for-byte identical to src/host_fn_util.zig from the first pub fn onward" {
+    const allocator = std.testing.allocator;
+    const this_file = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/bindgen/BindingsHostFnUtil.zig", allocator, .unlimited);
+    defer allocator.free(this_file);
+    const original = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/host_fn_util.zig", allocator, .unlimited);
+    defer allocator.free(original);
+
+    // Bounded to `original`'s own remaining length, not sliced to the end
+    // of `this_file` -- this test's own source text lives in *this* file,
+    // below the three real functions, so comparing "to the end" would
+    // wrongly compare `original`'s tail (nothing) against this test's own
+    // code (a real bug caught the hard way: an initial version of this
+    // exact test failed against itself for exactly this reason).
+    const needle = "pub fn readGuestBytes";
+    const this_start = std.mem.indexOf(u8, this_file, needle) orelse return error.TestUnexpectedResult;
+    const original_start = std.mem.indexOf(u8, original, needle) orelse return error.TestUnexpectedResult;
+    const original_remaining = original[original_start..];
+    const this_bounded = this_file[this_start .. this_start + original_remaining.len];
+    try std.testing.expectEqualStrings(original_remaining, this_bounded);
+}
