@@ -77,6 +77,7 @@ pub fn init(allocator: std.mem.Allocator, db_path: ?[:0]const u8) Error!Self {
 pub fn deinit(self: *Self) void {
     if (self.plugin) |p| c.extism_plugin_free(p);
     if (self.sqlite) |*s| s.close();
+    self.widgets.deinit();
 }
 
 /// Two-phase init: each capability's host functions capture the capability

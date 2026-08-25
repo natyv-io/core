@@ -339,7 +339,8 @@ pub fn main(init: std.process.Init) !void {
                         // window just stays open. See EventType's own doc
                         // comment.
                         if (windows[idx].root_widget_id) |root_id| {
-                            queue.push(io, root_id, .window_close_requested, "", FloatingOrder.surfaceIdFor(widget_snapshot[0..widget_count], root_id));
+                            const snap = widget_snapshot[0..widget_count];
+                            queue.push(io, root_id, .window_close_requested, "", FloatingOrder.surfaceIdFor(snap, WidgetHost.SnapshotIndex.build(snap), root_id));
                         } else {
                             running = false;
                         }

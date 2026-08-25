@@ -1288,6 +1288,7 @@ pub fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
                 // already running on the main thread).
                 self.queueWidgetTextDestroysLocked(&s.widget);
                 if (s.clay_managed) self.layout_generation +%= 1;
+                _ = self.id_to_index.remove(s.id);
                 slot.* = null;
                 host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
                 return;

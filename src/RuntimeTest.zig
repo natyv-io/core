@@ -2002,6 +2002,87 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
     }
 }
 
+// Real crash regression (Quinn's own real click-through on `clay-fixture`,
+// caught live, not by any prior unit test): `WidgetHostFunctions.
+// destroyWidgetHostFn` -- `natyv_destroy_widget`'s own single-widget,
+// no-cascade destroy path, distinct from `destroySubtreeLocked`'s cascading
+// one -- nulled a slot directly without removing its `id_to_index` entry
+// when that map was first added. Every prior test that exercised this exact
+// path (including the dropdown-select test right above) only ever checked
+// that the destroyed id was gone from a fresh `snapshot()` (which reads the
+// raw `slots` array directly, never consulting `id_to_index` at all), so
+// none of them actually exercised a *second* lookup by the now-stale id --
+// which is exactly what `ClayLayout.layoutIfNeeded`'s real writeback loop
+// does every frame via `WidgetHost.setRect`, racing the dispatch worker
+// thread's own destroys in the real app. Reproduced here deterministically,
+// with no threading needed at all: the underlying bug is a plain data
+// inconsistency (a stale map entry pointing at a now-null slot), not
+// something that only manifests under real concurrency -- the race in the
+// real app just decides *when* a second lookup lands on a freshly-destroyed
+// id, not *whether* one crashes once it does.
+test "Real crash regression: WidgetHost.setRect on an id destroyed via natyv_destroy_widget's single-widget path is a safe no-op, not a panic" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Select...")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+
+    var dispatch_buf: [256]u8 = undefined;
+    var payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{tid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+    n = runtime.widgets.snapshot(io, &snap);
+
+    var panel_id: ?u32 = null;
+    var option2_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == tid and slot.widget == .container) panel_id = slot.id;
+    }
+    const pid = panel_id orelse return error.MissingPanel;
+    for (snap[0..n]) |slot| {
+        if (slot.parent_id != null and slot.parent_id.? == pid and slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Option 2")) option2_id = slot.id;
+    }
+    const oid = option2_id orelse return error.MissingOption2;
+
+    // Real click on "Option 2" -- destroys the panel and both option
+    // buttons via `natyv_destroy_widget` (Menu.selectItem), the exact
+    // single-widget destroy path this test targets.
+    payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{oid});
+    _ = runtime.call(io, "natyv_dispatch", payload) orelse return error.CallFailed;
+
+    // Before the fix, this second lookup on the now-destroyed `pid`/`oid`
+    // would panic inside `findLocked` on `self.slots[idx].?` -- a stale
+    // `id_to_index` entry pointing at a slot that's already been nulled.
+    // Simply not crashing is the real assertion here; `setRect` becoming a
+    // no-op for a missing id is `findLocked`'s own documented contract.
+    runtime.widgets.setRect(io, pid, .{ .x = 1, .y = 1, .w = 1, .h = 1 });
+    runtime.widgets.setRect(io, oid, .{ .x = 1, .y = 1, .w = 1, .h = 1 });
+
+    // The registry itself must still be healthy afterward -- a fresh
+    // create still gets served correctly, and neither destroyed id is
+    // still resolvable by id.
+    n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        try std.testing.expect(slot.id != pid);
+        try std.testing.expect(slot.id != oid);
+    }
+}
+
 // Migration follow-up (Quinn's real click-through feedback): Dropdown's
 // original v1 scope deliberately had no arrow-key cycling or click-away
 // close (see Combobox's own doc comment contrasting itself with this).
@@ -3753,21 +3834,23 @@ test "W19 follow-up: WidgetHost.isEffectivelyVisible checks the full ancestor ch
     const parent: WidgetHost.Slot = .{ .id = 2, .widget = .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, .parent_id = 1, .clay_style = .{ .visible = true } };
     const child: WidgetHost.Slot = .{ .id = 3, .widget = .{ .label = Label.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, "") }, .parent_id = 2, .clay_style = .{ .visible = true } };
     const slots = [_]WidgetHost.Slot{ grandparent, parent, child };
+    const index = WidgetHost.SnapshotIndex.build(&slots);
 
     // The child's own flag is true, but its grandparent's is false -- the
     // whole chain must be treated as not visible.
-    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, child));
+    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, index, child));
     // The parent's own flag is true too, but it's under the same hidden
     // grandparent.
-    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, parent));
+    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, index, parent));
     // The grandparent's own flag alone already makes it invisible.
-    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, grandparent));
+    try std.testing.expect(!WidgetHost.isEffectivelyVisible(&slots, index, grandparent));
 
     // Flip the grandparent visible again -- every level's own flag is now
     // true, so the whole chain resolves to effectively visible.
     var slots2 = slots;
     slots2[0].clay_style.visible = true;
-    try std.testing.expect(WidgetHost.isEffectivelyVisible(&slots2, slots2[2]));
+    const index2 = WidgetHost.SnapshotIndex.build(&slots2);
+    try std.testing.expect(WidgetHost.isEffectivelyVisible(&slots2, index2, slots2[2]));
 }
 
 test "Accordion: WidgetHost.setVisible flips a plain widget's visible flag, bumps layout_generation only on a real change, and fails for a missing id" {
@@ -4726,8 +4809,9 @@ test "Multi-window Stage 4: natyv_clay_create_window returns a usable widget_id 
     // window_root the same way it already recognizes modal -- the window's
     // own widget_id is its own surface_id, and its child's surface_id
     // resolves to the same window, not 0 (root/main surface).
-    try std.testing.expectEqual(window_id, FloatingOrder.surfaceIdFor(snap[0..n], window_id));
-    try std.testing.expectEqual(window_id, FloatingOrder.surfaceIdFor(snap[0..n], child_id));
+    const surface_index = WidgetHost.SnapshotIndex.build(snap[0..n]);
+    try std.testing.expectEqual(window_id, FloatingOrder.surfaceIdFor(snap[0..n], surface_index, window_id));
+    try std.testing.expectEqual(window_id, FloatingOrder.surfaceIdFor(snap[0..n], surface_index, child_id));
 
     // windowSubset returns exactly this window's own root + child, nothing
     // from the fixture's own baseline (original-window) content.
@@ -4804,4 +4888,136 @@ test "Multi-window Stage 4: a synthetic .window_close_requested event round-trip
     const second = queue.pop(io) orelse return error.MissingEvent;
     defer queue.freeEntry(second);
     try std.testing.expectEqual(EventQueue.EventType.window_close_requested, second.event_type);
+}
+
+// Follow-up coverage for the `findLocked`/`destroyWidgetHostFn` crash fix
+// above, from a different, more realistic angle: a real nested Menu ->
+// submenu selection (Close() destroys the submenu items+panel, then the
+// top-level items+panel, then the guest's OnSelect handler runs) under the
+// exact real conditions that originally caught the crash -- a real worker
+// thread running `natyv_dispatch` concurrently with a real `layoutIfNeeded`
+// writeback loop on this thread. Prompted by Quinn's own real click-through
+// report of the selection seemingly "not saving" after the crash fix landed
+// -- this test (plus a plain synchronous version tried first) couldn't
+// reproduce that, and Quinn's own follow-up suggested it was likely just
+// not looking at the right label initially, not a real regression. Kept as
+// permanent coverage regardless: it's real, valuable proof that a multi-
+// widget destroy cascade followed by a cross-widget `SetText` survives the
+// exact race the earlier crash needed, not just a single destroy in
+// isolation.
+test "Menu: a nested submenu selection destroys both panel levels and still delivers OnSelect correctly under real concurrent dispatch + layout" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SdlInitFailed;
+    defer c.SDL_Quit();
+    const window = c.SDL_CreateWindow("menu-diag-test", 900, 700, c.SDL_WINDOW_HIDDEN) orelse return error.SdlWindowFailed;
+    defer c.SDL_DestroyWindow(window);
+    const renderer = c.SDL_CreateRenderer(window, null) orelse return error.SdlRendererFailed;
+    defer c.SDL_DestroyRenderer(renderer);
+    const engine = c.TTF_CreateRendererTextEngine(renderer) orelse return error.TextEngineFailed;
+    defer c.TTF_DestroyRendererTextEngine(engine);
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+
+    var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
+    defer clay_layout.deinit(allocator);
+
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
+    defer allocator.free(wasm);
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    runtime.initGuest(io);
+    defer runtime.widgets.destroyAllTextObjects(io);
+
+    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
+    var n = runtime.widgets.snapshot(io, &snap);
+
+    var trigger_id: ?u32 = null;
+    for (snap[0..n]) |slot| {
+        if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Menu")) trigger_id = slot.id;
+    }
+    const tid = trigger_id orelse return error.MissingTrigger;
+
+    var queue = EventQueue.init(allocator);
+    defer queue.deinit();
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+
+    // Real second OS thread, same call main.zig itself makes -- matches
+    // Quinn's own real report exactly: destroy+create+SetText all happen on
+    // this thread's `natyv_dispatch`, concurrently with the "frame loop"
+    // below's own `layoutIfNeeded` writeback (the exact function the
+    // earlier real crash raced against).
+    const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue });
+
+    queue.push(io, tid, .click, "", 0);
+
+    var more_id: ?u32 = null;
+    var i: u32 = 0;
+    while (i < 500 and more_id == null) : (i += 1) {
+        runtime.widgets.flushPendingTextDestroys(io);
+        var sync_ids: [WidgetHost.max_widgets]u32 = undefined;
+        n = runtime.widgets.snapshot(io, &snap);
+        for (snap[0..n], 0..) |s, si| sync_ids[si] = s.id;
+        runtime.widgets.syncTextObjects(io, engine, font_cap.font, sync_ids[0..n]);
+        _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch, null);
+        n = runtime.widgets.snapshot(io, &snap);
+        for (snap[0..n]) |slot| {
+            if (slot.widget == .button and std.mem.indexOf(u8, slot.widget.button.label(), "More") != null) more_id = slot.id;
+        }
+        if (more_id == null) try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    const mid = more_id orelse return error.MissingMore;
+
+    queue.push(io, mid, .click, "", 0);
+
+    var sub_a_id: ?u32 = null;
+    i = 0;
+    while (i < 500 and sub_a_id == null) : (i += 1) {
+        runtime.widgets.flushPendingTextDestroys(io);
+        var sync_ids: [WidgetHost.max_widgets]u32 = undefined;
+        n = runtime.widgets.snapshot(io, &snap);
+        for (snap[0..n], 0..) |s, si| sync_ids[si] = s.id;
+        runtime.widgets.syncTextObjects(io, engine, font_cap.font, sync_ids[0..n]);
+        _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch, null);
+        n = runtime.widgets.snapshot(io, &snap);
+        for (snap[0..n]) |slot| {
+            if (slot.widget == .button and std.mem.eql(u8, slot.widget.button.label(), "Sub A")) sub_a_id = slot.id;
+        }
+        if (sub_a_id == null) try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    const said = sub_a_id orelse return error.MissingSubA;
+
+    queue.push(io, said, .click, "", 0);
+
+    var final_text: [64]u8 = undefined;
+    var final_len: usize = 0;
+    i = 0;
+    while (i < 500) : (i += 1) {
+        runtime.widgets.flushPendingTextDestroys(io);
+        var sync_ids: [WidgetHost.max_widgets]u32 = undefined;
+        n = runtime.widgets.snapshot(io, &snap);
+        for (snap[0..n], 0..) |s, si| sync_ids[si] = s.id;
+        runtime.widgets.syncTextObjects(io, engine, font_cap.font, sync_ids[0..n]);
+        _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 900, 700, 0, 0, false, 0, 0, &scroll_scratch, null);
+        n = runtime.widgets.snapshot(io, &snap);
+        for (snap[0..n]) |slot| {
+            if (slot.widget == .label and std.mem.startsWith(u8, slot.widget.label.text(), "Menu selected:")) {
+                const t = slot.widget.label.text();
+                final_len = @min(t.len, final_text.len);
+                @memcpy(final_text[0..final_len], t[0..final_len]);
+            }
+        }
+        if (std.mem.eql(u8, final_text[0..final_len], "Menu selected: More > Sub A")) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expectEqualStrings("Menu selected: More > Sub A", final_text[0..final_len]);
+
+    queue.requestShutdown(io);
+    worker.join();
 }

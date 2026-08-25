@@ -80,12 +80,12 @@ pub fn windowIDOf(event: c.SDL_Event) ?c.SDL_WindowID {
 /// story (W6/W9 blur payload). Takes a `*WindowManager.WindowContext`
 /// instead of a bare `*c.SDL_Window` now -- IME start/stop is scoped to
 /// whichever window's own focus actually changed, not a single shared one.
-fn updateFocus(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []const WidgetHost.Slot, new_id: ?u32) void {
+fn updateFocus(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, new_id: ?u32) void {
     if (wctx.interaction.focused_widget_id) |old_id| {
         if (new_id == null or old_id != new_id.?) {
             var buf: [32]u8 = undefined;
             const payload = std.fmt.bufPrint(&buf, "{{\"new_focus_id\":{d}}}", .{new_id orelse 0}) catch "{}";
-            queue.push(io, old_id, .blur, payload, FloatingOrder.surfaceIdFor(slots, old_id));
+            queue.push(io, old_id, .blur, payload, FloatingOrder.surfaceIdFor(slots, index, old_id));
         }
     }
     const wants_text_input = widgets.setFocused(io, new_id);
@@ -154,7 +154,7 @@ fn notifyTabsValue(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32
     queue.push(io, id, .change, json, surface_id);
 }
 
-fn notifyTextChanged(queue: *EventQueue, io: std.Io, id: u32, new_text: []const u8, slots: []const WidgetHost.Slot) void {
+fn notifyTextChanged(queue: *EventQueue, io: std.Io, id: u32, new_text: []const u8, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex) void {
     var buf: [max_text_widget_len + 16]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const a = fba.allocator();
@@ -162,7 +162,7 @@ fn notifyTextChanged(queue: *EventQueue, io: std.Io, id: u32, new_text: []const 
     out.appendSlice(a, "{\"text\":") catch return;
     json_util.writeString(&out, a, new_text) catch return;
     out.append(a, '}') catch return;
-    queue.push(io, id, .text_changed, out.items, FloatingOrder.surfaceIdFor(slots, id));
+    queue.push(io, id, .text_changed, out.items, FloatingOrder.surfaceIdFor(slots, index, id));
 }
 
 /// W23: see main.zig's original doc comment on this same struct.
@@ -218,7 +218,7 @@ pub fn drainGlobalPending(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, 
             .io = io,
             .queue = queue,
             .widget_id = req.widget_id,
-            .surface_id = FloatingOrder.surfaceIdFor(full_snapshot, req.widget_id),
+            .surface_id = FloatingOrder.surfaceIdFor(full_snapshot, WidgetHost.SnapshotIndex.build(full_snapshot), req.widget_id),
         };
         switch (req.kind) {
             .open => c.SDL_ShowOpenFileDialog(fileDialogCallback, &file_dialog_ctx, primary_window, null, 0, null, req.allow_many),
@@ -266,15 +266,14 @@ pub fn layoutWindow(widgets: *WidgetHost, io: std.Io, wctx: *WindowManager.Windo
 /// Tree view doc comment on this same block. `full_snapshot` is this frame's
 /// fresh, post-text-sync snapshot (needed for a correct surface_id lookup).
 pub fn pushScrollEvents(queue: *EventQueue, io: std.Io, wctx: *WindowManager.WindowContext, full_snapshot: []const WidgetHost.Slot) void {
+    if (wctx.scrolled_count == 0) return;
+    const index = WidgetHost.SnapshotIndex.build(full_snapshot);
     for (wctx.scrolled_ids[0..wctx.scrolled_count]) |scrolled_id| {
-        for (full_snapshot) |slot| {
-            if (slot.id != scrolled_id) continue;
-            const sd = slot.scroll_data orelse break;
-            var buf: [64]u8 = undefined;
-            const json = std.fmt.bufPrint(&buf, "{{\"scroll_offset_x\":{d},\"scroll_offset_y\":{d}}}", .{ sd.scroll_offset_x, sd.scroll_offset_y }) catch "{}";
-            queue.push(io, scrolled_id, .scroll, json, FloatingOrder.surfaceIdFor(full_snapshot, scrolled_id));
-            break;
-        }
+        const slot = index.find(full_snapshot, scrolled_id) orelse continue;
+        const sd = slot.scroll_data orelse continue;
+        var buf: [64]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"scroll_offset_x\":{d},\"scroll_offset_y\":{d}}}", .{ sd.scroll_offset_x, sd.scroll_offset_y }) catch "{}";
+        queue.push(io, scrolled_id, .scroll, json, FloatingOrder.surfaceIdFor(full_snapshot, index, scrolled_id));
     }
 }
 
@@ -295,23 +294,23 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
     };
 }
 
-fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle) ?u32 {
-    if (!WidgetHost.isEffectivelyVisible(slots, slot)) return null;
+fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle) ?u32 {
+    if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) return null;
     switch (slot.widget) {
         .button => |b| if (b.containsPoint(mx, my)) {
-            activateWidget(widgets, io, queue, slot.id, .button, FloatingOrder.surfaceIdFor(slots, slot.id));
+            activateWidget(widgets, io, queue, slot.id, .button, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
         .checkbox => |cb| if (cb.containsPoint(mx, my)) {
-            activateWidget(widgets, io, queue, slot.id, .checkbox, FloatingOrder.surfaceIdFor(slots, slot.id));
+            activateWidget(widgets, io, queue, slot.id, .checkbox, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
         .toggle => |tg| if (tg.containsPoint(mx, my)) {
-            activateWidget(widgets, io, queue, slot.id, .toggle, FloatingOrder.surfaceIdFor(slots, slot.id));
+            activateWidget(widgets, io, queue, slot.id, .toggle, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
         .radio_button => |r| if (r.containsPoint(mx, my)) {
-            activateWidget(widgets, io, queue, slot.id, .radio_button, FloatingOrder.surfaceIdFor(slots, slot.id));
+            activateWidget(widgets, io, queue, slot.id, .radio_button, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
         .textfield => |t| if (t.containsPoint(mx, my)) {
@@ -332,7 +331,7 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             return slot.id;
         },
         .numeric_stepper => |ns| {
-            const surface_id = FloatingOrder.surfaceIdFor(slots, slot.id);
+            const surface_id = FloatingOrder.surfaceIdFor(slots, index, slot.id);
             switch (ns.regionAt(mx, my)) {
                 .minus => {
                     notifyStepperValue(widgets, io, queue, slot.id, ns.value - ns.step, surface_id);
@@ -346,11 +345,11 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             }
         },
         .segmented_control => |sc| if (sc.segmentAt(mx, my)) |idx| {
-            notifySegmentedValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, slot.id));
+            notifySegmentedValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         } else if (sc.containsPoint(mx, my)) return slot.id,
         .tabs => |tb| if (tb.tabAt(mx, my)) |idx| {
-            notifyTabsValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, slot.id));
+            notifyTabsValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         } else if (tb.containsPoint(mx, my)) return slot.id,
         .label, .container, .progress_bar, .divider, .badge, .spinner => {},
@@ -450,6 +449,11 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
 /// window is processed).
 ///
 pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []const WidgetHost.Slot, is_floating: []const bool, topmost_modal: ?u32, event: c.SDL_Event) void {
+    // Built once per event, shared by every `FloatingOrder`/
+    // `isEffectivelyVisible` lookup below instead of each one re-scanning
+    // `slots` linearly on its own -- see `WidgetHost.SnapshotIndex`'s own
+    // doc comment.
+    const index = WidgetHost.SnapshotIndex.build(slots);
     switch (event.type) {
         c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
             if (event.button.button == c.SDL_BUTTON_LEFT) {
@@ -459,32 +463,32 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
 
                 if (topmost_modal) |modal_id| {
                     for (slots) |slot| {
-                        if (!FloatingOrder.isDescendantOfOrSelf(slots, slot.id, modal_id)) continue;
-                        if (tryHitWidget(widgets, io, queue, slots, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                        if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
+                        if (tryHitWidget(widgets, io, queue, slots, index, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
                     }
                 } else {
                     var topmost_floating_root: ?u32 = null;
                     for (slots, is_floating) |slot, floating| {
                         if (!floating) continue;
                         if (!widgetContainsPoint(slot.widget, mx, my)) continue;
-                        const root = FloatingOrder.nearestFloatingRoot(slots, slot.id) orelse continue;
+                        const root = FloatingOrder.nearestFloatingRoot(slots, index, slot.id) orelse continue;
                         if (topmost_floating_root == null or root > topmost_floating_root.?) topmost_floating_root = root;
                     }
                     for (slots, is_floating) |slot, floating| {
                         if (!floating) continue;
                         if (topmost_floating_root) |root| {
-                            if (FloatingOrder.nearestFloatingRoot(slots, slot.id) != root) continue;
+                            if (FloatingOrder.nearestFloatingRoot(slots, index, slot.id) != root) continue;
                         }
-                        if (tryHitWidget(widgets, io, queue, slots, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                        if (tryHitWidget(widgets, io, queue, slots, index, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
                     }
                     if (hit_focusable == null) {
                         for (slots, is_floating) |slot, floating| {
                             if (floating) continue;
-                            if (tryHitWidget(widgets, io, queue, slots, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                            if (tryHitWidget(widgets, io, queue, slots, index, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
                         }
                     }
                 }
-                updateFocus(widgets, io, queue, wctx, slots, hit_focusable);
+                updateFocus(widgets, io, queue, wctx, slots, index, hit_focusable);
             }
         },
         c.SDL_EVENT_MOUSE_BUTTON_UP => {
@@ -497,7 +501,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
             if (wctx.interaction.focused_widget_id) |id| {
                 var text_buf: [max_text_widget_len]u8 = undefined;
                 if (widgets.appendTextTo(io, id, std.mem.span(event.text.text), &text_buf)) |n| {
-                    notifyTextChanged(queue, io, id, text_buf[0..n], slots);
+                    notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
                 }
             }
         },
@@ -509,7 +513,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
             c.SDLK_BACKSPACE => if (wctx.interaction.focused_widget_id) |id| {
                 var text_buf: [max_text_widget_len]u8 = undefined;
                 if (widgets.backspaceOn(io, id, &text_buf)) |n| {
-                    notifyTextChanged(queue, io, id, text_buf[0..n], slots);
+                    notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
                 }
             },
             c.SDLK_TAB => {
@@ -527,20 +531,20 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                 }
                 const forward = (event.key.mod & c.SDL_KMOD_SHIFT) == 0;
                 const next = WidgetHost.nextFocusable(focusable_ids[0..focusable_count], wctx.interaction.focused_widget_id, forward);
-                updateFocus(widgets, io, queue, wctx, slots, next);
+                updateFocus(widgets, io, queue, wctx, slots, index, next);
             },
             c.SDLK_RETURN, c.SDLK_KP_ENTER, c.SDLK_SPACE => {
                 if (wctx.interaction.focused_widget_id) |id| {
                     for (slots) |slot| {
                         if (slot.id == id) {
-                            activateWidget(widgets, io, queue, id, std.meta.activeTag(slot.widget), FloatingOrder.surfaceIdFor(slots, id));
+                            activateWidget(widgets, io, queue, id, std.meta.activeTag(slot.widget), FloatingOrder.surfaceIdFor(slots, index, id));
                             if (slot.widget == .textfield and event.key.key != c.SDLK_SPACE) {
-                                queue.push(io, id, .key_nav, "{\"key\":\"enter\"}", FloatingOrder.surfaceIdFor(slots, id));
+                                queue.push(io, id, .key_nav, "{\"key\":\"enter\"}", FloatingOrder.surfaceIdFor(slots, index, id));
                             }
                             if (slot.widget == .textarea and event.key.key != c.SDLK_SPACE) {
                                 var text_buf: [max_text_widget_len]u8 = undefined;
                                 if (widgets.appendTextTo(io, id, "\n", &text_buf)) |n| {
-                                    notifyTextChanged(queue, io, id, text_buf[0..n], slots);
+                                    notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
                                 }
                             }
                         }
@@ -548,13 +552,13 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                 }
             },
             c.SDLK_ESCAPE => if (topmost_modal) |modal_id| {
-                queue.push(io, modal_id, .dismiss, "", FloatingOrder.surfaceIdFor(slots, modal_id));
+                queue.push(io, modal_id, .dismiss, "", FloatingOrder.surfaceIdFor(slots, index, modal_id));
             } else {
-                updateFocus(widgets, io, queue, wctx, slots, null);
+                updateFocus(widgets, io, queue, wctx, slots, index, null);
             },
             c.SDLK_LEFT => if (wctx.interaction.focused_widget_id) |id| {
                 for (slots) |slot| {
-                    const surface_id = FloatingOrder.surfaceIdFor(slots, id);
+                    const surface_id = FloatingOrder.surfaceIdFor(slots, index, id);
                     if (slot.id != id) continue;
                     switch (slot.widget) {
                         .slider => |s| notifySliderValue(widgets, io, queue, id, s.value - Slider.nudge_step, surface_id),
@@ -569,7 +573,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
             },
             c.SDLK_RIGHT => if (wctx.interaction.focused_widget_id) |id| {
                 for (slots) |slot| {
-                    const surface_id = FloatingOrder.surfaceIdFor(slots, id);
+                    const surface_id = FloatingOrder.surfaceIdFor(slots, index, id);
                     if (slot.id != id) continue;
                     switch (slot.widget) {
                         .slider => |s| notifySliderValue(widgets, io, queue, id, s.value + Slider.nudge_step, surface_id),
@@ -585,24 +589,24 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
             c.SDLK_DOWN => if (wctx.interaction.focused_widget_id) |id| {
                 for (slots) |slot| {
                     if (slot.id == id and slot.widget == .slider) {
-                        notifySliderValue(widgets, io, queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(slots, id));
+                        notifySliderValue(widgets, io, queue, id, slot.widget.slider.value - Slider.nudge_step, FloatingOrder.surfaceIdFor(slots, index, id));
                     } else if (slot.id == id and slot.widget == .range_slider) {
                         const rs = slot.widget.range_slider;
-                        notifyRangeSliderValue(widgets, io, queue, id, rs.active_handle, rs.activeValue() - rs.nudgeAmount(), FloatingOrder.surfaceIdFor(slots, id));
+                        notifyRangeSliderValue(widgets, io, queue, id, rs.active_handle, rs.activeValue() - rs.nudgeAmount(), FloatingOrder.surfaceIdFor(slots, index, id));
                     } else if (slot.id == id and (slot.widget == .textfield or slot.widget == .button)) {
-                        queue.push(io, id, .key_nav, "{\"key\":\"down\"}", FloatingOrder.surfaceIdFor(slots, id));
+                        queue.push(io, id, .key_nav, "{\"key\":\"down\"}", FloatingOrder.surfaceIdFor(slots, index, id));
                     }
                 }
             },
             c.SDLK_UP => if (wctx.interaction.focused_widget_id) |id| {
                 for (slots) |slot| {
                     if (slot.id == id and slot.widget == .slider) {
-                        notifySliderValue(widgets, io, queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(slots, id));
+                        notifySliderValue(widgets, io, queue, id, slot.widget.slider.value + Slider.nudge_step, FloatingOrder.surfaceIdFor(slots, index, id));
                     } else if (slot.id == id and slot.widget == .range_slider) {
                         const rs = slot.widget.range_slider;
-                        notifyRangeSliderValue(widgets, io, queue, id, rs.active_handle, rs.activeValue() + rs.nudgeAmount(), FloatingOrder.surfaceIdFor(slots, id));
+                        notifyRangeSliderValue(widgets, io, queue, id, rs.active_handle, rs.activeValue() + rs.nudgeAmount(), FloatingOrder.surfaceIdFor(slots, index, id));
                     } else if (slot.id == id and (slot.widget == .textfield or slot.widget == .button)) {
-                        queue.push(io, id, .key_nav, "{\"key\":\"up\"}", FloatingOrder.surfaceIdFor(slots, id));
+                        queue.push(io, id, .key_nav, "{\"key\":\"up\"}", FloatingOrder.surfaceIdFor(slots, index, id));
                     }
                 }
             },
@@ -634,14 +638,18 @@ fn containsIdInSlots(slots: []const WidgetHost.Slot, id: u32) bool {
 /// always has mouse focus whenever the cursor is over it at all).
 pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []WidgetHost.Slot, is_floating: []const bool, topmost_modal: ?u32, arrow_cursor: ?*c.SDL_Cursor, pointer_cursor: ?*c.SDL_Cursor) void {
     const widget_count = slots.len;
+    // Built once per draw pass, shared by every `FloatingOrder`/
+    // `isEffectivelyVisible` lookup below -- see
+    // `WidgetHost.SnapshotIndex`'s own doc comment.
+    const index = WidgetHost.SnapshotIndex.build(slots);
 
     if (wctx.interaction.dragging_slider_id) |id| {
         for (slots) |slot| {
             if (slot.id == id and slot.widget == .slider) {
-                notifySliderValue(widgets, io, queue, id, slot.widget.slider.valueFromX(wctx.interaction.mouse_x), FloatingOrder.surfaceIdFor(slots, id));
+                notifySliderValue(widgets, io, queue, id, slot.widget.slider.valueFromX(wctx.interaction.mouse_x), FloatingOrder.surfaceIdFor(slots, index, id));
             } else if (slot.id == id and slot.widget == .range_slider) {
                 const handle = wctx.interaction.dragging_range_handle orelse slot.widget.range_slider.active_handle;
-                notifyRangeSliderValue(widgets, io, queue, id, handle, slot.widget.range_slider.valueFromX(wctx.interaction.mouse_x), FloatingOrder.surfaceIdFor(slots, id));
+                notifyRangeSliderValue(widgets, io, queue, id, handle, slot.widget.range_slider.valueFromX(wctx.interaction.mouse_x), FloatingOrder.surfaceIdFor(slots, index, id));
             }
         }
     }
@@ -650,9 +658,9 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     var hovered_widget_id_this_frame: ?u32 = null;
     for (slots) |slot| {
         if (topmost_modal) |modal_id| {
-            if (!FloatingOrder.isDescendantOfOrSelf(slots, slot.id, modal_id)) continue;
+            if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
         }
-        if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
+        if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         switch (slot.widget) {
             .button => |b| if (b.containsPoint(wctx.interaction.mouse_x, wctx.interaction.mouse_y)) {
                 hovering_any = true;
@@ -712,7 +720,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (wctx.interaction.tooltip_active_for) |active_id| {
             if (wctx.interaction.hovered_widget_id) |prev_id| {
                 if (active_id == prev_id) {
-                    queue.push(io, prev_id, .hover, "{\"hovering\":false}", FloatingOrder.surfaceIdFor(slots, prev_id));
+                    queue.push(io, prev_id, .hover, "{\"hovering\":false}", FloatingOrder.surfaceIdFor(slots, index, prev_id));
                 }
             }
             wctx.interaction.tooltip_active_for = null;
@@ -723,7 +731,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (wctx.interaction.hover_start_ms) |start| {
             const already_active = if (wctx.interaction.tooltip_active_for) |active_id| active_id == id else false;
             if (timing.nowMs() - start >= tooltip_hover_threshold_ms and !already_active) {
-                queue.push(io, id, .hover, "{\"hovering\":true}", FloatingOrder.surfaceIdFor(slots, id));
+                queue.push(io, id, .hover, "{\"hovering\":true}", FloatingOrder.surfaceIdFor(slots, index, id));
                 wctx.interaction.tooltip_active_for = id;
             }
         }
@@ -737,7 +745,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
 
     for (slots, clip_rects[0..widget_count], is_floating) |slot, clip, floating| {
         if (floating) continue;
-        if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
+        if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         if (slot.widget.fillRect()) |fr| {
             if (slot.clay_style.corner_radius != null or slot.clay_style.border != null or slot.clay_style.gradient != null) {
                 // Flush whatever's pending first -- a styled shape draws
@@ -772,7 +780,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
 
     for (slots, clip_rects[0..widget_count], is_floating) |slot, clip, floating| {
         if (floating) continue;
-        if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
+        if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
         drawWidgetDecorations(slot.widget, wctx.renderer, slot.clay_style.padding, &wctx.shape_cache);
@@ -781,9 +789,9 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
 
     for (slots, clip_rects[0..widget_count], is_floating) |slot, clip, floating| {
         if (!floating) continue;
-        if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
+        if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         if (topmost_modal) |modal_id| {
-            if (FloatingOrder.isDescendantOfOrSelf(slots, slot.id, modal_id)) continue;
+            if (FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
         }
         drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache);
     }
@@ -799,8 +807,8 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
 
         for (slots, clip_rects[0..widget_count], is_floating) |slot, clip, floating| {
             if (!floating) continue;
-            if (!WidgetHost.isEffectivelyVisible(slots, slot)) continue;
-            if (!FloatingOrder.isDescendantOfOrSelf(slots, slot.id, modal_id)) continue;
+            if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
+            if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
             drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache);
         }
     }

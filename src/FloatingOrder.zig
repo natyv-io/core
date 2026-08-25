@@ -26,10 +26,15 @@ const WidgetHost = @import("widgets/WidgetHost.zig");
 /// the modal-specific functions below for the genuinely new behaviors
 /// (topmost-of-several, input-blocking, backdrop).
 pub fn computeIsFloating(slots: []const WidgetHost.Slot, out: []bool) void {
-    for (slots, 0..) |slot, i| out[i] = isFloatingOrDescendant(slots, slot);
+    // Built once per call, not once per slot -- every one of the up-to-`n`
+    // ancestor walks below shares this same index instead of each one
+    // re-scanning `slots` linearly on every step (see
+    // `WidgetHost.SnapshotIndex`'s own doc comment).
+    const index = WidgetHost.SnapshotIndex.build(slots);
+    for (slots, 0..) |slot, i| out[i] = isFloatingOrDescendant(slots, index, slot);
 }
 
-fn isFloatingOrDescendant(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot) bool {
+fn isFloatingOrDescendant(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot) bool {
     // W7: `toast` joins `floating`/`modal` here for the same reason modal
     // did in W5 -- lets the existing floating draw pass and floating-first
     // hit-test pass cover toast content for free, no new machinery needed
@@ -37,7 +42,7 @@ fn isFloatingOrDescendant(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot)
     if (slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) return true;
     var current = slot.parent_id;
     while (current) |id| {
-        const parent = findSlot(slots, id) orelse break;
+        const parent = index.find(slots, id) orelse break;
         if (parent.clay_style.floating or parent.clay_style.modal or parent.clay_style.toast) return true;
         current = parent.parent_id;
     }
@@ -63,12 +68,12 @@ fn isFloatingOrDescendant(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot)
 /// testing (so a submenu click can't also register on whatever's visually
 /// underneath it) and draw order (so that stays true of what's drawn on
 /// top, not just what's clickable).
-pub fn nearestFloatingRoot(slots: []const WidgetHost.Slot, id: u32) ?u32 {
-    const slot = findSlot(slots, id) orelse return null;
+pub fn nearestFloatingRoot(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, id: u32) ?u32 {
+    const slot = index.find(slots, id) orelse return null;
     if (slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) return slot.id;
     var current = slot.parent_id;
     while (current) |pid| {
-        const parent = findSlot(slots, pid) orelse break;
+        const parent = index.find(slots, pid) orelse break;
         if (parent.clay_style.floating or parent.clay_style.modal or parent.clay_style.toast) return parent.id;
         current = parent.parent_id;
     }
@@ -93,13 +98,13 @@ pub fn topmostModalRoot(slots: []const WidgetHost.Slot) ?u32 {
 /// True when `id` is `root_id` itself, or `root_id` appears anywhere in
 /// `id`'s parent_id chain. Used to scope hit-testing/drawing to "everything
 /// inside the topmost modal" regardless of how deeply nested it is.
-pub fn isDescendantOfOrSelf(slots: []const WidgetHost.Slot, id: u32, root_id: u32) bool {
+pub fn isDescendantOfOrSelf(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, id: u32, root_id: u32) bool {
     if (id == root_id) return true;
-    const slot = findSlot(slots, id) orelse return false;
+    const slot = index.find(slots, id) orelse return false;
     var current = slot.parent_id;
     while (current) |pid| {
         if (pid == root_id) return true;
-        const parent = findSlot(slots, pid) orelse break;
+        const parent = index.find(slots, pid) orelse break;
         current = parent.parent_id;
     }
     return false;
@@ -125,13 +130,13 @@ pub fn isDescendantOfOrSelf(slots: []const WidgetHost.Slot, id: u32, root_id: u3
 /// (window roots are always `parent_id == null`), so no explicit ordering
 /// between the two checks is needed beyond "modal on the same slot wins,
 /// since a slot can't be both."
-pub fn surfaceIdFor(slots: []const WidgetHost.Slot, id: u32) u32 {
-    const slot = findSlot(slots, id) orelse return 0;
+pub fn surfaceIdFor(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, id: u32) u32 {
+    const slot = index.find(slots, id) orelse return 0;
     if (slot.clay_style.modal) return slot.id;
     if (slot.clay_style.window_root) return slot.id;
     var current = slot.parent_id;
     while (current) |pid| {
-        const parent = findSlot(slots, pid) orelse break;
+        const parent = index.find(slots, pid) orelse break;
         if (parent.clay_style.modal) return parent.id;
         if (parent.clay_style.window_root) return parent.id;
         current = parent.parent_id;
@@ -146,12 +151,12 @@ pub fn surfaceIdFor(slots: []const WidgetHost.Slot, id: u32) u32 {
 /// `parent_id == null`, see `WidgetHost.ClayStyle.window_root`'s own doc
 /// comment), so this walk never needs to consider more than one window-root
 /// ancestor being possible.
-fn nearestWindowRoot(slots: []const WidgetHost.Slot, id: u32) ?u32 {
-    const slot = findSlot(slots, id) orelse return null;
+fn nearestWindowRoot(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, id: u32) ?u32 {
+    const slot = index.find(slots, id) orelse return null;
     if (slot.clay_style.window_root) return slot.id;
     var current = slot.parent_id;
     while (current) |pid| {
-        const parent = findSlot(slots, pid) orelse break;
+        const parent = index.find(slots, pid) orelse break;
         if (parent.clay_style.window_root) return parent.id;
         current = parent.parent_id;
     }
@@ -172,20 +177,18 @@ fn nearestWindowRoot(slots: []const WidgetHost.Slot, id: u32) ?u32 {
 /// snapshot by these ids instead of this function copying data a caller may
 /// not even need.
 pub fn windowSubset(slots: []const WidgetHost.Slot, window_root_id: ?u32, out: []u32) usize {
+    // See `computeIsFloating`'s own comment -- built once, shared across
+    // every slot's own `nearestWindowRoot` walk below.
+    const index = WidgetHost.SnapshotIndex.build(slots);
     var n: usize = 0;
     for (slots) |slot| {
         if (n >= out.len) break;
-        if (nearestWindowRoot(slots, slot.id) == window_root_id) {
+        if (nearestWindowRoot(slots, index, slot.id) == window_root_id) {
             out[n] = slot.id;
             n += 1;
         }
     }
     return n;
-}
-
-fn findSlot(slots: []const WidgetHost.Slot, id: u32) ?WidgetHost.Slot {
-    for (slots) |s| if (s.id == id) return s;
-    return null;
 }
 
 const std = @import("std");
@@ -303,7 +306,8 @@ test "a toast stack container and its content are floating too, with no separate
 
 test "nearestFloatingRoot is null for a widget with no floating ancestor" {
     var slots = [_]WidgetHost.Slot{ containerSlot(1, null, false), containerSlot(2, 1, false) };
-    try std.testing.expectEqual(@as(?u32, null), nearestFloatingRoot(&slots, 2));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(?u32, null), nearestFloatingRoot(&slots, index, 2));
 }
 
 test "nearestFloatingRoot returns the widget's own id when it's directly floating" {
@@ -311,7 +315,8 @@ test "nearestFloatingRoot returns the widget's own id when it's directly floatin
         containerSlot(1, null, false), // trigger
         containerSlot(2, 1, true), // floating panel
     };
-    try std.testing.expectEqual(@as(?u32, 2), nearestFloatingRoot(&slots, 2));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(?u32, 2), nearestFloatingRoot(&slots, index, 2));
 }
 
 test "nearestFloatingRoot picks the innermost floating ancestor, not the outermost" {
@@ -328,9 +333,10 @@ test "nearestFloatingRoot picks the innermost floating ancestor, not the outermo
         containerSlot(4, 3, true), // nested floating submenu panel
         containerSlot(5, 4, false), // an item inside the submenu
     };
-    try std.testing.expectEqual(@as(?u32, 2), nearestFloatingRoot(&slots, 3));
-    try std.testing.expectEqual(@as(?u32, 4), nearestFloatingRoot(&slots, 4));
-    try std.testing.expectEqual(@as(?u32, 4), nearestFloatingRoot(&slots, 5));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(?u32, 2), nearestFloatingRoot(&slots, index, 3));
+    try std.testing.expectEqual(@as(?u32, 4), nearestFloatingRoot(&slots, index, 4));
+    try std.testing.expectEqual(@as(?u32, 4), nearestFloatingRoot(&slots, index, 5));
 }
 
 test "topmostModalRoot is null when no modal is open" {
@@ -349,19 +355,22 @@ test "isDescendantOfOrSelf is true for the root itself and any depth of descenda
         containerSlot(2, 1, false),
         containerSlot(3, 2, false), // two levels deep
     };
-    try std.testing.expect(isDescendantOfOrSelf(&slots, 1, 1));
-    try std.testing.expect(isDescendantOfOrSelf(&slots, 2, 1));
-    try std.testing.expect(isDescendantOfOrSelf(&slots, 3, 1));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expect(isDescendantOfOrSelf(&slots, index, 1, 1));
+    try std.testing.expect(isDescendantOfOrSelf(&slots, index, 2, 1));
+    try std.testing.expect(isDescendantOfOrSelf(&slots, index, 3, 1));
 }
 
 test "isDescendantOfOrSelf is false for an unrelated widget" {
     var slots = [_]WidgetHost.Slot{ modalSlot(1, null), containerSlot(2, null, false) };
-    try std.testing.expect(!isDescendantOfOrSelf(&slots, 2, 1));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expect(!isDescendantOfOrSelf(&slots, index, 2, 1));
 }
 
 test "surfaceIdFor returns 0 (root) for a widget with no modal ancestor" {
     var slots = [_]WidgetHost.Slot{ containerSlot(1, null, false), containerSlot(2, 1, true) };
-    try std.testing.expectEqual(@as(u32, 0), surfaceIdFor(&slots, 2));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(u32, 0), surfaceIdFor(&slots, index, 2));
 }
 
 test "surfaceIdFor returns the modal's own id for the modal root and its descendants" {
@@ -370,8 +379,9 @@ test "surfaceIdFor returns the modal's own id for the modal root and its descend
         containerSlot(2, 1, false),
         containerSlot(3, 2, false),
     };
-    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 1));
-    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 3));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, index, 1));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, index, 3));
 }
 
 test "surfaceIdFor resolves nested modals to the nearest (innermost) one" {
@@ -381,8 +391,9 @@ test "surfaceIdFor resolves nested modals to the nearest (innermost) one" {
         modalSlot(3, 2), // nested modal
         containerSlot(4, 3, false), // content inside the nested modal
     };
-    try std.testing.expectEqual(@as(u32, 3), surfaceIdFor(&slots, 4));
-    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 2));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(u32, 3), surfaceIdFor(&slots, index, 4));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, index, 2));
 }
 
 test "surfaceIdFor resolves a window-scoped widget to its own window's root id" {
@@ -391,9 +402,10 @@ test "surfaceIdFor resolves a window-scoped widget to its own window's root id" 
         containerSlot(2, 1, false),
         containerSlot(3, 2, false), // two levels deep inside the window
     };
-    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 1));
-    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 2));
-    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 3));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, index, 1));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, index, 2));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, index, 3));
 }
 
 test "surfaceIdFor resolves a modal opened inside a window to the modal, not the window" {
@@ -403,8 +415,9 @@ test "surfaceIdFor resolves a modal opened inside a window to the modal, not the
         modalSlot(3, 2), // a modal opened inside that window
         containerSlot(4, 3, false), // content inside the modal
     };
-    try std.testing.expectEqual(@as(u32, 3), surfaceIdFor(&slots, 4));
-    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, 2));
+    const index = WidgetHost.SnapshotIndex.build(&slots);
+    try std.testing.expectEqual(@as(u32, 3), surfaceIdFor(&slots, index, 4));
+    try std.testing.expectEqual(@as(u32, 1), surfaceIdFor(&slots, index, 2));
 }
 
 test "windowSubset returns only the original window's content when no window root exists" {

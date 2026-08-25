@@ -288,17 +288,10 @@ fn containsId(ids: []const u32, id: u32) bool {
 /// own scrollbar -- exactly the bug this fixes (found via Quinn's real
 /// click-through on the Tooltip, though the fix applies to every floating
 /// widget generically, not just that one kind).
-fn nearestScrollBoundary(slots: []const WidgetHost.Slot, slot: WidgetHost.Slot, vertical: bool) ?f32 {
+fn nearestScrollBoundary(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot, vertical: bool) ?f32 {
     var current_parent = slot.parent_id;
     while (current_parent) |pid| {
-        var parent: ?WidgetHost.Slot = null;
-        for (slots) |s| {
-            if (s.id == pid) {
-                parent = s;
-                break;
-            }
-        }
-        const p = parent orelse return null;
+        const p = index.find(slots, pid) orelse return null;
         const scrolls = if (vertical) p.clay_style.scroll_horizontal else p.clay_style.scroll_vertical;
         if (scrolls) {
             const data = c.Clay_GetElementData(elementId(p.id));
@@ -527,6 +520,10 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         }
     }
     const slots = snap[0..n];
+    // Built once per real recompute, shared by every `nearestScrollBoundary`
+    // call and the parent-chain walks below -- see
+    // `WidgetHost.SnapshotIndex`'s own doc comment.
+    const index = WidgetHost.SnapshotIndex.build(slots);
 
     // deltaTime is seconds since the *last real recompute* (not literal
     // frame time) -- Clay_UpdateScrollContainers is only ever called
@@ -601,12 +598,12 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         // fixture's own root column is 300px in a 900px window) --
         // `nearestScrollBoundary` tightens the effective edge to whichever
         // is closer.
-        const v_bound = if (nearestScrollBoundary(slots, slot, true)) |b| @min(window_h, b) else window_h;
+        const v_bound = if (nearestScrollBoundary(slots, index, slot, true)) |b| @min(window_h, b) else window_h;
         if (data.boundingBox.y + data.boundingBox.height > v_bound) {
             v_flip_ids[v_flip_count] = slot.id;
             v_flip_count += 1;
         }
-        const h_bound = if (nearestScrollBoundary(slots, slot, false)) |b| @min(window_w, b) else window_w;
+        const h_bound = if (nearestScrollBoundary(slots, index, slot, false)) |b| @min(window_w, b) else window_w;
         if (data.boundingBox.x + data.boundingBox.width > h_bound) {
             h_flip_ids[h_flip_count] = slot.id;
             h_flip_count += 1;
@@ -652,8 +649,8 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
         const data = c.Clay_GetElementData(elementId(slot.id));
         if (!data.found) continue;
         const box = data.boundingBox;
-        const right_bound = if (nearestScrollBoundary(slots, slot, false)) |b| @min(window_w, b) else window_w;
-        const bottom_bound = if (nearestScrollBoundary(slots, slot, true)) |b| @min(window_h, b) else window_h;
+        const right_bound = if (nearestScrollBoundary(slots, index, slot, false)) |b| @min(window_w, b) else window_w;
+        const bottom_bound = if (nearestScrollBoundary(slots, index, slot, true)) |b| @min(window_h, b) else window_h;
         // `@max(0, bound - size)` covers the pathological case where the
         // panel is wider/taller than the space available at all -- pins it
         // to the left/top edge (still overflowing the far side) rather
@@ -695,14 +692,7 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
                     box.y += clamp_dy[i];
                     break;
                 }
-                var next_parent: ?u32 = null;
-                for (slots) |s| {
-                    if (s.id == cid) {
-                        next_parent = s.parent_id;
-                        break;
-                    }
-                }
-                current = next_parent;
+                current = if (index.find(slots, cid)) |s| s.parent_id else null;
             }
             widgets.setRect(io, slot.id, .{ .x = box.x, .y = box.y, .w = box.width, .h = box.height });
         }
@@ -757,26 +747,13 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
 /// -frame latency every other generation-bump-driven change in this
 /// codebase already has (nothing here is drawn synchronously mid-frame).
 pub fn applyScrollIntoView(slots: []const WidgetHost.Slot, widgets: *WidgetHost, widget_id: u32) void {
-    var target: ?WidgetHost.Slot = null;
-    for (slots) |s| {
-        if (s.id == widget_id) {
-            target = s;
-            break;
-        }
-    }
-    var t = target orelse return;
+    const index = WidgetHost.SnapshotIndex.build(slots);
+    var t = index.find(slots, widget_id) orelse return;
 
     var ancestor: ?WidgetHost.Slot = null;
     var current: ?u32 = t.parent_id;
     while (current) |pid| {
-        var parent: ?WidgetHost.Slot = null;
-        for (slots) |s| {
-            if (s.id == pid) {
-                parent = s;
-                break;
-            }
-        }
-        const p = parent orelse break;
+        const p = index.find(slots, pid) orelse break;
         if (p.clay_style.scroll_vertical) {
             ancestor = p;
             break;

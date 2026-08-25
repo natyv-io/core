@@ -34,20 +34,23 @@ const WidgetHost = @import("widgets/WidgetHost.zig");
 /// widget's own rect goes through `Widget.rectPtr()`, which requires
 /// `*Widget`.
 pub fn computeClipRects(slots: []WidgetHost.Slot, out: []?c.SDL_FRect) void {
+    // Built once per call, shared across every slot's own ancestor walk
+    // below -- see `WidgetHost.SnapshotIndex`'s own doc comment.
+    const index = WidgetHost.SnapshotIndex.build(slots);
     for (slots, 0..) |*slot, i| {
         if (slot.clay_style.floating or slot.clay_style.modal or slot.clay_style.toast) {
             out[i] = null;
         } else {
-            out[i] = clipRectFor(slots, slot.parent_id);
+            out[i] = clipRectFor(slots, index, slot.parent_id);
         }
     }
 }
 
-fn clipRectFor(slots: []WidgetHost.Slot, parent_id: ?u32) ?c.SDL_FRect {
+fn clipRectFor(slots: []WidgetHost.Slot, index: WidgetHost.SnapshotIndex, parent_id: ?u32) ?c.SDL_FRect {
     var result: ?c.SDL_FRect = null;
     var current = parent_id;
     while (current) |id| {
-        const parent = findSlot(slots, id) orelse break;
+        var parent = index.find(slots, id) orelse break;
         if (parent.clay_style.scroll_vertical or parent.clay_style.scroll_horizontal) {
             result = intersect(result, parent.widget.rectPtr().*);
         }
@@ -55,11 +58,6 @@ fn clipRectFor(slots: []WidgetHost.Slot, parent_id: ?u32) ?c.SDL_FRect {
         current = parent.parent_id;
     }
     return result;
-}
-
-fn findSlot(slots: []WidgetHost.Slot, id: u32) ?*WidgetHost.Slot {
-    for (slots) |*s| if (s.id == id) return s;
-    return null;
 }
 
 fn intersect(a: ?c.SDL_FRect, b: c.SDL_FRect) c.SDL_FRect {

@@ -537,28 +537,94 @@ pub const Slot = struct {
 /// as the W15 tooltip-overflow fix's round 2. `slots` is a snapshot slice
 /// (same shape `FloatingOrder.zig`'s own ancestor-walk helpers take), not
 /// the live locked registry -- callers already have one from `snapshot()`.
-pub fn isEffectivelyVisible(slots: []const Slot, slot: Slot) bool {
+pub fn isEffectivelyVisible(slots: []const Slot, index: SnapshotIndex, slot: Slot) bool {
     if (!slot.clay_style.visible) return false;
     var current = slot.parent_id;
     while (current) |pid| {
-        var parent: ?Slot = null;
-        for (slots) |s| {
-            if (s.id == pid) {
-                parent = s;
-                break;
-            }
-        }
-        const p = parent orelse return true; // orphaned parent id -- shouldn't normally happen, no ancestor constraint to apply
+        const p = index.find(slots, pid) orelse return true; // orphaned parent id -- shouldn't normally happen, no ancestor constraint to apply
         if (!p.clay_style.visible) return false;
         current = p.parent_id;
     }
     return true;
 }
 
+/// Fixed-capacity, allocation-free id -> `Slot` lookup over a snapshot slice
+/// (`[]const Slot`) -- distinct from `id_to_index` above, which only ever
+/// indexes the *live* registry's own `self.slots`, never a copied-out
+/// snapshot handed around by value. `isEffectivelyVisible` above and
+/// `FloatingOrder.zig`/`ScrollClip.zig`/`ClayLayout.zig`'s own ancestor-walk
+/// helpers all used to re-scan the whole snapshot slice linearly on every
+/// single step of every walk; building one of these once per real "process
+/// this snapshot" call and reusing it for every walk that call makes turns
+/// each step into a real O(1) average lookup.
+///
+/// Open-addressing (linear probing) over a fixed-size array, not
+/// `std.AutoHashMapUnmanaged` (unlike `id_to_index` above) -- these are all
+/// pure, allocator-free functions today, some called directly from tests
+/// with no allocator anywhere in scope, and introducing one here would be a
+/// real, unwanted architecture change just to look up a handful of ids per
+/// frame (see feedback_natyv_memory_efficiency's own "bounded by design"
+/// convention). `capacity` is a power of two (so probing can use a bitmask,
+/// not `%`) comfortably above `max_widgets` -- load factor stays <= ~0.4
+/// even when every slot is live at once, keeping the average probe chain
+/// short.
+pub const SnapshotIndex = struct {
+    const capacity = 512;
+    const empty: u32 = std.math.maxInt(u32);
+
+    slot_of: [capacity]u32 = [_]u32{empty} ** capacity,
+
+    pub fn build(slots: []const Slot) SnapshotIndex {
+        var self: SnapshotIndex = .{};
+        for (slots, 0..) |slot, i| {
+            var probe = slot.id & (capacity - 1);
+            while (self.slot_of[probe] != empty) : (probe = (probe + 1) & (capacity - 1)) {}
+            self.slot_of[probe] = @intCast(i);
+        }
+        return self;
+    }
+
+    /// `slots` must be the exact same slice `build` was called with --
+    /// this only ever stores indices into it, never copies of its data.
+    pub fn find(self: SnapshotIndex, slots: []const Slot, id: u32) ?Slot {
+        var probe = id & (capacity - 1);
+        var probes: usize = 0;
+        while (probes < capacity) : (probes += 1) {
+            const si = self.slot_of[probe];
+            if (si == empty) return null;
+            if (slots[si].id == id) return slots[si];
+            probe = (probe + 1) & (capacity - 1);
+        }
+        return null;
+    }
+};
+
 allocator: std.mem.Allocator,
 mutex: Io.Mutex = .init,
 slots: [max_widgets]?Slot = [_]?Slot{null} ** max_widgets,
 next_id: u32 = 1,
+/// id -> index into `slots`, kept in sync at every real site a slot ever
+/// gets assigned or freed (`insertLockedWithLayout`; `destroySubtreeLocked`,
+/// the cascading-destroy path; and `WidgetHostFunctions.destroyWidgetHostFn`,
+/// `natyv_destroy_widget`'s own single-widget, no-cascade path, which nulls
+/// a slot inline rather than going through `destroySubtreeLocked`) -- turns
+/// `findLocked` from an O(max_widgets) linear scan into an O(1) lookup.
+/// `destroyWidgetHostFn` was missed on the first pass (grepped only this
+/// file for null-assignment sites, not the whole tree) and shipped a real,
+/// reproducible crash: `natyv_destroy_widget` nulled the slot without
+/// removing the map entry, so any later `findLocked` on that id found a
+/// stale index pointing at a `null` slot and panicked on `self.slots[idx].?`
+/// -- caught by Quinn's own real click-through on `clay-fixture`, not by
+/// any unit test (every test exercised `destroySubtreeLocked`'s cascading
+/// path, never the everyday single-widget destroy the fixture's own
+/// hover/click demo widgets actually use). Stores an index, not a `*Slot`
+/// pointer, so it stays valid even if `self` itself is ever moved/copied
+/// (a raw self-pointer wouldn't be). `.empty` (not `.init(allocator)`)
+/// matches this codebase's own established `ArrayList`-unmanaged
+/// convention -- no separate `WidgetHost.init`/`.deinit` lifecycle
+/// exists today (every real construction site is a plain struct
+/// literal), so this needs to work with that same zero-init shape.
+id_to_index: std.AutoHashMapUnmanaged(u32, usize) = .empty,
 /// Bumped by any mutation that could change Clay-managed layout geometry
 /// (create/destroy a Clay-managed widget, or change text on one whose size
 /// depends on its content) -- L4's render-loop pass compares this against
@@ -939,10 +1005,15 @@ pub fn insertLocked(self: *Self, widget: Widget) ?u32 {
 }
 
 fn insertLockedWithLayout(self: *Self, widget: Widget, parent_id: ?u32, clay_style: ClayStyle) ?u32 {
-    for (&self.slots) |*slot| {
+    for (&self.slots, 0..) |*slot, idx| {
         if (slot.* == null) {
             const id = self.next_id;
             self.next_id += 1;
+            // Inserted into the map *before* the slot itself, so a failed
+            // put (OOM) leaves this a clean no-op -- the slot stays null,
+            // and the skipped id is simply never reused (harmless: ids
+            // were never required to be contiguous).
+            self.id_to_index.put(self.allocator, id, idx) catch return null;
             slot.* = .{ .id = id, .widget = widget, .parent_id = parent_id, .clay_style = clay_style };
             return id;
         }
@@ -1025,14 +1096,22 @@ pub fn setScrollData(self: *Self, call_io: Io, id: u32, data: ScrollBar.Data) vo
     if (self.findLocked(id)) |slot| slot.scroll_data = data;
 }
 
-/// `pub` -- see `io`'s doc comment above.
+/// `pub` -- see `io`'s doc comment above. O(1) via `id_to_index` --
+/// previously an O(max_widgets) linear scan; the id->index invariant is
+/// maintained by `insertLockedWithLayout`/`destroySubtreeLocked`, the
+/// only two places a slot is ever assigned or freed.
 pub fn findLocked(self: *Self, id: u32) ?*Slot {
-    for (&self.slots) |*slot| {
-        if (slot.*) |*s| {
-            if (s.id == id) return s;
-        }
-    }
-    return null;
+    const idx = self.id_to_index.get(id) orelse return null;
+    return &(self.slots[idx].?);
+}
+
+/// Frees `id_to_index`'s own backing memory -- the fixed-size `slots`
+/// array needs no equivalent, but a hash map does. Not called anywhere
+/// yet (no `Runtime.deinit`-style teardown reaches `WidgetHost` today),
+/// wired in alongside this change so the leak-checked GPA in debug
+/// builds doesn't start reporting one the moment this map exists.
+pub fn deinit(self: *Self) void {
+    self.id_to_index.deinit(self.allocator);
 }
 
 /// F3: creates/updates every button/textfield/label's cached `TTF_Text`
@@ -1190,6 +1269,7 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
                     // never actually exercised the worker-thread path.
                     self.queueWidgetTextDestroysLocked(&s.widget);
                     if (s.clay_managed) self.layout_generation +%= 1;
+                    _ = self.id_to_index.remove(s.id);
                     slot.* = null;
                     break;
                 }
