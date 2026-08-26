@@ -55,7 +55,10 @@ fn removeWindow(windows: []WindowManager.WindowContext, window_count: *usize, id
 // require remembering flags to run someone else's app correctly. The one
 // remaining CLI argument is the config file's own path, defaulting to
 // `conf.natyv.json` in the current directory, purely for dev convenience
-// (pointing at a different example without `cd`ing into it first).
+// (pointing at a different example without `cd`ing into it first) --
+// only ever consulted for a local, non-embedded dev build (see below);
+// a real bundled `.app` always uses its own embedded config regardless
+// of argv, since it can't rely on any particular cwd at launch anyway.
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -63,10 +66,25 @@ pub fn main(init: std.process.Init) !void {
     const argv = init.minimal.args.vector;
     const config_path: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "conf.natyv.json";
 
-    const config = Config.load(allocator, io, config_path) catch |err| {
-        std.debug.print("[main] failed to load {s}: {}\n", .{ config_path, err });
-        return err;
-    };
+    // Mirrors the wasm dispatch further below exactly (same
+    // `build_options.embed_app_wasm` flag, same "embedded wins
+    // unconditionally" shape): Finder/Launch Services never sets a
+    // bundled `.app`'s cwd to its own bundle directory, so a real
+    // distributable build can't rely on a cwd-relative disk read at all
+    // -- confirmed the hard way when the first real `.app` this project
+    // built failed to launch from the Dock with a plain `FileNotFound`
+    // on `conf.natyv.json`. `EmbeddedWasm.config_bytes` is baked in by
+    // `Bundle.zig` at the same point it already embeds the app's wasm.
+    const config = if (build_options.embed_app_wasm)
+        Config.parseBytes(allocator, EmbeddedWasm.config_bytes) catch |err| {
+            std.debug.print("[main] failed to load embedded config: {}\n", .{err});
+            return err;
+        }
+    else
+        Config.load(allocator, io, config_path) catch |err| {
+            std.debug.print("[main] failed to load {s}: {}\n", .{ config_path, err });
+            return err;
+        };
     defer config.deinit();
 
     // Only ever consulted in the non-embedded (local dev/testing) branch
