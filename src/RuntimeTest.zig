@@ -517,9 +517,12 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
     // proof that a resolved stylesheet token can change a widget's
     // rendering at runtime -- see styleDemoPanel's own doc comment in
     // main.go.)
+    // (Texture-fill styling system: +1 -- the heroImage Container, real
+    // end-to-end proof of drawRoundedRectTexture through a real guest --
+    // see heroImage's own doc comment in main.go.)
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const n = runtime.widgets.snapshot(io, &snap);
-    try std.testing.expectEqual(@as(usize, 123), n);
+    try std.testing.expectEqual(@as(usize, 124), n);
 
     // W2: the fixture now creates a *second* top-level container (the
     // scroll container, parent_id == null just like this one) alongside
