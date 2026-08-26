@@ -28,6 +28,7 @@ const InteractionState = @import("InteractionState.zig");
 const DrawBatcher = @import("DrawBatcher.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const ShapeCache = @import("capabilities/ShapeCache.zig");
+const ImageCache = @import("capabilities/ImageCache.zig");
 
 /// Small fixed cap, same "bump later if a real need shows up" precedent
 /// `WidgetHost.max_widgets` itself already set.
@@ -46,6 +47,11 @@ pub const WindowContext = struct {
     /// -- see ShapeCache.zig's own doc comment. Textures are
     /// renderer-scoped, so this can't be shared across windows.
     shape_cache: ShapeCache.Cache = .{},
+    /// Texture-fill styling system: per-window cache of decoded background
+    /// images -- see ImageCache.zig's own doc comment. Same renderer-scoped
+    /// reasoning as `shape_cache`, kept as a separate cache since it's keyed
+    /// by asset id rather than shape geometry.
+    image_cache: ImageCache.Cache = .{},
     /// See file doc comment -- `null` for the original startup window.
     root_widget_id: ?u32,
     interaction: InteractionState = .{},
@@ -102,7 +108,48 @@ pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, wi
 pub fn destroyWindowContext(self: *WindowContext, allocator: std.mem.Allocator) void {
     if (self.clay_layout) |*cl| cl.deinit(allocator);
     self.shape_cache.deinit();
+    self.image_cache.deinit();
     c.TTF_DestroyRendererTextEngine(self.text_engine);
     c.SDL_DestroyRenderer(self.renderer);
     c.SDL_DestroyWindow(self.window);
+}
+
+test "texture fill: WindowContext's real image_cache/shape_cache decode and composite an image through a real SDL renderer, no error" {
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SdlInitFailed;
+    defer c.SDL_Quit();
+    const window = c.SDL_CreateWindow("windowmanager-texture-test", 64, 64, c.SDL_WINDOW_HIDDEN) orelse return error.SdlWindowFailed;
+    defer c.SDL_DestroyWindow(window);
+    const renderer = c.SDL_CreateRenderer(window, null) orelse return error.SdlRendererFailed;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text_engine = c.TTF_CreateRendererTextEngine(renderer) orelse return error.TextEngineFailed;
+    defer c.TTF_DestroyRendererTextEngine(text_engine);
+
+    // Built directly (not via createWindowContext) so this test needs no
+    // real font -- createWindowContext requires one unconditionally even
+    // with clay_enabled=false, since `default_font` is a non-optional
+    // parameter regardless of whether ClayLayout.init ever actually reads
+    // it. Every field this test cares about (image_cache/shape_cache) gets
+    // its own real default, same as createWindowContext's own return value
+    // would produce.
+    var wctx = WindowContext{
+        .window = window,
+        .renderer = renderer,
+        .clay_layout = null,
+        .text_engine = text_engine,
+        .root_widget_id = null,
+    };
+
+    const tex = ImageCache.getOrLoad(&wctx.image_cache, renderer, 1, &ImageCache.test_tga) orelse return error.DecodeFailed;
+    try std.testing.expectEqual(@as(usize, 1), wctx.image_cache.count);
+
+    // Real compositing pass through ShapeCache.drawRoundedRectTexture --
+    // this is a genuine function *call* (not just a type reference), which
+    // is what actually forces Zig to analyze that function's body and
+    // ImageCache.getOrLoad's, per this file's own doc comment above on why
+    // the earlier type-reference-only attempt reported 0 tests.
+    ShapeCache.drawRoundedRectTexture(&wctx.shape_cache, renderer, .{ .x = 0, .y = 0, .w = 32, .h = 32 }, .{ 4, 4, 4, 4 }, tex);
+    try std.testing.expectEqualStrings("", std.mem.span(c.SDL_GetError()));
+
+    wctx.shape_cache.deinit();
+    wctx.image_cache.deinit();
 }

@@ -383,6 +383,17 @@ pub const ClayStyle = struct {
     /// own flat color on top, borders don't have a gradient concept in
     /// this vocabulary.
     gradient: ?Gradient = null,
+    /// Texture-fill styling system: `null` means no texture fill (flat
+    /// `background_color`/`gradient` apply as normal, per those fields' own
+    /// doc comments). Non-null is a real asset id -- an index into the
+    /// per-app generated `TextureAssets.data` embedded-bytes array (see
+    /// `build.zig`'s `-Dhas-textures` module swap), never a raw path or
+    /// guest-supplied bytes; `natyv prepare`'s styling codegen is what
+    /// resolves a stylesheet's `texture: "logo.png"` string into this id.
+    /// Takes precedence over both `background_color` and `gradient` for the
+    /// fill itself when set, same "most specific fill wins" precedent
+    /// `gradient` already established over `background_color`.
+    texture: ?u32 = null,
     child_gap: u16 = 0,
     direction: c.Clay_LayoutDirection = c.CLAY_LEFT_TO_RIGHT,
     child_alignment: c.Clay_ChildAlignment = std.mem.zeroes(c.Clay_ChildAlignment),
@@ -1821,7 +1832,7 @@ pub fn setHeight(self: *Self, call_io: Io, id: u32, height: f32) bool {
 /// so unlike `padding` they never bump `layout_generation` -- FrameLoop.zig
 /// reads them live off `Slot.clay_style` every frame, no dirty-tracking
 /// needed.
-pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding, corner_radius: ?[4]f32, border: ?Border, gradient: ?Gradient) bool {
+pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding, corner_radius: ?[4]f32, border: ?Border, gradient: ?Gradient, texture: ?u32) bool {
     self.mutex.lockUncancelable(call_io);
     const slot = self.findLocked(id) orelse {
         self.mutex.unlock(call_io);
@@ -1839,6 +1850,7 @@ pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FCol
     if (corner_radius) |cr| slot.clay_style.corner_radius = cr;
     if (border) |b| slot.clay_style.border = b;
     if (gradient) |g| slot.clay_style.gradient = g;
+    if (texture) |t| slot.clay_style.texture = t;
     self.mutex.unlock(call_io);
 
     if (changed and slot.clay_managed) self.layout_generation +%= 1;

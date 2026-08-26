@@ -35,6 +35,8 @@ const ScrollBar = @import("ScrollBar.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
 const WindowManager = @import("WindowManager.zig");
 const ShapeCache = @import("capabilities/ShapeCache.zig");
+const ImageCache = @import("capabilities/ImageCache.zig");
+const TextureAssets = @import("TextureAssets");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -389,15 +391,29 @@ fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
 /// neither `corner_radius` nor `border` set keep the exact plain
 /// `SDL_RenderFillRect` path, unchanged -- this only branches into
 /// `ShapeCache` for a widget that actually opted into styling.
-fn drawStyledFill(renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, clay_style: WidgetHost.ClayStyle, rect: c.SDL_FRect, default_color: c.SDL_Color) void {
+fn drawStyledFill(renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, image_cache: *ImageCache.Cache, clay_style: WidgetHost.ClayStyle, rect: c.SDL_FRect, default_color: c.SDL_Color) void {
     const color = styleOverrideColor(clay_style.background_color) orelse default_color;
-    if (clay_style.corner_radius == null and clay_style.border == null and clay_style.gradient == null) {
+    if (clay_style.corner_radius == null and clay_style.border == null and clay_style.gradient == null and clay_style.texture == null) {
         _ = c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
         _ = c.SDL_RenderFillRect(renderer, &rect);
         return;
     }
     const radii = clay_style.corner_radius orelse .{ 0, 0, 0, 0 };
-    if (clay_style.gradient) |g| {
+    // Texture-fill styling system: takes precedence over gradient/flat
+    // fill when set, same "most specific fill wins" precedent gradient
+    // already established over background_color. `id >= TextureAssets
+    // .data.len`/a genuine decode failure both fall through to the
+    // gradient/flat path below rather than drawing nothing -- an app
+    // should never hit either in practice (Prepare.zig's asset-staging
+    // pass guarantees every resolved texture id is valid), but degrading
+    // gracefully here is strictly better than a guest-triggerable crash.
+    const texture_tex: ?*c.SDL_Texture = if (clay_style.texture) |id|
+        (if (id < TextureAssets.data.len) ImageCache.getOrLoad(image_cache, renderer, id, TextureAssets.data[id]) else null)
+    else
+        null;
+    if (texture_tex) |tex| {
+        ShapeCache.drawRoundedRectTexture(shape_cache, renderer, rect, radii, tex);
+    } else if (clay_style.gradient) |g| {
         ShapeCache.drawRoundedRectGradient(shape_cache, renderer, rect, radii, g.start_uv, g.start_color, g.end_uv, g.end_color);
     } else {
         ShapeCache.drawRoundedRect(shape_cache, renderer, rect, radii, color);
@@ -430,11 +446,11 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, 
     }
 }
 
-fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache) void {
+fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, image_cache: *ImageCache.Cache) void {
     const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
     if (slot.widget.fillRect()) |fr| {
-        drawStyledFill(renderer, shape_cache, slot.clay_style, fr.rect, fr.color);
+        drawStyledFill(renderer, shape_cache, image_cache, slot.clay_style, fr.rect, fr.color);
     }
     drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding, shape_cache);
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
@@ -747,7 +763,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (floating) continue;
         if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         if (slot.widget.fillRect()) |fr| {
-            if (slot.clay_style.corner_radius != null or slot.clay_style.border != null or slot.clay_style.gradient != null) {
+            if (slot.clay_style.corner_radius != null or slot.clay_style.border != null or slot.clay_style.gradient != null or slot.clay_style.texture != null) {
                 // Flush whatever's pending first -- a styled shape draws
                 // immediately (it can't join the plain-rect batch), so
                 // without this, a batched sibling queued earlier in this
@@ -757,10 +773,10 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
                 if (clip) |cr| {
                     const sdl_clip = toClipRect(cr);
                     _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-                    drawStyledFill(wctx.renderer, &wctx.shape_cache, slot.clay_style, fr.rect, fr.color);
+                    drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, fr.rect, fr.color);
                     _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
                 } else {
-                    drawStyledFill(wctx.renderer, &wctx.shape_cache, slot.clay_style, fr.rect, fr.color);
+                    drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, fr.rect, fr.color);
                 }
                 continue;
             }
@@ -793,7 +809,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (topmost_modal) |modal_id| {
             if (FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
         }
-        drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache);
+        drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache);
     }
     if (topmost_modal) |modal_id| {
         var win_w: c_int = undefined;
@@ -809,7 +825,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             if (!floating) continue;
             if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
             if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
-            drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache);
+            drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache);
         }
     }
 

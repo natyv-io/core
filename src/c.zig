@@ -29,4 +29,12 @@ pub const c = @cImport({
     // addCSourceFiles in build.zig), never crossing into this Zig-visible
     // header. See vendor/sdl_ttf/ and vendor/freetype/.
     @cInclude("SDL3_ttf/SDL_ttf.h");
+    // stb_image, vendored the same way as Clay (single-header, declarations
+    // translated here, real implementation compiled as C via addCSourceFile
+    // in build.zig -- see vendor/stb/stb_image_impl.c). STBI_NO_STDIO must
+    // match the same define there so the declaration and implementation
+    // agree on which symbols exist (natyv only ever decodes in-memory
+    // @embedFile'd bytes via stbi_load_from_memory, never a filesystem path).
+    @cDefine("STBI_NO_STDIO", "1");
+    @cInclude("stb_image.h");
 });

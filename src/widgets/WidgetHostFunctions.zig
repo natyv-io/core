@@ -102,7 +102,13 @@ const GradientRequest = struct { start_pos: [2]f32, start_color: ColorRequest, e
 // property," not "set it to zero/none" -- see `setStyleHostFn`'s doc
 // comment. Reuses `ClayPaddingRequest` (declared below) rather than a
 // second padding shape.
-const SetStyleRequest = struct { widget_id: u32, background_color: ?ColorRequest = null, padding: ?ClayPaddingRequest = null, corner_radius: ?[4]f32 = null, border: ?BorderRequest = null, gradient: ?GradientRequest = null };
+// Texture-fill styling system: `texture` is already a resolved numeric
+// asset id by the time it reaches here (`natyv prepare`'s styling codegen
+// resolves a stylesheet's `texture: "logo.png"` string into this at
+// generate time, the same "host never sees guest-authored strings for this
+// property" posture every other already-resolved field here follows) --
+// never a raw path.
+const SetStyleRequest = struct { widget_id: u32, background_color: ?ColorRequest = null, padding: ?ClayPaddingRequest = null, corner_radius: ?[4]f32 = null, border: ?BorderRequest = null, gradient: ?GradientRequest = null, texture: ?u32 = null };
 
 // L3: wire-format mirrors of Clay's real C types (Clay_SizingAxis,
 // Clay_Padding, Clay_LayoutDirection, Clay_ChildAlignment -- see clay.h)
@@ -1086,7 +1092,7 @@ pub fn setStyleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
         .end_color = .{ .r = g.end_color.r, .g = g.end_color.g, .b = g.end_color.b, .a = g.end_color.a },
     } else null;
 
-    if (!self.setStyle(self.io(), req.widget_id, bg, padding, req.corner_radius, border, gradient)) {
+    if (!self.setStyle(self.io(), req.widget_id, bg, padding, req.corner_radius, border, gradient, req.texture)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }

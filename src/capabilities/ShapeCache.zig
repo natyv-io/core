@@ -500,3 +500,80 @@ pub fn drawRoundedRectGradient(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: 
     var indices = [6]c_int{ 0, 1, 2, 0, 2, 3 };
     _ = c.SDL_RenderGeometry(renderer, tex, &verts, 4, &indices, 6);
 }
+
+/// Draws a filled, per-corner-rounded rectangle with a texture fill (the
+/// user's own image, already decoded to `image` by ImageCache.getOrLoad)
+/// instead of a flat color or gradient, using/populating `cache` for the
+/// shape mask exactly like drawRoundedRect/drawRoundedRectGradient.
+///
+/// Compositing technique, no shader (matches this file's own "no custom
+/// GPU shader anywhere" v1 constraint): three real SDL_BlendMode passes,
+/// each formula taken directly from SDL3's own documented blend-mode
+/// definitions (SDL_blendmode.h), not derived by trial and error --
+///   1. Clear a scratch target `T` (sized to the mask, not the caller's
+///      float `rect`) to fully transparent.
+///   2. Draw the mask onto `T` with BLENDMODE_BLEND. Since the mask's own
+///      color is pure white, BLEND's `dstRGB = srcRGB*srcA + dstRGB*(1-srcA)`
+///      leaves `T.RGB = (coverage, coverage, coverage)` and `T.A = coverage`
+///      -- i.e. `T` is now a valid *premultiplied*-alpha representation of
+///      the mask alone (RGB already scaled by its own alpha).
+///   3. Draw `image` onto `T`, stretched to fill it, with BLENDMODE_MOD.
+///      MOD's `dstRGB = srcRGB*dstRGB` (alpha untouched) turns
+///      `T.RGB` into `image.RGB * coverage` -- still premultiplied, now
+///      holding the actual image color instead of white, alpha still
+///      `coverage`.
+///   4. Blit `T` onto the real destination with BLENDMODE_BLEND_PREMULTIPLIED
+///      (`dstRGBA = srcRGBA + dstRGBA*(1-srcA)`) -- the correct composite
+///      for an already-premultiplied source, unlike plain BLEND which would
+///      multiply by `T.A` a second time.
+///
+/// `image`'s own alpha channel is deliberately ignored by this technique
+/// (MOD's formula never reads `srcA`) -- a real v1 scope limitation, not an
+/// oversight: a texture-fill image is expected to be an opaque photo/
+/// pattern, not a further semi-transparent layer on top of the shape's own
+/// mask alpha. Revisit if that need ever surfaces for real.
+pub fn drawRoundedRectTexture(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, image: *c.SDL_Texture) void {
+    const w: i32 = @intFromFloat(@round(rect.w));
+    const h: i32 = @intFromFloat(@round(rect.h));
+    if (w <= 0 or h <= 0) return;
+    const key = MaskKey{ .kind = .rect, .w = w, .h = h, .radii = quantizeRadii(radii) };
+    const mask = if (cache.find(key)) |t| t else blk: {
+        const t = renderRectMask(renderer, w, h, radii) orelse return;
+        cache.insert(key, t);
+        break :blk t;
+    };
+    // Reset any leftover flat-fill/gradient mod from a previous draw
+    // against this same cached mask -- see drawRoundedRectGradient's
+    // identical reset for why -- and force BLEND explicitly since nothing
+    // else in this file ever changes a cached mask's own blend mode away
+    // from it, but this function's correctness genuinely depends on it.
+    _ = c.SDL_SetTextureColorMod(mask, 255, 255, 255);
+    _ = c.SDL_SetTextureAlphaMod(mask, 255);
+    _ = c.SDL_SetTextureBlendMode(mask, c.SDL_BLENDMODE_BLEND);
+
+    const scratch = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGBA8888, c.SDL_TEXTUREACCESS_TARGET, w, h) orelse return;
+    defer c.SDL_DestroyTexture(scratch);
+    _ = c.SDL_SetTextureScaleMode(scratch, c.SDL_SCALEMODE_LINEAR);
+
+    const prev_target = c.SDL_GetRenderTarget(renderer);
+    _ = c.SDL_SetRenderTarget(renderer, scratch);
+    _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_NONE);
+    _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+    _ = c.SDL_RenderClear(renderer);
+    _ = c.SDL_RenderTexture(renderer, mask, null, null);
+
+    // `image` is cached (ImageCache) and reused across frames/shapes, so
+    // its blend mode is switched to MOD only for this one draw and
+    // restored to BLEND immediately after -- leaving it on MOD would
+    // corrupt any other real use of the same decoded texture.
+    _ = c.SDL_SetTextureBlendMode(image, c.SDL_BLENDMODE_MOD);
+    _ = c.SDL_RenderTexture(renderer, image, null, null);
+    _ = c.SDL_SetTextureBlendMode(image, c.SDL_BLENDMODE_BLEND);
+
+    _ = c.SDL_SetRenderTarget(renderer, prev_target);
+
+    _ = c.SDL_SetTextureBlendMode(scratch, c.SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+    // See drawCircle's doc comment -- `rect` is the real destination, not a
+    // rect rebuilt from the integer w/h used only for the mask/cache key.
+    _ = c.SDL_RenderTexture(renderer, scratch, null, &rect);
+}
