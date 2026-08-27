@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const build_options = @import("build_options");
 const c = @import("c.zig").c;
 const timing = @import("timing.zig");
 const Manifest = @import("Manifest.zig");
@@ -75,15 +76,26 @@ plugin: ?*c.ExtismPlugin = null,
 pub const Error = SqliteCapability.Error || error{PluginLoadFailed};
 
 /// `db_path == null` means the app declared no SQLite capability -- see the
-/// `sqlite` field doc comment.
+/// `sqlite` field doc comment. Guarded by `build_options.sqlite_enabled`
+/// (comptime, `build.zig`-injected) rather than just `db_path`'s own
+/// runtime nullability -- when an app's `conf.natyv.json` never sets
+/// `sqlite.enabled: true`, `natyv build` passes `-Dsqlite=false`, and this
+/// comptime branch is what actually keeps `SqliteCapability.open` (and
+/// everything it calls into real vendored sqlite3 code for) out of the
+/// compiled binary entirely, not just unreached at runtime.
 pub fn init(allocator: std.mem.Allocator, db_path: ?[:0]const u8) Error!Self {
-    const sqlite: ?SqliteCapability = if (db_path) |path| try SqliteCapability.open(allocator, path) else null;
+    const sqlite: ?SqliteCapability = if (build_options.sqlite_enabled)
+        (if (db_path) |path| try SqliteCapability.open(allocator, path) else null)
+    else
+        null;
     return .{ .allocator = allocator, .sqlite = sqlite, .widgets = .{ .allocator = allocator } };
 }
 
 pub fn deinit(self: *Self) void {
     if (self.plugin) |p| c.extism_plugin_free(p);
-    if (self.sqlite) |*s| s.close();
+    if (build_options.sqlite_enabled) {
+        if (self.sqlite) |*s| s.close();
+    }
     self.widgets.deinit();
 }
 
@@ -98,7 +110,9 @@ pub fn deinit(self: *Self) void {
 pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, widget_kinds: WidgetHost.EnabledKinds, clay_enabled: bool) Error!void {
     var funcs: [max_host_functions]?*const c.ExtismFunction = undefined;
     var n: usize = 0;
-    if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
+    if (build_options.sqlite_enabled) {
+        if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
+    }
     n += self.widgets.registerInto(funcs[n..], widget_kinds);
     if (clay_enabled) n += self.widgets.registerClayInto(funcs[n..]);
     // `[]?*anyopaque`, not `[]?*const c.ExtismFunction` -- see
