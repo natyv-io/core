@@ -63,8 +63,17 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    const argv = init.minimal.args.vector;
-    const config_path: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "conf.natyv.json";
+    // `Args.Iterator.initAllocator`, not raw `argv[i]` indexing --
+    // `init.minimal.args.vector` isn't an array of C-string pointers on
+    // every target the way it is on POSIX: on Windows it's the single raw
+    // UTF-16 command-line string the OS actually hands a process, which
+    // `std.mem.span`-style indexing can't even typecheck against. The
+    // iterator does the real cross-platform (and Windows-specific)
+    // parsing so this file doesn't have to.
+    var arg_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer arg_iter.deinit();
+    _ = arg_iter.skip(); // argv[0] is this executable's own path.
+    const config_path: []const u8 = arg_iter.next() orelse "conf.natyv.json";
 
     // Mirrors the wasm dispatch further below exactly (same
     // `build_options.embed_app_wasm` flag, same "embedded wins
