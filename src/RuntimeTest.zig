@@ -48,7 +48,7 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
     // guest only imports natyv_clay_* (never natyv_create_button/etc) --
     // needs clay_enabled=true or plugin creation itself fails with an
     // "unknown import" error before natyv_init ever runs.
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // W13: natyv_init now lands on the Home page (a real navigation
@@ -173,7 +173,7 @@ test "bookstore: cancelling the delete-confirm dialog leaves the book untouched"
 
     var runtime = try Runtime.init(allocator, ":memory:");
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [45]WidgetHost.Slot = undefined;
@@ -276,7 +276,7 @@ test "W13: a breadcrumb trail reflects the real navigation path and OnCrumbClick
 
     var runtime = try Runtime.init(allocator, ":memory:");
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [45]WidgetHost.Slot = undefined;
@@ -333,7 +333,7 @@ test "widget host functions: create/get/set/destroy round trip through a trivial
 
     var runtime = try Runtime.init(allocator, ":memory:");
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, false);
+    try runtime.loadPlugin(wasm, .{}, false);
     runtime.initGuest(io);
 
     // The trivial counter guest creates exactly one button in natyv_init.
@@ -432,7 +432,7 @@ test "L3: natyv_clay_create_container/_button through a real compiled guest, gat
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // 45, not 8: natyv_init creates container + button + checkbox + 2 radio
@@ -587,7 +587,7 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -1082,7 +1082,7 @@ test "W2: natyv_clay_create_container's scroll_vertical/scroll_horizontal round-
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
@@ -1146,7 +1146,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -1239,7 +1239,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -1325,7 +1325,7 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
     defer runtime.widgets.destroyAllTextObjects(io);
 
@@ -1423,7 +1423,7 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
     defer runtime.widgets.destroyAllTextObjects(io);
 
@@ -1633,7 +1633,7 @@ test "W1: checkbox/radio/progress bar created and mutated through a real compile
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // 16, not 8 -- see the L3 test's identical comment above (W2 bump).
@@ -1707,7 +1707,7 @@ test "W3: slider created via natyv_clay_create_slider round-trips its value, and
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -1742,7 +1742,7 @@ test "W27: a range slider created via natyv_clay_create_range_slider round-trips
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -1785,7 +1785,7 @@ test "W28: a Card's title/content structure round-trips, and a real click inside
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -1863,7 +1863,7 @@ test "W29: a spinner exists, is not focusable, gets real Clay-computed geometry,
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -1911,7 +1911,7 @@ test "W4: a dropdown's floating options panel round-trips floating into ClayStyl
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // 24, not 16: natyv_init's 18 widgets (see the L3 test's comment
@@ -2034,7 +2034,7 @@ test "Real crash regression: WidgetHost.setRect on an id destroyed via natyv_des
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -2102,7 +2102,7 @@ test "Dropdown follow-up: arrow-key cycling + Enter selects the highlighted opti
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -2186,7 +2186,7 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -2309,7 +2309,7 @@ test "W6: a combobox's .text_changed re-filters, .key_nav moves the highlight an
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // natyv_init's baseline is now 31 (see the L3 test's comment above),
@@ -2408,7 +2408,7 @@ test "W6: a real .blur event closes the combobox panel without selecting anythin
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // natyv_init's baseline is now 31 (see the L3 test's comment above),
@@ -2472,7 +2472,7 @@ test "W7: a toast round-trips duration_ms into a real expires_at_ms, and destroy
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // natyv_init's baseline is now 31 (see the L3 test's comment above),
@@ -2562,7 +2562,7 @@ test "Menu (productized): a real click opens the dropdown, key_nav highlights th
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -2680,7 +2680,7 @@ test "Menu (productized) submenu: opening a submenu-triggering item's own dropdo
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -2840,7 +2840,7 @@ test "Menu (productized) migration repro: many rapid key_nav presses, with a rea
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -2919,7 +2919,7 @@ test "Menu bar: a real click on a second bar item closes whichever one was alrea
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -3021,7 +3021,7 @@ test "W10: a textarea's multi-line content flows through host-level mutation, re
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
@@ -3084,7 +3084,7 @@ test "W11: a divider exists, is not focusable, and gets real Clay-computed geome
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -3136,7 +3136,7 @@ test "W12: a toggle exists, is focusable, activates via a real click, and natyv_
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // 32: natyv_init's 31 widgets (see the L3 test's comment above) --
@@ -3189,7 +3189,7 @@ test "W14: three badges exist with their real tones/labels, are not focusable, a
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -3243,7 +3243,7 @@ test "W15: a real .hover event creates a floating tooltip through a real guest, 
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // natyv_init's baseline is now 45 (see the L3 test's comment above),
@@ -3332,7 +3332,7 @@ test "W16: a date/time picker's calendar grid matches the real month, and select
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // natyv_init's baseline is now 45 (see the L3 test's comment above),
@@ -3416,7 +3416,7 @@ test "W16: month navigation regenerates the grid for the real target month, and 
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // Bumped from 100 -- same peak-widget-count math as the previous
@@ -3533,7 +3533,7 @@ test "W18: a popover opens with real content, its own Checkbox toggles, its own 
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     // W19 follow-up: bumped from 48 -- natyv_init now creates 45 widgets on
@@ -3765,7 +3765,7 @@ test "W19: natyv_clay_create_tabs/_tab_panel round-trip through a real compiled 
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -3973,7 +3973,7 @@ test "Accordion: natyv_set_visible round-trips through a real compiled guest, an
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
@@ -4182,7 +4182,7 @@ test "Scroll-into-view: natyv_get_scroll_position's Slot.scroll_data mirror matc
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -4245,7 +4245,7 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     var font_cap = try Font.init();
@@ -4338,7 +4338,7 @@ test "Tree view: a real click expands a root and reveals children while collapse
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
     defer runtime.widgets.destroyAllTextObjects(io);
 
@@ -4456,7 +4456,7 @@ test "Table view: real header labels and row-1 cell content exist right after in
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
     defer runtime.widgets.destroyAllTextObjects(io);
 
@@ -4604,7 +4604,7 @@ test "File picker: a real .file_selected event reaches OnFileSelected for the ri
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
     defer runtime.widgets.destroyAllTextObjects(io);
 
@@ -4768,7 +4768,7 @@ test "Multi-window Stage 4: natyv_clay_create_window returns a usable widget_id 
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     const resp_bytes = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"CreateWindowTest\"}") orelse return error.CallFailed;
@@ -4836,7 +4836,7 @@ test "Multi-window Stage 4: natyv_destroy_window cascades to the whole window su
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
     const create_resp = runtime.call(io, "natyv_test_hook", "{\"widget_id\":0,\"event_type\":\"CreateWindowTest\"}") orelse return error.CallFailed;
@@ -4934,7 +4934,7 @@ test "Menu: a nested submenu selection destroys both panel levels and still deli
 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
-    try runtime.loadPlugin(wasm, .{}, .{}, true);
+    try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
     defer runtime.widgets.destroyAllTextObjects(io);
 

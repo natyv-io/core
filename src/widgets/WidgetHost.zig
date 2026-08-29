@@ -184,8 +184,9 @@ pub const max_widgets = 192;
 // natyv_clay_create_* split.
 // Tabs (W19) adds no plain natyv_create_* function at all -- like
 // Container, it's inherently a Clay parent/child + visibility construct,
-// so it's Clay-only (see registerClayInto/clay_host_function_count below),
-// not gated by an EnabledKinds/WidgetsConfig flag.
+// so it's Clay-only (see registerClayInto/clay_host_function_count below) --
+// it never had a plain natyv_create_* function in registerInto's own count
+// to begin with.
 // + natyv_set_visible (1) -- Accordion, generic per-slot toggle, guest-
 // composed rather than a new WidgetKind, so no Clay-side registration.
 // + natyv_set_size (1) -- Tree view, generic per-slot Fixed-height resize,
@@ -819,87 +820,44 @@ pub fn takePendingWindowTeardowns(self: *Self, call_io: Io, out: []u32) usize {
     return n;
 }
 
-pub const EnabledKinds = struct {
-    button: bool = true,
-    textfield: bool = true,
-    textarea: bool = true,
-    label: bool = true,
-    checkbox: bool = true,
-    toggle: bool = true,
-    radio_button: bool = true,
-    progress_bar: bool = true,
-    slider: bool = true,
-    divider: bool = true,
-    badge: bool = true,
-    numeric_stepper: bool = true,
-    segmented_control: bool = true,
-};
-
-/// Registers only the create-functions for widget kinds `enabled` declares
-/// (an app's conf.natyv.json) -- a guest that was never granted a kind gets
-/// a normal "unknown import" failure from Extism if it tries to use it,
-/// same class of enforcement as `allowed_hosts` for network access.
-/// `natyv_set_text`/`natyv_get_text`/`natyv_destroy_widget` are generic
-/// utility ops over whatever widgets already exist, so they're always
-/// registered regardless -- there's nothing to gate: a guest can't get a
-/// widget_id to call them with unless it already had permission to create
-/// that widget in the first place.
-pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled: EnabledKinds) usize {
+/// Registers every widget kind's create-function unconditionally -- widgets
+/// are declarative purely through use of their tag in `.ntx` markup, with no
+/// separate per-app opt-in step (confirmed decision, 2026-08-29: matches how
+/// `Container` already worked, see the "not gated" comment above; the
+/// previous per-kind `conf.natyv.json` `widgets.*` gate never actually added
+/// real enforcement value once every kind defaulted through the same guest
+/// SDK path, so it was a pure config-surface cost with no offsetting
+/// benefit -- unlike `sqlite`/`network`, which remain real, enforced gates).
+pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
     const in_types = [_]c.ExtismValType{c.ExtismValType_I64};
     const out_types = [_]c.ExtismValType{c.ExtismValType_I64};
     var n: usize = 0;
-    if (enabled.button) {
-        funcs_out[n] = c.extism_function_new("natyv_create_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createButtonHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.textfield) {
-        funcs_out[n] = c.extism_function_new("natyv_create_textfield", &in_types[0], 1, &out_types[0], 1, HostFunctions.createTextFieldHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.textarea) {
-        funcs_out[n] = c.extism_function_new("natyv_create_textarea", &in_types[0], 1, &out_types[0], 1, HostFunctions.createTextAreaHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.label) {
-        funcs_out[n] = c.extism_function_new("natyv_create_label", &in_types[0], 1, &out_types[0], 1, HostFunctions.createLabelHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.checkbox) {
-        funcs_out[n] = c.extism_function_new("natyv_create_checkbox", &in_types[0], 1, &out_types[0], 1, HostFunctions.createCheckboxHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.toggle) {
-        funcs_out[n] = c.extism_function_new("natyv_create_toggle", &in_types[0], 1, &out_types[0], 1, HostFunctions.createToggleHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.radio_button) {
-        funcs_out[n] = c.extism_function_new("natyv_create_radio_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createRadioButtonHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.progress_bar) {
-        funcs_out[n] = c.extism_function_new("natyv_create_progressbar", &in_types[0], 1, &out_types[0], 1, HostFunctions.createProgressBarHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.slider) {
-        funcs_out[n] = c.extism_function_new("natyv_create_slider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createSliderHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.divider) {
-        funcs_out[n] = c.extism_function_new("natyv_create_divider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createDividerHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.badge) {
-        funcs_out[n] = c.extism_function_new("natyv_create_badge", &in_types[0], 1, &out_types[0], 1, HostFunctions.createBadgeHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.numeric_stepper) {
-        funcs_out[n] = c.extism_function_new("natyv_create_numeric_stepper", &in_types[0], 1, &out_types[0], 1, HostFunctions.createNumericStepperHostFn, self, null);
-        n += 1;
-    }
-    if (enabled.segmented_control) {
-        funcs_out[n] = c.extism_function_new("natyv_create_segmented_control", &in_types[0], 1, &out_types[0], 1, HostFunctions.createSegmentedControlHostFn, self, null);
-        n += 1;
-    }
+    funcs_out[n] = c.extism_function_new("natyv_create_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createButtonHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_textfield", &in_types[0], 1, &out_types[0], 1, HostFunctions.createTextFieldHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_textarea", &in_types[0], 1, &out_types[0], 1, HostFunctions.createTextAreaHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_label", &in_types[0], 1, &out_types[0], 1, HostFunctions.createLabelHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_checkbox", &in_types[0], 1, &out_types[0], 1, HostFunctions.createCheckboxHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_toggle", &in_types[0], 1, &out_types[0], 1, HostFunctions.createToggleHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_radio_button", &in_types[0], 1, &out_types[0], 1, HostFunctions.createRadioButtonHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_progressbar", &in_types[0], 1, &out_types[0], 1, HostFunctions.createProgressBarHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_slider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createSliderHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_divider", &in_types[0], 1, &out_types[0], 1, HostFunctions.createDividerHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_badge", &in_types[0], 1, &out_types[0], 1, HostFunctions.createBadgeHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_numeric_stepper", &in_types[0], 1, &out_types[0], 1, HostFunctions.createNumericStepperHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_create_segmented_control", &in_types[0], 1, &out_types[0], 1, HostFunctions.createSegmentedControlHostFn, self, null);
+    n += 1;
     funcs_out[n] = c.extism_function_new("natyv_set_text", &in_types[0], 1, &out_types[0], 1, HostFunctions.setTextHostFn, self, null);
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_text", &in_types[0], 1, &out_types[0], 1, HostFunctions.getTextHostFn, self, null);
@@ -971,8 +929,10 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction, enabled:
 pub const clay_host_function_count = 22;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
-/// Runtime.loadPlugin gates this the same way sqlite/widgets.* already
-/// gate their own host functions (see Config.zig's UiConfig). These only
+/// Runtime.loadPlugin gates this the same way `sqlite`/`network` gate their
+/// own host functions (see Config.zig's UiConfig; unlike those two real
+/// capability gates, plain widget-kind registration in `registerInto` above
+/// is always-on and ungated). These only
 /// touch the widget registry (store parent_id + style on insert); the
 /// actual Clay arena/BeginLayout/EndLayout lifecycle lives in
 /// ClayLayout.zig and is driven per-frame by L4's render-loop pass, not by

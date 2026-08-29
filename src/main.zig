@@ -162,23 +162,8 @@ pub fn main(init: std.process.Init) !void {
     defer runtime.deinit();
 
     const manifest: Manifest = .{ .allowed_hosts = if (config.value.network.enabled) config.value.network.allowed_hosts else &.{} };
-    const widget_kinds: WidgetHost.EnabledKinds = .{
-        .button = config.value.widgets.button,
-        .textfield = config.value.widgets.textfield,
-        .textarea = config.value.widgets.textarea,
-        .label = config.value.widgets.label,
-        .checkbox = config.value.widgets.checkbox,
-        .toggle = config.value.widgets.toggle,
-        .radio_button = config.value.widgets.radio_button,
-        .progress_bar = config.value.widgets.progress_bar,
-        .slider = config.value.widgets.slider,
-        .divider = config.value.widgets.divider,
-        .badge = config.value.widgets.badge,
-        .numeric_stepper = config.value.widgets.numeric_stepper,
-        .segmented_control = config.value.widgets.segmented_control,
-    };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
-    try runtime.loadPlugin(wasm, manifest, widget_kinds, clay_enabled);
+    try runtime.loadPlugin(wasm, manifest, clay_enabled);
     runtime.initGuest(io);
 
     var queue = EventQueue.init(allocator);

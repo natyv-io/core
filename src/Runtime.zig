@@ -105,15 +105,17 @@ pub fn deinit(self: *Self) void {
 /// not during construction of the returned value itself.
 ///
 /// `clay_enabled` mirrors conf.natyv.json's `ui.backend == "clay"` (see
-/// Config.UiConfig) -- only registers the natyv_clay_* functions when true,
-/// same enforcement story as `widget_kinds` for the plain widget functions.
-pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, widget_kinds: WidgetHost.EnabledKinds, clay_enabled: bool) Error!void {
+/// Config.UiConfig) -- only registers the natyv_clay_* functions when true.
+/// Plain widget-kind registration (`widgets.registerInto` below) is always
+/// unconditional -- widgets are declarative purely through `.ntx` tag use,
+/// no separate per-app opt-in (confirmed decision, 2026-08-29).
+pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enabled: bool) Error!void {
     var funcs: [max_host_functions]?*const c.ExtismFunction = undefined;
     var n: usize = 0;
     if (build_options.sqlite_enabled) {
         if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
     }
-    n += self.widgets.registerInto(funcs[n..], widget_kinds);
+    n += self.widgets.registerInto(funcs[n..]);
     if (clay_enabled) n += self.widgets.registerClayInto(funcs[n..]);
     // `[]?*anyopaque`, not `[]?*const c.ExtismFunction` -- see
     // `BindingsAbsent.zig`'s own doc comment on why this cross-module
