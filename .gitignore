@@ -1,0 +1,18 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+.DS_Store
+
+# Copied in by natyv build's own bundling step immediately before it
+# invokes zig build -- whatever app is currently being bundled.
+src/assets/embedded_app.wasm
+src/assets/embedded_config.json
+
+# Texture-fill styling system: written by natyv prepare's own
+# asset-staging pass.
+src/assets/TextureAssetsGenerated.zig
+src/assets/textures/
+
+# Binding generator: written by natyv bind/natyv build directly into
+# this repo's own checkout (local dev) or a packaged copy of it.
+src/BindingsGenerated.zig

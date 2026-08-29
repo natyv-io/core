@@ -1,6 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig").c;
-const Config = @import("Config.zig");
+const Config = @import("Config");
 const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const build_options = @import("build_options");

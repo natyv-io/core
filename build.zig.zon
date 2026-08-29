@@ -1,0 +1,48 @@
+.{
+    .name = .natyv_core,
+    .version = "0.0.0",
+    .fingerprint = 0x1ba72f55ba89d0d7,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sdl = .{
+            .url = "https://github.com/allyourcodebase/SDL3/archive/refs/tags/1.0.1+3.4.14.tar.gz",
+            .hash = "sdl-1.0.1+3.4.14-i4QD0ViwqQAThHDlng1K46lINQ5PioLIz9bDKpGJTuzs",
+        },
+        .extism_aarch64_macos = .{
+            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-aarch64-apple-darwin-v1.30.0.tar.gz",
+            .hash = "N-V-__8AAFoRKQbJyBexdHaVn_1CaGv54NZyZxQjpKk4DhKu",
+        },
+        .extism_x86_64_macos = .{
+            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-apple-darwin-v1.30.0.tar.gz",
+            .hash = "N-V-__8AABJ4igZfENpmL70NeY2h63RO2bPPychyHBYgc_VW",
+        },
+        .extism_x86_64_linux_gnu = .{
+            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-unknown-linux-gnu-v1.30.0.tar.gz",
+            .hash = "N-V-__8AANRaSwmstPv9ox7zLy4Kjj3c4IYRDZCB14tkbS_X",
+        },
+        .extism_aarch64_linux_gnu = .{
+            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-aarch64-unknown-linux-gnu-v1.30.0.tar.gz",
+            .hash = "N-V-__8AAJBFqgj-JoK1LxhwRPOvAw0-5iFkaWF4zSk7GYGx",
+        },
+        .extism_x86_64_windows_gnu = .{
+            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-pc-windows-gnu-v1.30.0.tar.gz",
+            .hash = "N-V-__8AAMYC9AfopfBtCj992qD9wRNwojVmC4JNjZuGUTfz",
+        },
+        .llvm_mingw = .{
+            .url = "https://github.com/mstorsjo/llvm-mingw/releases/download/20260826/llvm-mingw-20260826-ucrt-macos-universal.tar.xz",
+            .hash = "N-V-__8AACLxny4duQDp3FGCPOH31CSIZ2WJAe2AEo9XajH0",
+        },
+        .shared = .{
+            .url = "git+https://github.com/natyv-io/shared#3a7966143284facef087d91fe5800681838029d6",
+            .hash = "natyv_shared-0.0.0-cp-g4HGJAADhv7-HU7XvMqjlaR6bVQ_aA6lpjX9HfR6l",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+        "LICENSE",
+        "README.md",
+    },
+}
