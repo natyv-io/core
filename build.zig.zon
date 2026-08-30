@@ -1,6 +1,6 @@
 .{
     .name = .natyv_core,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x1ba72f55ba89d0d7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -33,8 +33,8 @@
             .hash = "N-V-__8AACLxny4duQDp3FGCPOH31CSIZ2WJAe2AEo9XajH0",
         },
         .shared = .{
-            .url = "git+https://github.com/natyv-io/shared#3a7966143284facef087d91fe5800681838029d6",
-            .hash = "natyv_shared-0.0.0-cp-g4HGJAADhv7-HU7XvMqjlaR6bVQ_aA6lpjX9HfR6l",
+            .url = "git+https://github.com/natyv-io/shared#ed008d38953fb791c31ca8cb2561c9497342c2bc",
+            .hash = "natyv_shared-0.1.0-cp-g4HGJAADGKUQ37Gxg_zUrjoX1FXBGed09X2AOS0O8",
         },
     },
     .paths = .{
