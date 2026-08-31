@@ -25,3 +25,15 @@
 
 pub const bytes: []const u8 = @embedFile("embedded_app.wasm");
 pub const config_bytes: []const u8 = @embedFile("embedded_config.json");
+
+/// `ca_certs_bytes` (added 2026-08-31, the custom-CA-cert work): a JSON
+/// array of `{"host","port","pem"}`, one per `conf.natyv.json`
+/// `allowed_sockets[].ca_cert_path` entry -- `Bundle.zig` resolves each
+/// path (relative to the config file's own directory, same convention as
+/// `icon`) and inlines the real PEM bytes at real `natyv build` time, for
+/// the same reason `config_bytes` above exists at all: a distinct `.app`
+/// bundle has no reliable cwd to resolve a relative path against at
+/// runtime. Always present (an empty `[]` when no app declares any custom
+/// CA), never a live disk read once bundled -- see `capabilities/Tcp.zig`'s
+/// own doc comment for the dev-mode (non-bundled) counterpart.
+pub const ca_certs_bytes: []const u8 = @embedFile("embedded_ca_certs.json");

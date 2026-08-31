@@ -5,3 +5,4 @@
 
 pub const bytes: []const u8 = &.{};
 pub const config_bytes: []const u8 = &.{};
+pub const ca_certs_bytes: []const u8 = &.{};

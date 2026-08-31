@@ -95,6 +95,20 @@ fn linkNatyvDeps(b: *std.Build, module: *std.Build.Module, extism_prefix: ?[]con
 
     linkExtism(b, module, extism_prefix);
 
+    // mbedTLS (real vendored Mbed-TLS 3.6.6 via `allyourcodebase/mbedtls`,
+    // pinned to a specific commit since the wrapper has no tagged releases
+    // -- see MbedtlsSmokeTest.zig's own doc comment) -- backs the real TLS
+    // handshake wrapper in Tls.zig, which TcpRegistry.zig now imports
+    // unconditionally (a `Connection` can always potentially hold an active
+    // TLS session), so this is a real, always-needed link for natyv-core
+    // itself now, not just a standalone smoke test.
+    const mbedtls_dep = b.dependency("mbedtls", .{
+        .target = module.resolved_target.?,
+        .optimize = module.optimize.?,
+    });
+    module.linkLibrary(mbedtls_dep.artifact("mbedtls"));
+    module.link_libc = true;
+
     // Vendored SQLite (the real, official amalgamation -- sqlite3.c/.h,
     // public domain). The header is always on the include path
     // (declarations alone need no linking), but the real implementation is
@@ -375,7 +389,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     linkNatyvDeps(b, runtime_tests.root_module, extism_prefix, sqlite_enabled);
+    runtime_tests.root_module.addImport("Config", config_mod);
     runtime_tests.root_module.addImport("Bindings", bindings_mod);
+    runtime_tests.root_module.addImport("EmbeddedWasm", embedded_wasm_mod);
     runtime_tests.root_module.addOptions("build_options", build_options);
     const run_runtime_tests = b.addRunArtifact(runtime_tests);
     run_runtime_tests.setCwd(b.path("."));
@@ -387,6 +403,64 @@ pub fn build(b: *std.Build) void {
     // tracked source file (full history preserved) for a future
     // natyv-io/integration-tests-style repo to pull in alongside real wasm
     // fixtures, per Quinn's own call (2026-08-29) when this gap was found.
+
+    const private_ranges_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/PrivateRanges.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_private_ranges_tests = b.addRunArtifact(private_ranges_tests);
+
+    const mbedtls_dep = b.dependency("mbedtls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const tcp_registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/TcpRegistry.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    tcp_registry_tests.root_module.linkLibrary(mbedtls_dep.artifact("mbedtls"));
+    tcp_registry_tests.root_module.addImport("Config", config_mod);
+    const run_tcp_registry_tests = b.addRunArtifact(tcp_registry_tests);
+
+    const mbedtls_smoke_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/MbedtlsSmokeTest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mbedtls_smoke_tests.root_module.linkLibrary(mbedtls_dep.artifact("mbedtls"));
+    const run_mbedtls_smoke_tests = b.addRunArtifact(mbedtls_smoke_tests);
+
+    const tcp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Tcp.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    tcp_tests.root_module.addImport("Config", config_mod);
+    const run_tcp_tests = b.addRunArtifact(tcp_tests);
+
+    const tls_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    tls_tests.root_module.linkLibrary(mbedtls_dep.artifact("mbedtls"));
+    const run_tls_tests = b.addRunArtifact(tls_tests);
 
     const drawbatcher_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -469,6 +543,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sqlite_tests.step);
     test_step.dependOn(&run_windowmanager_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
+    test_step.dependOn(&run_private_ranges_tests.step);
+    test_step.dependOn(&run_tcp_registry_tests.step);
+    test_step.dependOn(&run_mbedtls_smoke_tests.step);
+    test_step.dependOn(&run_tcp_tests.step);
+    test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_drawbatcher_tests.step);
     test_step.dependOn(&run_scrollclip_tests.step);
     test_step.dependOn(&run_scrollbar_tests.step);

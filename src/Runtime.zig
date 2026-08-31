@@ -23,7 +23,9 @@ const build_options = @import("build_options");
 const c = @import("c.zig").c;
 const timing = @import("timing.zig");
 const Manifest = @import("Manifest.zig");
+const Config = @import("Config");
 const SqliteCapability = @import("capabilities/Sqlite.zig");
+const TcpCapability = @import("capabilities/Tcp.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const json_util = @import("json_util.zig");
 // L1: Clay's own arena/BeginLayout/EndLayout lifecycle isn't wired into the
@@ -61,7 +63,7 @@ const Bindings = @import("Bindings");
 
 const Self = @This();
 
-const max_host_functions = SqliteCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
+const max_host_functions = SqliteCapability.host_function_count + TcpCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
 
 allocator: std.mem.Allocator,
 /// `null` when conf.natyv.json's `sqlite.enabled` is false -- no connection
@@ -70,6 +72,12 @@ allocator: std.mem.Allocator,
 /// import" failure if it tries to use it, same enforcement story as
 /// `allowed_hosts` for network and `widgets.*` for widget kinds.
 sqlite: ?SqliteCapability,
+/// `null` until `enableNetwork` is called (see its own doc comment) --
+/// unlike `sqlite`, not set up during `init` itself, since this is a much
+/// newer, still-partial capability (no TLS handshake yet) and every one of
+/// `init`'s ~60 existing call sites across `RuntimeTest.zig` would
+/// otherwise need updating for a capability none of them actually test.
+tcp: ?TcpCapability = null,
 widgets: WidgetHost,
 plugin: ?*c.ExtismPlugin = null,
 
@@ -91,11 +99,25 @@ pub fn init(allocator: std.mem.Allocator, db_path: ?[:0]const u8) Error!Self {
     return .{ .allocator = allocator, .sqlite = sqlite, .widgets = .{ .allocator = allocator } };
 }
 
+/// Sets up the `tcp` capability (`tcp_connect`/`tcp_read`/`tcp_write`/
+/// `tcp_close`) for real -- called explicitly by `main.zig` when
+/// `conf.natyv.json`'s `network.enabled` is true, after `Runtime.init` but
+/// before `loadPlugin` (the same "two-phase init" ordering `loadPlugin`'s
+/// own doc comment already requires for every capability: registration
+/// needs `self`/the capability struct at its final stable address first).
+/// Never called from `RuntimeTest.zig` today -- see the `tcp` field's own
+/// doc comment for why this is a separate method rather than an `init`
+/// parameter.
+pub fn enableNetwork(self: *Self, allowed_sockets: []const Config.AllowedSocket) void {
+    self.tcp = TcpCapability.init(self.allocator, allowed_sockets);
+}
+
 pub fn deinit(self: *Self) void {
     if (self.plugin) |p| c.extism_plugin_free(p);
     if (build_options.sqlite_enabled) {
         if (self.sqlite) |*s| s.close();
     }
+    if (self.tcp) |*tcp| tcp.deinit();
     self.widgets.deinit();
 }
 
@@ -115,6 +137,7 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
     if (build_options.sqlite_enabled) {
         if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
     }
+    if (self.tcp) |*tcp| n += tcp.registerInto(funcs[n..]);
     n += self.widgets.registerInto(funcs[n..]);
     if (clay_enabled) n += self.widgets.registerClayInto(funcs[n..]);
     // `[]?*anyopaque`, not `[]?*const c.ExtismFunction` -- see
@@ -149,6 +172,10 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
 pub fn call(self: *Self, io: Io, name: [:0]const u8, payload: []const u8) ?[]const u8 {
     self.widgets.current_io = io;
     defer self.widgets.current_io = null;
+    if (self.tcp) |*tcp| tcp.current_io = io;
+    defer if (self.tcp) |*tcp| {
+        tcp.current_io = null;
+    };
 
     const start = timing.nowMs();
     const rc = c.extism_plugin_call(self.plugin, name.ptr, payload.ptr, payload.len);

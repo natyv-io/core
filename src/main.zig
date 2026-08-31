@@ -160,8 +160,14 @@ pub fn main(init: std.process.Init) !void {
 
     var runtime = try Runtime.init(allocator, db_path);
     defer runtime.deinit();
+    if (config.value.network.enabled) runtime.enableNetwork(config.value.network.tcp.allowed_sockets);
+    // Real OS sockets need a real `Io` to close gracefully (see
+    // TcpRegistry.closeAll's own doc comment for why Runtime.deinit alone
+    // can't do this) -- `io` is still alive here, right before it stops
+    // being so, so this is the right place for it.
+    defer if (runtime.tcp) |*tcp| tcp.registry.closeAll(io);
 
-    const manifest: Manifest = .{ .allowed_hosts = if (config.value.network.enabled) config.value.network.allowed_hosts else &.{} };
+    const manifest: Manifest = .{ .allowed_hosts = if (config.value.network.enabled) config.value.network.http.allowed_hosts else &.{} };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
     try runtime.loadPlugin(wasm, manifest, clay_enabled);
     runtime.initGuest(io);
