@@ -7,6 +7,7 @@ zig-pkg/
 # invokes zig build -- whatever app is currently being bundled.
 src/assets/embedded_app.wasm
 src/assets/embedded_config.json
+src/assets/embedded_ca_certs.json
 
 # Texture-fill styling system: written by natyv prepare's own
 # asset-staging pass.

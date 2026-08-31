@@ -221,7 +221,13 @@ fn connectHostFn(
         const custom_ca = findCustomCaPem(self.allocator, req.host, req.port);
         defer if (custom_ca) |ca| self.allocator.free(ca);
         const conn = self.registry.find(id).?;
-        conn.tls_session = Tls.Session.handshake(conn.stream, call_io, hostname_z, custom_ca) catch |err| {
+        // `conn.tls_session` is reserved as non-null *before* calling
+        // `handshake` so `&conn.tls_session.?` is the session's real,
+        // final, never-moving-again address from the very start -- see
+        // `Tls.Session.handshake`'s own doc comment for why this matters.
+        conn.tls_session = @as(Tls.Session, undefined);
+        (&conn.tls_session.?).handshake(conn.stream, call_io, hostname_z, custom_ca) catch |err| {
+            conn.tls_session = null;
             self.registry.close(id, call_io);
             host_fn_util.writeErrorJson(plugin, &outputs[0], "tls handshake failed: {}", .{err});
             return;
@@ -282,7 +288,11 @@ fn upgradeTlsHostFn(
 
     const custom_ca = findCustomCaPem(self.allocator, conn.host(), conn.port);
     defer if (custom_ca) |ca| self.allocator.free(ca);
-    conn.tls_session = Tls.Session.handshake(conn.stream, call_io, hostname_z, custom_ca) catch |err| {
+    // See connectHostFn's own comment: reserve the optional as non-null
+    // first so the session's address is stable from the start.
+    conn.tls_session = @as(Tls.Session, undefined);
+    (&conn.tls_session.?).handshake(conn.stream, call_io, hostname_z, custom_ca) catch |err| {
+        conn.tls_session = null;
         host_fn_util.writeErrorJson(plugin, &outputs[0], "tls handshake failed: {}", .{err});
         return;
     };

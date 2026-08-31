@@ -54,6 +54,28 @@ pub const Session = struct {
     writer: net.Stream.Writer,
     write_buf: [write_buf_len]u8 = undefined,
 
+    /// Constructs `self` in place -- deliberately an out-parameter, not a
+    /// return-by-value, because `mbedtls_ssl_set_bio` below hands mbedTLS a
+    /// raw `*Session` context pointer for its `bioSend`/`bioRecv`
+    /// callbacks. That pointer has to be this session's real, final,
+    /// never-moving-again address from the moment it's captured -- a
+    /// return-by-value `Session` (as this function used to be) captures the
+    /// address of its own *local* stack variable instead, which is only
+    /// valid until the function returns; any copy the caller then makes
+    /// storing the result (`conn.tls_session = handshake(...)`) leaves
+    /// mbedTLS's internal BIO context dangling at that dead stack frame.
+    /// This was a real, hard-to-see bug: the stale pointer happened to
+    /// still read back correctly for the handshake itself and one
+    /// subsequent `read()` (the dead stack memory hadn't been overwritten
+    /// yet), then segfaulted inside `close()`'s `bioSend` once enough other
+    /// calls had reused that stack region -- caught only by a real
+    /// end-to-end guest run through the Go SDK, not by this file's own
+    /// standalone tests (which construct `session` as a local that's never
+    /// moved afterward, so the bug could never manifest there). Callers
+    /// must place `self` at its real final address *before* calling this
+    /// (a local `var`, or `&optional_field.?` once the field is non-null)
+    /// and never move it again afterward.
+    ///
     /// `hostname` must be valid for the duration of this call (mbedTLS
     /// copies what it needs internally during `mbedtls_ssl_set_hostname`,
     /// so it doesn't need to outlive the call itself, just be valid at call
@@ -63,8 +85,8 @@ pub const Session = struct {
     /// PEM-parsing convention) -- callers loading a dev-supplied file are
     /// responsible for that; the bundled default already satisfies it via
     /// `@embedFile`'s own sentinel-terminated array.
-    pub fn handshake(stream: net.Stream, io: Io, hostname: [:0]const u8, custom_ca_pem: ?[:0]const u8) Error!Session {
-        var session: Session = .{
+    pub fn handshake(self: *Session, stream: net.Stream, io: Io, hostname: [:0]const u8, custom_ca_pem: ?[:0]const u8) Error!void {
+        self.* = .{
             .entropy = undefined,
             .ctr_drbg = undefined,
             .ca_chain = undefined,
@@ -73,49 +95,47 @@ pub const Session = struct {
             .reader = stream.reader(io, &.{}),
             .writer = undefined,
         };
-        session.writer = stream.writer(io, &session.write_buf);
+        self.writer = stream.writer(io, &self.write_buf);
 
-        c.mbedtls_entropy_init(&session.entropy);
-        c.mbedtls_ctr_drbg_init(&session.ctr_drbg);
-        c.mbedtls_x509_crt_init(&session.ca_chain);
-        c.mbedtls_ssl_config_init(&session.conf);
-        c.mbedtls_ssl_init(&session.ssl);
-        errdefer session.deinit();
+        c.mbedtls_entropy_init(&self.entropy);
+        c.mbedtls_ctr_drbg_init(&self.ctr_drbg);
+        c.mbedtls_x509_crt_init(&self.ca_chain);
+        c.mbedtls_ssl_config_init(&self.conf);
+        c.mbedtls_ssl_init(&self.ssl);
+        errdefer self.deinit();
 
         const pers = "natyv-tls";
-        if (c.mbedtls_ctr_drbg_seed(&session.ctr_drbg, c.mbedtls_entropy_func, &session.entropy, pers, pers.len) != 0) {
+        if (c.mbedtls_ctr_drbg_seed(&self.ctr_drbg, c.mbedtls_entropy_func, &self.entropy, pers, pers.len) != 0) {
             return error.TlsInitFailed;
         }
 
         const ca_pem: [:0]const u8 = custom_ca_pem orelse default_ca_bundle;
-        if (c.mbedtls_x509_crt_parse(&session.ca_chain, ca_pem.ptr, ca_pem.len + 1) != 0) {
+        if (c.mbedtls_x509_crt_parse(&self.ca_chain, ca_pem.ptr, ca_pem.len + 1) != 0) {
             return error.TlsCaLoadFailed;
         }
 
-        if (c.mbedtls_ssl_config_defaults(&session.conf, c.MBEDTLS_SSL_IS_CLIENT, c.MBEDTLS_SSL_TRANSPORT_STREAM, c.MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+        if (c.mbedtls_ssl_config_defaults(&self.conf, c.MBEDTLS_SSL_IS_CLIENT, c.MBEDTLS_SSL_TRANSPORT_STREAM, c.MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
             return error.TlsInitFailed;
         }
-        c.mbedtls_ssl_conf_authmode(&session.conf, c.MBEDTLS_SSL_VERIFY_REQUIRED);
-        c.mbedtls_ssl_conf_ca_chain(&session.conf, &session.ca_chain, null);
-        c.mbedtls_ssl_conf_rng(&session.conf, c.mbedtls_ctr_drbg_random, &session.ctr_drbg);
+        c.mbedtls_ssl_conf_authmode(&self.conf, c.MBEDTLS_SSL_VERIFY_REQUIRED);
+        c.mbedtls_ssl_conf_ca_chain(&self.conf, &self.ca_chain, null);
+        c.mbedtls_ssl_conf_rng(&self.conf, c.mbedtls_ctr_drbg_random, &self.ctr_drbg);
 
-        if (c.mbedtls_ssl_setup(&session.ssl, &session.conf) != 0) {
+        if (c.mbedtls_ssl_setup(&self.ssl, &self.conf) != 0) {
             return error.TlsInitFailed;
         }
-        if (c.mbedtls_ssl_set_hostname(&session.ssl, hostname.ptr) != 0) {
+        if (c.mbedtls_ssl_set_hostname(&self.ssl, hostname.ptr) != 0) {
             return error.TlsInitFailed;
         }
-        c.mbedtls_ssl_set_bio(&session.ssl, &session, bioSend, bioRecv, null);
+        c.mbedtls_ssl_set_bio(&self.ssl, self, bioSend, bioRecv, null);
 
         while (true) {
-            const ret = c.mbedtls_ssl_handshake(&session.ssl);
+            const ret = c.mbedtls_ssl_handshake(&self.ssl);
             if (ret == 0) break;
             if (ret != c.MBEDTLS_ERR_SSL_WANT_READ and ret != c.MBEDTLS_ERR_SSL_WANT_WRITE) {
                 return error.TlsHandshakeFailed;
             }
         }
-
-        return session;
     }
 
     pub fn read(self: *Session, buf: []u8) Error!usize {
@@ -189,7 +209,8 @@ test "handshake: real TLS to imap.gmail.com:993, reads the real IMAP greeting" {
     const io = threaded.io();
 
     const stream = try testPlainConnect(io, "imap.gmail.com", 993);
-    var session = try Session.handshake(stream, io, "imap.gmail.com", null);
+    var session: Session = undefined;
+    try session.handshake(stream, io, "imap.gmail.com", null);
     defer session.close();
 
     var buf: [256]u8 = undefined;
@@ -204,7 +225,8 @@ test "handshake: a real self-signed cert is correctly rejected, not silently acc
     const io = threaded.io();
 
     const stream = try testPlainConnect(io, "self-signed.badssl.com", 443);
-    try std.testing.expectError(error.TlsHandshakeFailed, Session.handshake(stream, io, "self-signed.badssl.com", null));
+    var session: Session = undefined;
+    try std.testing.expectError(error.TlsHandshakeFailed, session.handshake(stream, io, "self-signed.badssl.com", null));
 }
 
 test "handshake: a real cert for the wrong hostname is correctly rejected" {
@@ -213,5 +235,6 @@ test "handshake: a real cert for the wrong hostname is correctly rejected" {
     const io = threaded.io();
 
     const stream = try testPlainConnect(io, "wrong.host.badssl.com", 443);
-    try std.testing.expectError(error.TlsHandshakeFailed, Session.handshake(stream, io, "wrong.host.badssl.com", null));
+    var session: Session = undefined;
+    try std.testing.expectError(error.TlsHandshakeFailed, session.handshake(stream, io, "wrong.host.badssl.com", null));
 }
