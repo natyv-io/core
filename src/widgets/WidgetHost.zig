@@ -1271,6 +1271,30 @@ pub fn destroyWindowSubtree(self: *Self, call_io: Io, root_id: u32) void {
     self.destroySubtreeLocked(root_id);
 }
 
+/// `natyv_destroy_widget`'s own real implementation, as of the mail-natyv
+/// demo app's own real UI work -- cascading is now the default, not the
+/// single-widget-only contract this function's own doc comment used to
+/// describe. Real motivation: an app dynamically rebuilding a view (an
+/// inbox list, a compose form) previously had to track and individually
+/// `Destroy()` every single widget it ever created, since destroying just
+/// the view's own outer container left every child orphaned in the
+/// registry (a still-live slot with a now-null `parent_id` target) --
+/// exactly the kind of foot-gun `destroySubtreeLocked` already exists to
+/// avoid for `destroyExpiredWidgets`/`destroyWindowSubtree`, just never
+/// generalized to the plain guest-facing destroy call until now. Returns
+/// `false` if `root_id` doesn't correspond to any real widget -- the
+/// caller's job to report as a clear error, matching the original
+/// single-widget destroy's own "no such widget" contract;
+/// `destroySubtreeLocked` itself silently no-ops on an unknown id, since
+/// its own other two real callers never needed to distinguish that case.
+pub fn destroyWidgetSubtree(self: *Self, call_io: Io, root_id: u32) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(root_id) == null) return false;
+    self.destroySubtreeLocked(root_id);
+    return true;
+}
+
 /// True when `id` is a strict descendant of `root_id` (walks `parent_id`
 /// up the chain) -- `id == root_id` itself is checked separately by every
 /// caller. Same shape `FloatingOrder.isDescendantOfOrSelf` uses over a

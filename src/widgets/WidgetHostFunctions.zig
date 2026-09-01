@@ -1269,6 +1269,11 @@ pub fn getRangeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
     host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
 }
 
+/// Cascades to every real descendant now -- see `WidgetHost.
+/// destroyWidgetSubtree`'s own doc comment for why this replaced the
+/// original single-slot-only teardown (this function used to inline that
+/// loop directly; the real logic now lives on `WidgetHost` itself,
+/// alongside `destroySubtreeLocked`'s other two real callers).
 pub fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -1277,31 +1282,11 @@ pub fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     defer parsed.deinit();
     const req = parsed.value;
 
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    for (&self.slots) |*slot| {
-        if (slot.*) |*s| {
-            if (s.id == req.widget_id) {
-                // F3: this host function runs on the worker thread (nested
-                // inside natyv_dispatch -- see Dispatch.zig's doc comment),
-                // but TTF_DestroyText is only valid on the thread that
-                // created the text (the main thread, which owns the text
-                // engine). Queue the pointer for main.zig to actually
-                // destroy next frame instead of calling it here -- see
-                // `pending_text_destroys`'s doc comment for the full story,
-                // and `destroyAllTextObjects` for the shutdown-time
-                // counterpart (safe to call directly there since it's
-                // already running on the main thread).
-                self.queueWidgetTextDestroysLocked(&s.widget);
-                if (s.clay_managed) self.layout_generation +%= 1;
-                _ = self.id_to_index.remove(s.id);
-                slot.* = null;
-                host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
-                return;
-            }
-        }
+    if (!self.destroyWidgetSubtree(self.io(), req.widget_id)) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
     }
-    host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
 
 /// Multi-window Stage 4: creates a real second OS window. Two-part, same
