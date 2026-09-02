@@ -384,6 +384,31 @@ fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
     return fcolorToColor(fc);
 }
 
+/// Fully transparent -- the fallback "default_color" passed to
+/// `drawStyledFill`/the plain-fill path when a widget has no natural fill
+/// of its own (`fillRect()` returned null) but real NTSS style properties
+/// are set anyway. Never actually shown as-is: `drawStyledFill`'s own
+/// `styleOverrideColor(...) orelse default_color` only reaches this when
+/// `background_color` itself is unset (a border/corner-radius-only style
+/// with no fill), the one case where "draw nothing behind the border" is
+/// correct.
+const transparent: c.SDL_Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+
+/// Real, once-unnoticed gap between two unrelated opt-ins (2026-09-02):
+/// `Widget.fillRect()` returning null (a plain Container's own W5
+/// `background` flag defaulting false, e.g. every `.ntx`-authored
+/// Container) used to silently suppress `drawStyledFill` entirely, even
+/// when the widget's own `clay_style` carries a real, guest-set NTSS
+/// style (`styles={...}` naming a token with `backgroundColor`/
+/// `cornerRadius`/etc.) -- that flag was only ever meant to give a
+/// floating panel (Dropdown, Modal) a default backdrop box, not gate the
+/// separate, later, fully guest-controllable styling system. Both real
+/// draw call sites below now check this to decide whether to still draw
+/// via the widget's own rect (`rectPtr()`) even without a natural fill.
+fn hasVisualStyle(clay_style: WidgetHost.ClayStyle) bool {
+    return clay_style.background_color != null or clay_style.corner_radius != null or clay_style.border != null or clay_style.gradient != null or clay_style.texture != null;
+}
+
 /// Styling system Stage 5a: shared by both `fillRect()` draw call sites
 /// below (the batched path can't use this -- it opts a styled widget out of
 /// batching entirely, same "opt out for a shape that isn't a plain solid
@@ -451,6 +476,14 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
     if (slot.widget.fillRect()) |fr| {
         drawStyledFill(renderer, shape_cache, image_cache, slot.clay_style, fr.rect, fr.color);
+    } else if (hasVisualStyle(slot.clay_style)) {
+        // See the identical branch in drawWindow's own batched loop below
+        // for why this exists: fillRect() returning null (e.g. a plain
+        // Container, whose own W5 `background` opt-in flag is false) must
+        // not also suppress a real, guest-set NTSS style -- that flag and
+        // this one are unrelated opt-ins that predate each other.
+        var w = slot.widget;
+        drawStyledFill(renderer, shape_cache, image_cache, slot.clay_style, w.rectPtr().*, transparent);
     }
     drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding, shape_cache);
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
@@ -762,34 +795,51 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     for (slots, clip_rects[0..widget_count], is_floating) |slot, clip, floating| {
         if (floating) continue;
         if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
+
+        var rect: c.SDL_FRect = undefined;
+        var default_color: c.SDL_Color = undefined;
         if (slot.widget.fillRect()) |fr| {
-            if (slot.clay_style.corner_radius != null or slot.clay_style.border != null or slot.clay_style.gradient != null or slot.clay_style.texture != null) {
-                // Flush whatever's pending first -- a styled shape draws
-                // immediately (it can't join the plain-rect batch), so
-                // without this, a batched sibling queued earlier in this
-                // same loop would render *after* this one instead of
-                // before it, silently reordering overlapping widgets.
-                wctx.draw_batcher.flush(wctx.renderer);
-                if (clip) |cr| {
-                    const sdl_clip = toClipRect(cr);
-                    _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-                    drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, fr.rect, fr.color);
-                    _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
-                } else {
-                    drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, fr.rect, fr.color);
-                }
-                continue;
-            }
-            const color = styleOverrideColor(slot.clay_style.background_color) orelse fr.color;
+            rect = fr.rect;
+            default_color = fr.color;
+        } else if (hasVisualStyle(slot.clay_style)) {
+            // See hasVisualStyle's own doc comment -- a widget with no
+            // natural fill (fillRect() null) still needs its real,
+            // guest-set NTSS style drawn; its rect exists regardless of
+            // that unrelated opt-in, via the same generic accessor L4's
+            // own layout writeback already uses.
+            var w = slot.widget;
+            rect = w.rectPtr().*;
+            default_color = transparent;
+        } else {
+            continue;
+        }
+
+        if (slot.clay_style.corner_radius != null or slot.clay_style.border != null or slot.clay_style.gradient != null or slot.clay_style.texture != null) {
+            // Flush whatever's pending first -- a styled shape draws
+            // immediately (it can't join the plain-rect batch), so
+            // without this, a batched sibling queued earlier in this
+            // same loop would render *after* this one instead of
+            // before it, silently reordering overlapping widgets.
+            wctx.draw_batcher.flush(wctx.renderer);
             if (clip) |cr| {
                 const sdl_clip = toClipRect(cr);
                 _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-                _ = c.SDL_SetRenderDrawColor(wctx.renderer, color.r, color.g, color.b, color.a);
-                _ = c.SDL_RenderFillRect(wctx.renderer, &fr.rect);
+                drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, rect, default_color);
                 _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
             } else {
-                wctx.draw_batcher.add(color, fr.rect);
+                drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, rect, default_color);
             }
+            continue;
+        }
+        const color = styleOverrideColor(slot.clay_style.background_color) orelse default_color;
+        if (clip) |cr| {
+            const sdl_clip = toClipRect(cr);
+            _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
+            _ = c.SDL_SetRenderDrawColor(wctx.renderer, color.r, color.g, color.b, color.a);
+            _ = c.SDL_RenderFillRect(wctx.renderer, &rect);
+            _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
+        } else {
+            wctx.draw_batcher.add(color, rect);
         }
     }
     wctx.draw_batcher.flush(wctx.renderer);
