@@ -320,6 +320,23 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
 
         var decl: c.Clay_ElementDeclaration = std.mem.zeroes(c.Clay_ElementDeclaration);
         decl.layout.sizing = slot.clay_style.sizing;
+        // Real button auto-width (2026-09-02): a `width: fit` Button is a
+        // Clay leaf with zero Clay children of its own (natyv draws text
+        // via SDL_ttf outside Clay entirely -- see this file's own header
+        // comment), so Clay's own Fit computation would otherwise collapse
+        // it to `Fit()`'s wire default (min=max=0), exactly the "leaf
+        // widgets collapse toward 0" gap `sdk/go/widgets`'s own `Fit()` doc
+        // comment already flags. `Button.measured_width` is real,
+        // font-driven (cached by `syncText`, main-thread-only, from the
+        // same `TTF_Text` object `drawDecorations` actually draws) -- used
+        // here to override Fit's min/max to the button's own real content
+        // width instead. 0 (not yet synced even once) leaves Clay's own
+        // sizing alone rather than forcing a real 0-width button.
+        if (slot.widget == .button and slot.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT and slot.widget.button.measured_width > 0) {
+            const text_padding = WidgetHost.effectiveTextPadding(slot.clay_style.padding);
+            const total_width = slot.widget.button.measured_width + @as(f32, @floatFromInt(text_padding.left + text_padding.right));
+            decl.layout.sizing.width.size.minMax = .{ .min = total_width, .max = total_width };
+        }
         decl.layout.padding = slot.clay_style.padding;
         decl.layout.childGap = slot.clay_style.child_gap;
         decl.layout.layoutDirection = slot.clay_style.direction;

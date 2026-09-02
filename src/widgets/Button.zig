@@ -27,6 +27,17 @@ text_obj_generation: u32 = 0,
 /// assert the dirty-flag skip is real, same role `ClayLayout.recompute_count`
 /// plays for L4.
 sync_count: u32 = 0,
+/// Real font-driven label width in pixels, cached here by `syncText`
+/// (main-thread-only, alongside the font it already has there) every time
+/// the label's `TTF_Text` is actually (re)created/updated -- lets
+/// `ClayLayout.openChildren` (main thread too) give a `width: fit` button
+/// its own real content width instead of Clay's usual zero-min collapse
+/// for a leaf with no Clay children, without any cross-thread TTF call
+/// (`natyv_create_button`/`SetLabel`'s own host functions run on the
+/// worker thread, which has no safe access to the font at all -- see
+/// `measured_width`'s own doc comment on the `openChildren` side for the
+/// full reasoning). 0 until the very first real sync.
+measured_width: f32 = 0,
 /// Keyboard interaction model: true when this button has focus (via Tab
 /// navigation or a mouse click) -- driven by `WidgetHost.setFocused`
 /// through `Widget.setFocusedFlag`, mirrors `TextField.focused`. Space or
@@ -120,13 +131,27 @@ pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font) void 
             _ = c.TTF_SetTextString(obj, self.label().ptr, self.label_len);
             self.text_obj_generation = self.text_generation;
             self.sync_count += 1;
+            self.remeasure(obj);
         }
     } else if (c.TTF_CreateText(engine, font, self.label().ptr, self.label_len)) |obj| {
         _ = c.TTF_SetTextColor(obj, 255, 255, 255, 255);
         self.text_obj = obj;
         self.text_obj_generation = self.text_generation;
         self.sync_count += 1;
+        self.remeasure(obj);
     }
+}
+
+/// See `measured_width`'s own doc comment. `TTF_GetTextSize` (not the
+/// plain-font `TTF_GetStringSize`) reads the already-synced `TTF_Text`
+/// object directly, matching exactly what `drawDecorations` itself uses
+/// for the same button -- guaranteed pixel-consistent with what's
+/// actually drawn.
+fn remeasure(self: *Self, obj: *c.TTF_Text) void {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    _ = c.TTF_GetTextSize(obj, &w, &h);
+    self.measured_width = @floatFromInt(w);
 }
 
 /// Must be called before this widget is dropped from the registry --

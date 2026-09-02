@@ -1117,7 +1117,29 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
         if (slot.*) |*s| {
             if (std.mem.indexOfScalar(u32, allowed_ids, s.id) == null) continue;
             switch (s.widget) {
-                .button => |*b| b.syncText(engine, font),
+                .button => |*b| {
+                    // Real button auto-width (2026-09-02): a `width: fit`
+                    // button's own real size depends on `b.measured_width`,
+                    // which only changes right here, on a real resync
+                    // (`sync_count` bump) -- but text syncing has always
+                    // been orthogonal to `layout_generation` (Clay has no
+                    // idea text exists at all, see ClayLayout.zig's own
+                    // header comment), so without this, a *second* real
+                    // relayout picking up the corrected width would simply
+                    // never happen: the first-ever layout pass for a new
+                    // Fit-width button runs *before* its first text sync
+                    // (see main.zig's own frame ordering), so it always
+                    // measures 0 and nothing would ever ask Clay to try
+                    // again. Scoped to Fit-width buttons specifically --
+                    // a Fixed/Grow button's own width never depends on
+                    // measured_width, so its own text changes have nothing
+                    // new to relayout for.
+                    const before = b.sync_count;
+                    b.syncText(engine, font);
+                    if (b.sync_count != before and s.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT) {
+                        self.layout_generation +%= 1;
+                    }
+                },
                 .textfield => |*t| t.syncText(engine, font),
                 .textarea => |*ta| ta.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
                 .label => |*l| l.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
