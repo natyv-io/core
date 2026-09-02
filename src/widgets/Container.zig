@@ -39,3 +39,11 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer) void {
     _ = c.SDL_SetRenderDrawColor(renderer, 80, 85, 100, 255);
     _ = c.SDL_RenderRect(renderer, &self.rect);
 }
+
+/// 2026-09-02: a Container was never hit-testable at all before its own
+/// new click support (`FrameLoop.zig`'s `tryHitWidget`) -- mirrors every
+/// other widget kind's own identical `containsPoint`.
+pub fn containsPoint(self: Self, x: f32, y: f32) bool {
+    return x >= self.rect.x and x < self.rect.x + self.rect.w and
+        y >= self.rect.y and y < self.rect.y + self.rect.h;
+}

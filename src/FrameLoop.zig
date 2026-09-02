@@ -116,7 +116,12 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         .checkbox => widgets.toggleCheckbox(io, id),
         .toggle => widgets.toggleToggle(io, id),
         .radio_button => widgets.selectRadioExclusive(io, id),
-        .textfield, .textarea, .label, .container, .progress_bar, .slider, .range_slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs, .spinner => return,
+        // 2026-09-02: a Container's own new click support (tryHitWidget)
+        // needs no state-mutating side effect the way a checkbox/toggle's
+        // own visible state-flip does -- just the plain `.click` event
+        // below, so a guest can make a whole card/row clickable.
+        .container => {},
+        .textfield, .textarea, .label, .progress_bar, .slider, .range_slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs, .spinner => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -354,9 +359,44 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             notifyTabsValue(widgets, io, queue, slot.id, idx, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         } else if (tb.containsPoint(mx, my)) return slot.id,
-        .label, .container, .progress_bar, .divider, .badge, .spinner => {},
+        // 2026-09-02: a Container can now be clicked directly (a real,
+        // guest-requested "make this whole row/card clickable" need) --
+        // but only when no more-specific *interactive* descendant (a
+        // Button/Checkbox/Toggle/RadioButton nested inside it, e.g. a
+        // per-row Checkbox in an otherwise-clickable row) also contains
+        // this exact point, so clicking that descendant doesn't *also*
+        // fire the wrapping Container's own click. Every other widget
+        // kind here (Label, ProgressBar, Divider, Badge, Spinner) truly
+        // has nothing to do on a click, unlike Container.
+        .container => |cont| if (cont.containsPoint(mx, my) and !containerClickBlockedByDescendant(slots, index, slot.id, mx, my)) {
+            activateWidget(widgets, io, queue, slot.id, .container, FloatingOrder.surfaceIdFor(slots, index, slot.id));
+            return slot.id;
+        },
+        .label, .progress_bar, .divider, .badge, .spinner => {},
     }
     return null;
+}
+
+/// Whether some more-specific interactive descendant of `container_id`
+/// also contains this exact click point -- see the `.container` arm
+/// above for why this must suppress a wrapping Container's own click
+/// rather than let both fire for the same real mouse click. Only checks
+/// kinds with their own real `activateWidget`-driven click (Button/
+/// Checkbox/Toggle/RadioButton) -- TextField/TextArea's own hit is a
+/// focus grab, not really "a click" in this same sense, so they don't
+/// suppress a wrapping Container's click.
+fn containerClickBlockedByDescendant(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, container_id: u32, mx: f32, my: f32) bool {
+    for (slots) |other| {
+        if (other.id == container_id) continue;
+        const is_clickable_kind = switch (other.widget) {
+            .button, .checkbox, .toggle, .radio_button => true,
+            else => false,
+        };
+        if (!is_clickable_kind) continue;
+        if (!widgetContainsPoint(other.widget, mx, my)) continue;
+        if (FloatingOrder.isDescendantOfOrSelf(slots, index, other.id, container_id)) return true;
+    }
+    return false;
 }
 
 // Styling system Stage 2: `padding` is the owning slot's real
