@@ -592,6 +592,35 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
 }
 
+/// One scrollbar thumb (vertical and/or horizontal), for a single
+/// scroll-enabled Container slot -- factored out of `drawWindow`'s own
+/// scrollbar pass (2026-09-02 fix) so that pass can run three times, once
+/// per layering phase (ordinary content / floating-non-modal / modal),
+/// instead of the single unconditional end-of-frame pass that let a
+/// scrollbar draw on top of a modal it should have been covered by. A
+/// no-op for a slot that isn't a scroll-enabled Container, or whose
+/// content doesn't currently overflow (`ScrollBar.verticalThumb`/
+/// `horizontalThumb` return `null` in that case -- see their own doc
+/// comments).
+fn drawScrollbarFor(slot: WidgetHost.Slot, clay_layout: ClayLayout, renderer: ?*c.SDL_Renderer) void {
+    if (!slot.clay_managed or slot.widget != .container) return;
+    if (!(slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal)) return;
+    const data = clay_layout.scrollContainerData(slot.id) orelse return;
+    const container_rect = slot.widget.container.rect;
+
+    _ = c.SDL_SetRenderDrawColor(renderer, 150, 150, 160, 190);
+    if (slot.clay_style.scroll_vertical) {
+        if (ScrollBar.verticalThumb(container_rect, data)) |thumb| {
+            _ = c.SDL_RenderFillRect(renderer, &thumb);
+        }
+    }
+    if (slot.clay_style.scroll_horizontal) {
+        if (ScrollBar.horizontalThumb(container_rect, data)) |thumb| {
+            _ = c.SDL_RenderFillRect(renderer, &thumb);
+        }
+    }
+}
+
 /// Handles one SDL input event already resolved (by main.zig, via
 /// `windowIDOf`) as targeting `wctx`'s own window -- the exact per-event
 /// body main.zig's original single-window body ran inline, now scoped to
@@ -969,6 +998,21 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
     }
 
+    // Scrollbar thumbs, drawn in the same three layering phases as the
+    // widgets they belong to (2026-09-02 fix) -- previously a single
+    // unconditional pass ran after *everything* else, including the modal
+    // backdrop and its own content, so an ordinary scrollable Container's
+    // thumb visibly drew on top of any open modal (found via a real
+    // click-through: mail-natyv's own message-list scrollbar cut straight
+    // through a Dialog). Ordinary (non-floating) content's own scrollbars
+    // belong in this same phase, beneath floating/modal content.
+    if (wctx.clay_layout) |clay_layout| {
+        for (slots, is_floating) |slot, floating| {
+            if (floating) continue;
+            drawScrollbarFor(slot, clay_layout, wctx.renderer);
+        }
+    }
+
     for (slots, clip_rects[0..widget_count], is_floating) |slot, clip, floating| {
         if (!floating) continue;
         if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
@@ -976,6 +1020,18 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             if (FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
         }
         drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache);
+    }
+    // A floating (but non-modal) scrollable widget's own scrollbar -- e.g.
+    // a scrollable Dropdown/Menu panel -- belongs here: above ordinary
+    // content, still beneath any modal.
+    if (wctx.clay_layout) |clay_layout| {
+        for (slots, is_floating) |slot, floating| {
+            if (!floating) continue;
+            if (topmost_modal) |modal_id| {
+                if (FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
+            }
+            drawScrollbarFor(slot, clay_layout, wctx.renderer);
+        }
     }
     if (topmost_modal) |modal_id| {
         var win_w: c_int = undefined;
@@ -993,25 +1049,14 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
             drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache);
         }
-    }
-
-    if (wctx.clay_layout) |clay_layout| {
-        for (slots) |slot| {
-            if (!slot.clay_managed or slot.widget != .container) continue;
-            if (!(slot.clay_style.scroll_vertical or slot.clay_style.scroll_horizontal)) continue;
-            const data = clay_layout.scrollContainerData(slot.id) orelse continue;
-            const container_rect = slot.widget.container.rect;
-
-            _ = c.SDL_SetRenderDrawColor(wctx.renderer, 150, 150, 160, 190);
-            if (slot.clay_style.scroll_vertical) {
-                if (ScrollBar.verticalThumb(container_rect, data)) |thumb| {
-                    _ = c.SDL_RenderFillRect(wctx.renderer, &thumb);
-                }
-            }
-            if (slot.clay_style.scroll_horizontal) {
-                if (ScrollBar.horizontalThumb(container_rect, data)) |thumb| {
-                    _ = c.SDL_RenderFillRect(wctx.renderer, &thumb);
-                }
+        // A scrollable widget inside the modal itself (e.g. a long
+        // message list in a Dialog) -- correctly on top of everything,
+        // matching the modal content it belongs to.
+        if (wctx.clay_layout) |clay_layout| {
+            for (slots, is_floating) |slot, floating| {
+                if (!floating) continue;
+                if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
+                drawScrollbarFor(slot, clay_layout, wctx.renderer);
             }
         }
     }
