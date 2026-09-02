@@ -442,7 +442,15 @@ const transparent: c.SDL_Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
 /// A disabled Button's fixed fill color -- see `ClayStyle.enabled`'s own
 /// doc comment for why this always wins over any guest-set NTSS
 /// `backgroundColor`, and why text itself can't also be dimmed to match.
-const disabled_color: c.SDL_FColor = .{ .r = 0.3, .g = 0.31, .b = 0.32, .a = 1.0 };
+///
+/// Deliberately darker/duller than any real button color role (2026-09-02,
+/// fixing a real bug: the original (0.3, 0.31, 0.32) was *brighter* than
+/// e.g. mail-natyv's own secondaryBtn (#2A2E37 = 0.165, 0.18, 0.216),
+/// making disabled buttons visually more prominent than active ones --
+/// backwards from how "disabled" should read. Sits close to the app's own
+/// dark root background rather than any fixed absolute gray, so it stays
+/// duller than a normal button's color across any real color scheme.
+const disabled_color: c.SDL_FColor = .{ .r = 0.14, .g = 0.15, .b = 0.17, .a = 1.0 };
 
 /// Real, once-unnoticed gap between two unrelated opt-ins (2026-09-02):
 /// `Widget.fillRect()` returning null (a plain Container's own W5
