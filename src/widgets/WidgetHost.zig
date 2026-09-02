@@ -198,7 +198,7 @@ pub const max_widgets = 192;
 // + natyv_set_style (1) -- Styling system Stage 2, generic per-slot
 // resolved-style application, same "guest-composed, no new WidgetKind"
 // reasoning as natyv_set_visible/natyv_set_size.
-pub const host_function_count = 27;
+pub const host_function_count = 28;
 
 pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner };
 pub const Widget = union(WidgetKind) {
@@ -455,6 +455,19 @@ pub const ClayStyle = struct {
     /// appear. Defaults `true` so every existing widget kind (which never
     /// sets this) keeps behaving exactly as before.
     visible: bool = true,
+    /// 2026-09-02: when false, a Button ignores clicks entirely (`tryHitWidget`
+    /// treats it as a miss, no flash, no `.click` event) and renders dimmed
+    /// (`Button.fillColor`/`drawDecorations`' border both override to a fixed
+    /// muted gray regardless of any guest-set NTSS background color -- text
+    /// itself can't be dimmed too, natyv's own label text color is hardcoded
+    /// with no per-widget override, a real, separate, already-disclosed
+    /// limitation). Generic on every slot, same "no coordination the host
+    /// needs to own" reasoning `visible`/`natyv_set_visible` already
+    /// established, though only `Button` actually reads it today -- built for
+    /// a real "< N >" pager, disabled at either end instead of the buttons
+    /// disappearing. Defaults `true` so every existing widget keeps behaving
+    /// exactly as before.
+    enabled: bool = true,
     /// Multi-window Stage 3: marks this slot as the root of a real second OS
     /// window (a plain `.container` underneath, same shape as any other
     /// Clay-managed root -- see `WindowManager.WindowContext` for the real
@@ -880,6 +893,11 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
     // Accordion's own doc comment on `HostFunctions.setVisibleHostFn`) --
     // same "always registered" reasoning as the block above.
     funcs_out[n] = c.extism_function_new("natyv_set_visible", &in_types[0], 1, &out_types[0], 1, HostFunctions.setVisibleHostFn, self, null);
+    n += 1;
+    // A real "< N >" pager: generic per-slot disabled toggle, guest-composed
+    // (see `ClayStyle.enabled`'s own doc comment) -- same "always
+    // registered" reasoning as the block above.
+    funcs_out[n] = c.extism_function_new("natyv_set_enabled", &in_types[0], 1, &out_types[0], 1, HostFunctions.setEnabledHostFn, self, null);
     n += 1;
     // Tree view: generic per-slot Fixed-height resize, guest-composed (see
     // `HostFunctions.setSizeHostFn`'s own doc comment) -- same "always
@@ -1788,6 +1806,19 @@ pub fn setVisible(self: *Self, call_io: Io, id: u32, visible: bool) bool {
     self.mutex.unlock(call_io);
 
     if (changed) self.layout_generation +%= 1;
+    return true;
+}
+
+/// Generic per-slot disabled toggle -- see `ClayStyle.enabled`'s own doc
+/// comment. No `layout_generation` bump needed (unlike `setVisible`):
+/// disabling doesn't change what Clay declares or how anything is sized,
+/// only how a Button draws and responds to clicks, both read fresh every
+/// frame/event regardless of any layout cache.
+pub fn setEnabled(self: *Self, call_io: Io, id: u32, enabled: bool) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(id) orelse return false;
+    slot.clay_style.enabled = enabled;
     return true;
 }
 

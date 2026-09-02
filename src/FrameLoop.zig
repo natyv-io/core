@@ -304,7 +304,12 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
 fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle) ?u32 {
     if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) return null;
     switch (slot.widget) {
-        .button => |b| if (b.containsPoint(mx, my)) {
+        // A disabled Button (ClayStyle.enabled's own doc comment) is
+        // treated as a real miss here -- no click event, no flash, and it
+        // doesn't consume the point (`hit_focusable`), so a real "< N >"
+        // pager can disable either end without it swallowing clicks meant
+        // for whatever's underneath/behind it.
+        .button => |b| if (slot.clay_style.enabled and b.containsPoint(mx, my)) {
             activateWidget(widgets, io, queue, slot.id, .button, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
@@ -433,6 +438,11 @@ fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
 /// with no fill), the one case where "draw nothing behind the border" is
 /// correct.
 const transparent: c.SDL_Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+
+/// A disabled Button's fixed fill color -- see `ClayStyle.enabled`'s own
+/// doc comment for why this always wins over any guest-set NTSS
+/// `backgroundColor`, and why text itself can't also be dimmed to match.
+const disabled_color: c.SDL_FColor = .{ .r = 0.3, .g = 0.31, .b = 0.32, .a = 1.0 };
 
 /// Real, once-unnoticed gap between two unrelated opt-ins (2026-09-02):
 /// `Widget.fillRect()` returning null (a plain Container's own W5
@@ -796,7 +806,10 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         }
         if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         switch (slot.widget) {
-            .button => |b| if (b.containsPoint(wctx.interaction.mouse_x, wctx.interaction.mouse_y)) {
+            // A disabled Button shows neither the pointer cursor nor a
+            // tooltip hover -- it isn't actually clickable right now, so
+            // neither affordance should suggest otherwise.
+            .button => |b| if (slot.clay_style.enabled and b.containsPoint(wctx.interaction.mouse_x, wctx.interaction.mouse_y)) {
                 hovering_any = true;
                 hovered_widget_id_this_frame = slot.id;
             },
@@ -899,7 +912,17 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             continue;
         }
 
-        if (slot.clay_style.corner_radius != null or slot.clay_style.border != null or slot.clay_style.gradient != null or slot.clay_style.texture != null) {
+        // A disabled Button (ClayStyle.enabled's own doc comment) always
+        // draws this fixed muted gray, regardless of any guest-set NTSS
+        // backgroundColor -- overriding a *local copy* of clay_style
+        // (passed by value below either way) rather than adding a
+        // separate parameter everywhere color gets resolved.
+        var effective_style = slot.clay_style;
+        if (slot.widget == .button and !slot.clay_style.enabled) {
+            effective_style.background_color = disabled_color;
+        }
+
+        if (effective_style.corner_radius != null or effective_style.border != null or effective_style.gradient != null or effective_style.texture != null) {
             // Flush whatever's pending first -- a styled shape draws
             // immediately (it can't join the plain-rect batch), so
             // without this, a batched sibling queued earlier in this
@@ -909,14 +932,14 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             if (clip) |cr| {
                 const sdl_clip = toClipRect(cr);
                 _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-                drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, rect, default_color);
+                drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, effective_style, rect, default_color);
                 _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
             } else {
-                drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, slot.clay_style, rect, default_color);
+                drawStyledFill(wctx.renderer, &wctx.shape_cache, &wctx.image_cache, effective_style, rect, default_color);
             }
             continue;
         }
-        const color = styleOverrideColor(slot.clay_style.background_color) orelse default_color;
+        const color = styleOverrideColor(effective_style.background_color) orelse default_color;
         if (clip) |cr| {
             const sdl_clip = toClipRect(cr);
             _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);

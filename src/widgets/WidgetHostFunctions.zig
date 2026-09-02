@@ -80,6 +80,7 @@ const SetValueRequest = struct { widget_id: u32, value: f32 };
 // natyv_dispatch-driven update).
 const SetRangeRequest = struct { widget_id: u32, min: f32, max: f32 };
 const SetVisibleRequest = struct { widget_id: u32, visible: bool };
+const SetEnabledRequest = struct { widget_id: u32, enabled: bool };
 const SetSizeRequest = struct { widget_id: u32, height: f32 };
 
 // Styling system Stage 2: 0..1 floats, matching the stylesheet resolver's
@@ -1036,6 +1037,25 @@ pub fn setVisibleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Ext
     const req = parsed.value;
 
     if (!self.setVisible(self.io(), req.widget_id, req.visible)) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// Generic per-slot disabled toggle -- thin wire adapter over
+/// `WidgetHost.setEnabled`, same "host function just parses JSON and calls
+/// a plain `WidgetHost` method" split `setVisibleHostFn` above already
+/// establishes.
+pub fn setEnabledHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetEnabledRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    if (!self.setEnabled(self.io(), req.widget_id, req.enabled)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }
