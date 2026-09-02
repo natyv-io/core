@@ -195,6 +195,17 @@ context: *c.Clay_Context,
 /// means "never," so the very first call always computes regardless of
 /// what `WidgetHost.layout_generation` happens to be.
 last_computed_generation: ?u64 = null,
+/// Window size (2026-09-02, real window resizing) as of the last real
+/// recompute -- `null` means "never," matching `last_computed_generation`.
+/// `layoutIfNeeded` is called with the window's own live, current size
+/// every single frame regardless of whether anything actually changed
+/// (see `FrameLoop.layoutWindow`'s own `SDL_GetWindowSize` call) -- these
+/// two fields are what let the dirty-check below tell "the window was
+/// actually resized" apart from "same size as always," the one real case
+/// `last_computed_generation`/scroll-delta alone can't detect (dragging a
+/// window's edge changes neither the widget tree nor the scroll offset).
+last_window_w: ?f32 = null,
+last_window_h: ?f32 = null,
 /// Bumped only on an actual `Clay_EndLayout` call, never on a skipped
 /// frame -- this is what proves the dirty-flag caching really avoids the
 /// call, not just avoids its visible side effects.
@@ -521,7 +532,8 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
     const current_generation = widgets.currentGeneration(io);
     const content_changed = self.last_computed_generation == null or self.last_computed_generation.? != current_generation;
     const scrolled = scroll_dx != 0 or scroll_dy != 0;
-    if (!content_changed and !scrolled) return 0;
+    const resized = self.last_window_w == null or self.last_window_w.? != window_w or self.last_window_h.? != window_h;
+    if (!content_changed and !scrolled and !resized) return 0;
 
     var full_snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const full_n = widgets.snapshot(io, &full_snap);
@@ -738,6 +750,8 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
     }
 
     self.last_computed_generation = current_generation;
+    self.last_window_w = window_w;
+    self.last_window_h = window_h;
     return scrolled_out_count;
 }
 

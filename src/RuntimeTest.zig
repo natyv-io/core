@@ -648,6 +648,65 @@ fn fixedAxis(v: f32) c.Clay_SizingAxis {
     return .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = v, .max = v } } };
 }
 
+fn growAxis() c.Clay_SizingAxis {
+    return .{ .type = c.CLAY__SIZING_TYPE_GROW, .size = .{ .minMax = .{ .min = 0, .max = std.math.floatMax(f32) } } };
+}
+
+test "2026-09-02 real window resizing: a window-size-only change (no content/scroll change) still forces a real recompute, and a Grow widget reflows to the new size" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 300, 100, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+
+    const grow_id = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = growAxis(), .height = growAxis() },
+    }) orelse return error.RegistryFull;
+
+    // First frame at 300x100: must run Clay for real (nothing computed yet).
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch, null);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    var snap: [8]WidgetHost.Slot = undefined;
+    const n = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n]) |slot| {
+        if (slot.id == grow_id) {
+            try std.testing.expectApproxEqAbs(@as(f32, 300), slot.widget.container.rect.w, 0.01);
+            try std.testing.expectApproxEqAbs(@as(f32, 100), slot.widget.container.rect.h, 0.01);
+        }
+    }
+
+    // Second frame, same 300x100, nothing else changed either -- must skip
+    // the real Clay computation entirely (this is the pre-existing L4
+    // behavior, confirmed still intact after adding the resize check).
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch, null);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    // Third frame: window resized to 600x400 -- no widget mutation, no
+    // scroll, the one and only thing that changed is the window's own
+    // size. Before this fix, content_changed/scrolled would both be false
+    // here and this call would wrongly skip, leaving the Grow widget
+    // frozen at its old 300x100 rect even though the window is now bigger.
+    _ = clay_layout.layoutIfNeeded(&runtime.widgets, io, 600, 400, 0, 0, false, 0, 0, &scroll_scratch, null);
+    try std.testing.expectEqual(@as(usize, 2), clay_layout.recompute_count);
+
+    const n2 = runtime.widgets.snapshot(io, &snap);
+    for (snap[0..n2]) |slot| {
+        if (slot.id == grow_id) {
+            try std.testing.expectApproxEqAbs(@as(f32, 600), slot.widget.container.rect.w, 0.01);
+            try std.testing.expectApproxEqAbs(@as(f32, 400), slot.widget.container.rect.h, 0.01);
+        }
+    }
+}
+
 test "W16: a floating widget that would overflow the bottom of the window flips to open above its trigger instead" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});

@@ -70,8 +70,17 @@ pub const WindowContext = struct {
 /// `clay_enabled`) an owned `ClayLayout` sized to it + its own
 /// renderer-backed `TTF_TextEngine`. Main-thread-only, same as every SDL/
 /// Clay/TTF call this mirrors from `main.zig`'s own primary-window setup.
+///
+/// Real, user-driven resizing (2026-09-02): `SDL_WINDOW_RESIZABLE` applies
+/// here, so every real OS window natyv ever creates -- the primary window
+/// and any guest-created `<Window>` alike -- can be dragged by its edges,
+/// not just the primary one. No other resize-specific code lives here:
+/// `FrameLoop.layoutWindow` already queries the window's live current size
+/// every frame regardless, and `ClayLayout.layoutIfNeeded`'s own dirty
+/// check (`last_window_w`/`last_window_h`) is what actually notices a real
+/// size change and re-lays-out against it.
 pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, width: f32, height: f32, default_font: *c.TTF_Font, clay_enabled: bool, root_widget_id: ?u32) !WindowContext {
-    const window = c.SDL_CreateWindow(title.ptr, @intFromFloat(width), @intFromFloat(height), 0) orelse {
+    const window = c.SDL_CreateWindow(title.ptr, @intFromFloat(width), @intFromFloat(height), c.SDL_WINDOW_RESIZABLE) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlWindowFailed;
     };
