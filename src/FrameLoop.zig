@@ -488,8 +488,53 @@ fn drawStyledFill(renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, im
     }
 }
 
+/// Real intersection of two int clip rects (never a negative width/height
+/// -- an empty intersection collapses to a zero-size rect at the overlap
+/// point, which SDL's own clipping already treats as "draw nothing," the
+/// correct behavior when a widget's own bounds fall entirely outside an
+/// already-active outer clip, e.g. a scroll region).
+fn intersectClipRects(a: c.SDL_Rect, b: c.SDL_Rect) c.SDL_Rect {
+    const x1 = @max(a.x, b.x);
+    const y1 = @max(a.y, b.y);
+    const x2 = @min(a.x + a.w, b.x + b.w);
+    const y2 = @min(a.y + a.h, b.y + b.h);
+    return .{ .x = x1, .y = y1, .w = @max(0, x2 - x1), .h = @max(0, y2 - y1) };
+}
+
+/// Real, general containment fix (2026-09-02): text has no font-driven
+/// measurement against its own widget's box (a real, disclosed natyv
+/// limitation -- see `fitSizing`'s own doc comment in shared's
+/// `Codegen.zig` for the layout-side half of this same gap), so a string
+/// longer than its widget's own configured width previously just drew
+/// straight past that widget's own edge onto whatever sits next to it
+/// (confirmed live: a long guest-set Button label visibly overran its
+/// own background). Clipping to the widget's own rect here doesn't
+/// recover the missing characters -- there's still no way to *see* them
+/// -- but it does guarantee the one thing actually being asked for: a
+/// widget's own rendered content never visually spills outside its own
+/// box, with zero required opt-in from `.ntx`/NTSS. Intersects with
+/// whatever clip a caller already had active (e.g. a scroll region)
+/// rather than replacing it, and always restores the prior clip
+/// afterward -- both call sites below already scope their own outer
+/// clip the same way.
 fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding, shape_cache: *ShapeCache.Cache) void {
     const padding = WidgetHost.effectiveTextPadding(raw_padding);
+
+    const had_prior_clip = c.SDL_RenderClipEnabled(renderer);
+    var prior_clip: c.SDL_Rect = undefined;
+    if (had_prior_clip) _ = c.SDL_GetRenderClipRect(renderer, &prior_clip);
+    var w = widget;
+    const own_clip = toClipRect(w.rectPtr().*);
+    const effective_clip = if (had_prior_clip) intersectClipRects(prior_clip, own_clip) else own_clip;
+    _ = c.SDL_SetRenderClipRect(renderer, &effective_clip);
+    defer {
+        if (had_prior_clip) {
+            _ = c.SDL_SetRenderClipRect(renderer, &prior_clip);
+        } else {
+            _ = c.SDL_SetRenderClipRect(renderer, null);
+        }
+    }
+
     switch (widget) {
         .button => |b| b.drawDecorations(renderer, padding),
         .textfield => |t| t.drawDecorations(renderer, padding),
