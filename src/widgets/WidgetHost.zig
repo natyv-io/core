@@ -327,6 +327,28 @@ pub const Widget = union(WidgetKind) {
             .label, .container, .progress_bar, .divider, .badge, .spinner => {},
         }
     }
+
+    /// Read-side counterpart to `setFocusedFlag`, used by `WidgetHost.setFocused`
+    /// to detect whether a slot's `focused` flag is actually about to flip
+    /// (so it only bumps `layout_generation` when something will actually
+    /// look different on screen, same "no-op call, no pointless recompute"
+    /// shape as `setVisible`/`setHeight`).
+    pub fn isFocused(self: Widget) bool {
+        return switch (self) {
+            .button => |b| b.focused,
+            .textfield => |t| t.focused,
+            .textarea => |ta| ta.focused,
+            .checkbox => |cb| cb.focused,
+            .toggle => |tg| tg.focused,
+            .radio_button => |r| r.focused,
+            .slider => |s| s.focused,
+            .range_slider => |rs| rs.focused,
+            .numeric_stepper => |ns| ns.focused,
+            .segmented_control => |sc| sc.focused,
+            .tabs => |tb| tb.focused,
+            .label, .container, .progress_bar, .divider, .badge, .spinner => false,
+        };
+    }
 };
 
 /// The Clay tree relationships/style a widget was created with -- only
@@ -1543,18 +1565,28 @@ pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
 /// renaming the local accordingly, since the old name became inaccurate).
 /// `main.zig` uses this to decide whether to start/stop `SDL_StartTextInput`
 /// without a second registry lookup (focusing a `Button` shouldn't turn on
-/// IME/text composition).
+/// IME/text composition). Bumps `layout_generation` when any slot's
+/// `focused` flag actually flips -- the focus ring is drawn purely off that
+/// flag with no `needsContinuousRedraw` exception (unlike Spinner/Button's
+/// flash), so without this bump `FrameLoop.drawWindow`'s draw-level dirty
+/// check (added by the idle-CPU render-loop fix) would skip redrawing it
+/// entirely until some unrelated generation-bumping event happened to also
+/// occur -- caught live: focus visibly moved with no ring shown until the
+/// user started typing, which bumps generation via the text edit itself.
 pub fn setFocused(self: *Self, call_io: Io, id: ?u32) bool {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     var focused_wants_text_input = false;
+    var changed = false;
     for (&self.slots) |*slot| {
         if (slot.*) |*s| {
             const this_one = id != null and s.id == id.?;
+            if (s.widget.isFocused() != this_one) changed = true;
             s.widget.setFocusedFlag(this_one);
             if (this_one and (s.widget == .textfield or s.widget == .textarea)) focused_wants_text_input = true;
         }
     }
+    if (changed) self.layout_generation +%= 1;
     return focused_wants_text_input;
 }
 
@@ -1616,11 +1648,19 @@ pub fn flashButton(self: *Self, call_io: Io, id: u32) void {
 /// a checkbox -- flips its `checked` state. `main.zig`'s widened activation
 /// handling calls this instead of `flashButton` when the activated widget
 /// is a `.checkbox`.
+/// Bumps `layout_generation` on every real toggle -- the checked mark is a
+/// purely visual difference (Clay never sees `checked`), but
+/// `FrameLoop.drawWindow`'s draw-level dirty check (idle-CPU render-loop
+/// fix) means "purely visual" no longer implies "always redrawn anyway";
+/// see `WidgetHost.setFocused`'s doc comment for the full reasoning.
 pub fn toggleCheckbox(self: *Self, call_io: Io, id: u32) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     if (self.findLocked(id)) |slot| {
-        if (slot.widget == .checkbox) slot.widget.checkbox.toggle();
+        if (slot.widget == .checkbox) {
+            slot.widget.checkbox.toggle();
+            self.layout_generation +%= 1;
+        }
     }
 }
 
@@ -1630,11 +1670,16 @@ pub fn toggleCheckbox(self: *Self, call_io: Io, id: u32) void {
 /// widget kinds sharing this file only by convention, and generalizing here
 /// would mean touching `toggleCheckbox`'s already-shipped, tested body for
 /// no functional gain.
+/// Bumps `layout_generation` on every real toggle -- same reasoning as
+/// `toggleCheckbox` just above.
 pub fn toggleToggle(self: *Self, call_io: Io, id: u32) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     if (self.findLocked(id)) |slot| {
-        if (slot.widget == .toggle) slot.widget.toggle.toggle();
+        if (slot.widget == .toggle) {
+            slot.widget.toggle.toggle();
+            self.layout_generation +%= 1;
+        }
     }
 }
 
@@ -1646,6 +1691,8 @@ pub fn toggleToggle(self: *Self, call_io: Io, id: u32) void {
 /// `natyv_set_checked` when a guest programmatically selects a radio, so
 /// both paths behave identically. A no-op if `id` doesn't name a radio
 /// button.
+/// Bumps `layout_generation` when the selection actually moved -- same
+/// draw-level-dirty-check reasoning as `toggleCheckbox`/`setFocused`.
 pub fn selectRadioExclusive(self: *Self, call_io: Io, id: u32) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -1656,10 +1703,13 @@ pub fn selectRadioExclusive(self: *Self, call_io: Io, id: u32) void {
             else => return,
         };
     };
+    var changed = false;
     for (&self.slots) |*slot| {
         if (slot.*) |*s| {
             if (s.widget == .radio_button and s.widget.radio_button.group_id == group_id) {
-                if (s.id == id) {
+                const should_select = s.id == id;
+                if (s.widget.radio_button.checked != should_select) changed = true;
+                if (should_select) {
                     s.widget.radio_button.select();
                 } else {
                     s.widget.radio_button.deselect();
@@ -1667,6 +1717,7 @@ pub fn selectRadioExclusive(self: *Self, call_io: Io, id: u32) void {
             }
         }
     }
+    if (changed) self.layout_generation +%= 1;
 }
 
 /// W3: the host-authoritative counterpart to `toggleCheckbox`/
@@ -1679,6 +1730,11 @@ pub fn selectRadioExclusive(self: *Self, call_io: Io, id: u32) void {
 /// means `main.zig`'s `notifySliderValue` can report exactly what got
 /// stored without a second lookup, never an out-of-range value a caller
 /// (e.g. an arrow-key nudge past 0/1) happened to pass in.
+/// Bumps `layout_generation` when the clamped value actually moved -- a
+/// drag in progress is already covered separately (`FrameLoop.drawWindow`'s
+/// own `dragging` exception), but a non-drag change (arrow-key nudge, a
+/// guest's `natyv_set_slider_value`) has no such exception and needs this
+/// bump to ever actually redraw, same reasoning as `setFocused`.
 pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -1687,7 +1743,9 @@ pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
     const old = slot.widget.slider.value;
     slot.widget.slider.setValue(value);
     const new = slot.widget.slider.value;
-    return if (new != old) new else null;
+    if (new == old) return null;
+    self.layout_generation +%= 1;
+    return new;
 }
 
 /// W27: the `RangeSlider` counterpart to `setSliderValue` -- called directly
@@ -1701,6 +1759,9 @@ pub fn setSliderValue(self: *Self, call_io: Io, id: u32, value: f32) ?f32 {
 /// the actual clamped `{min, max}` pair if either changed, or `null` if `id`
 /// doesn't name a range slider or nothing actually moved (e.g. nudging a
 /// handle already pinned against its sibling).
+/// Bumps `layout_generation` when either value actually moved -- same
+/// "drag already covered, non-drag paths aren't" reasoning as
+/// `setSliderValue`.
 pub fn setRangeSliderValue(self: *Self, call_io: Io, id: u32, handle: RangeSlider.Handle, value: f32) ?struct { min: f32, max: f32 } {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -1712,7 +1773,9 @@ pub fn setRangeSliderValue(self: *Self, call_io: Io, id: u32, handle: RangeSlide
     slot.widget.range_slider.active_handle = handle;
     const new_min = slot.widget.range_slider.min;
     const new_max = slot.widget.range_slider.max;
-    return if (new_min != old_min or new_max != old_max) .{ .min = new_min, .max = new_max } else null;
+    if (new_min == old_min and new_max == old_max) return null;
+    self.layout_generation +%= 1;
+    return .{ .min = new_min, .max = new_max };
 }
 
 /// W27: sets which handle a click targeted, without changing either value --
@@ -1733,6 +1796,9 @@ pub fn setRangeSliderActiveHandle(self: *Self, call_io: Io, id: u32, handle: Ran
 /// kind" contract, integer-valued and going through `NumericStepper.resolve`
 /// (clamp or wrap, see that function's doc comment) instead of a plain
 /// [0,1] clamp.
+/// Bumps `layout_generation` when the resolved value actually changed --
+/// same reasoning as `setSliderValue` (no drag exception applies here at
+/// all, so this is the only thing that ever forces a redraw).
 pub fn setStepperValue(self: *Self, call_io: Io, id: u32, value: i32) ?i32 {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -1741,11 +1807,15 @@ pub fn setStepperValue(self: *Self, call_io: Io, id: u32, value: i32) ?i32 {
     const old = slot.widget.numeric_stepper.value;
     slot.widget.numeric_stepper.setValue(value);
     const new = slot.widget.numeric_stepper.value;
-    return if (new != old) new else null;
+    if (new == old) return null;
+    self.layout_generation +%= 1;
+    return new;
 }
 
 /// W17: the `SegmentedControl` counterpart to `setSliderValue` -- same
 /// shape, clamping via `SegmentedControl.select` instead of a value range.
+/// Bumps `layout_generation` when the selection actually changed -- same
+/// reasoning as `setStepperValue`.
 pub fn setSegmentedIndex(self: *Self, call_io: Io, id: u32, index: usize) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -1754,7 +1824,9 @@ pub fn setSegmentedIndex(self: *Self, call_io: Io, id: u32, index: usize) ?usize
     const old = slot.widget.segmented_control.selected_index;
     slot.widget.segmented_control.select(index);
     const new = slot.widget.segmented_control.selected_index;
-    return if (new != old) new else null;
+    if (new == old) return null;
+    self.layout_generation +%= 1;
+    return new;
 }
 
 /// W19: the `Tabs` counterpart to `setSegmentedIndex` -- same clamp-and-
@@ -1810,15 +1882,28 @@ pub fn setVisible(self: *Self, call_io: Io, id: u32, visible: bool) bool {
 }
 
 /// Generic per-slot disabled toggle -- see `ClayStyle.enabled`'s own doc
-/// comment. No `layout_generation` bump needed (unlike `setVisible`):
-/// disabling doesn't change what Clay declares or how anything is sized,
-/// only how a Button draws and responds to clicks, both read fresh every
-/// frame/event regardless of any layout cache.
+/// comment. Doesn't change what Clay declares or how anything is sized
+/// (unlike `setVisible`), only how a Button draws and responds to clicks --
+/// but "draws" still needs a `layout_generation` bump now that
+/// `FrameLoop.drawWindow`'s draw-level dirty check (added by the idle-CPU
+/// render-loop fix) skips the actual redraw unless that generation moved (or
+/// one of a short, explicit list of continuous-redraw exceptions applies,
+/// which a disabled-state flip isn't). The old "read fresh every frame"
+/// reasoning predates that gate and stopped being true the day it landed --
+/// same class of bug as `setFocused`'s doc comment describes, only found via
+/// code audit here rather than live click-through. Only bumps when the
+/// value actually changes, same as `setVisible`/`setHeight`.
 pub fn setEnabled(self: *Self, call_io: Io, id: u32, enabled: bool) bool {
     self.mutex.lockUncancelable(call_io);
-    defer self.mutex.unlock(call_io);
-    const slot = self.findLocked(id) orelse return false;
+    const slot = self.findLocked(id) orelse {
+        self.mutex.unlock(call_io);
+        return false;
+    };
+    const changed = slot.clay_style.enabled != enabled;
     slot.clay_style.enabled = enabled;
+    self.mutex.unlock(call_io);
+
+    if (changed) self.layout_generation +%= 1;
     return true;
 }
 
@@ -1865,10 +1950,16 @@ pub fn setHeight(self: *Self, call_io: Io, id: u32, height: f32) bool {
 /// project (it already only ever receives fully-resolved property values,
 /// e.g. `ClayContainerRequest`'s `padding` today). Name-to-value
 /// resolution/merging lives in the Go SDK's `ApplyStyle` helper, one layer
-/// up. `corner_radius`/`border` are purely visual (Clay never sees them),
-/// so unlike `padding` they never bump `layout_generation` -- FrameLoop.zig
-/// reads them live off `Slot.clay_style` every frame, no dirty-tracking
-/// needed.
+/// up. `corner_radius`/`border`/`gradient`/`texture` are purely visual
+/// (Clay never sees them) and never affect sizing, but they still bump
+/// `layout_generation` below when changed -- same "used to be provably fine
+/// without it, until `FrameLoop.drawWindow`'s draw-level dirty check
+/// (idle-CPU render-loop fix) started skipping the redraw entirely unless
+/// generation moved" reasoning as `setFocused`/`setEnabled`. A
+/// `slot.clay_managed` style-only change still forces the redraw gate open
+/// (worth the occasional unnecessary Clay recompute -- these calls aren't
+/// hot-path) rather than silently never rendering until something unrelated
+/// happens to redraw.
 pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FColor, padding: ?c.Clay_Padding, corner_radius: ?[4]f32, border: ?Border, gradient: ?Gradient, texture: ?u32) bool {
     self.mutex.lockUncancelable(call_io);
     const slot = self.findLocked(id) orelse {
@@ -1884,10 +1975,22 @@ pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FCol
         changed = changed or !std.meta.eql(slot.clay_style.padding, p);
         slot.clay_style.padding = p;
     }
-    if (corner_radius) |cr| slot.clay_style.corner_radius = cr;
-    if (border) |b| slot.clay_style.border = b;
-    if (gradient) |g| slot.clay_style.gradient = g;
-    if (texture) |t| slot.clay_style.texture = t;
+    if (corner_radius) |cr| {
+        changed = changed or slot.clay_style.corner_radius == null or !std.meta.eql(slot.clay_style.corner_radius.?, cr);
+        slot.clay_style.corner_radius = cr;
+    }
+    if (border) |b| {
+        changed = changed or slot.clay_style.border == null or !std.meta.eql(slot.clay_style.border.?, b);
+        slot.clay_style.border = b;
+    }
+    if (gradient) |g| {
+        changed = changed or slot.clay_style.gradient == null or !std.meta.eql(slot.clay_style.gradient.?, g);
+        slot.clay_style.gradient = g;
+    }
+    if (texture) |t| {
+        changed = changed or slot.clay_style.texture == null or slot.clay_style.texture.? != t;
+        slot.clay_style.texture = t;
+    }
     self.mutex.unlock(call_io);
 
     if (changed and slot.clay_managed) self.layout_generation +%= 1;
