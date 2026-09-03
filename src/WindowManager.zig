@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const timing = @import("timing.zig");
 const ClayLayout = @import("capabilities/ClayLayout.zig");
 const InteractionState = @import("InteractionState.zig");
 const DrawBatcher = @import("DrawBatcher.zig");
@@ -64,6 +65,36 @@ pub const WindowContext = struct {
     /// establish.
     scrolled_ids: [WidgetHost.max_widgets]u32 = undefined,
     scrolled_count: usize = 0,
+    /// This window's own equivalent of `ClayLayout.last_computed_generation`
+    /// -- the `WidgetHost.layout_generation` value as of this window's last
+    /// real `SDL_RenderClear`/redraw/`SDL_RenderPresent` pass, `null` until
+    /// the first one. `FrameLoop.drawWindow` compares against this (plus a
+    /// couple of non-generation-tracked cases -- see its own doc comment) to
+    /// skip that pass entirely on a frame where nothing for this window
+    /// actually changed, rather than repainting unconditionally every wake.
+    last_drawn_generation: ?u64 = null,
+    /// Real, empirically-found necessity, not defensive paranoia: a
+    /// brand-new SDL window's very first `SDL_RenderPresent` can land
+    /// before the OS compositor has it fully mapped/visible -- confirmed
+    /// live (a real click-through after adding the generation-based redraw
+    /// gate above): the window's own late-created widgets (a "Delete
+    /// Selected" button, pager buttons -- all real, all present in the
+    /// registry, all drawn in that one real first pass, per a temporary
+    /// debug print showing `draw_count` frozen at 1 forever) never actually
+    /// appeared on screen, because nothing ever forced a *second* present
+    /// to correct whatever the compositor did with the first one. Forces
+    /// every real redraw to actually happen (bypassing the generation gate
+    /// entirely) for `warmup_ms` after window creation -- cheap (a handful
+    /// of extra real frames, once, per window) and matches common real
+    /// game-engine/GUI-toolkit practice of not trusting a window's first
+    /// frame(s) to actually display.
+    created_at_ms: i64 = 0,
+    /// Real, incremented-only-when-`drawWindow` actually redraws counter --
+    /// exists purely so a test can assert the dirty-check above is actually
+    /// skipping work (an unchanged, non-animating scene should draw once
+    /// across N calls), the same role `ClayLayout.recompute_count` already
+    /// plays one layer up.
+    draw_count: usize = 0,
 };
 
 /// Creates a real second OS window: `SDL_Window` + `SDL_Renderer` + (when
@@ -92,6 +123,17 @@ pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, wi
     };
     errdefer c.SDL_DestroyRenderer(renderer);
 
+    // Caps SDL_RenderPresent to the display's own refresh rate instead of
+    // returning immediately -- confirmed via SDL3's own header that this
+    // must run on the main thread, same as every other call in this
+    // function. A `false` return (the driver doesn't support the requested
+    // interval) is deliberately non-fatal -- an app is still fully usable
+    // without vsync, just leaning more on main.zig's own SDL_WaitEventTimeout
+    // to bound the frame loop's iteration rate instead.
+    if (!c.SDL_SetRenderVSync(renderer, 1)) {
+        std.debug.print("SDL_SetRenderVSync failed: {s}\n", .{c.SDL_GetError()});
+    }
+
     const text_engine = c.TTF_CreateRendererTextEngine(renderer) orelse {
         std.debug.print("TTF_CreateRendererTextEngine failed: {s}\n", .{c.SDL_GetError()});
         return error.TextEngineFailed;
@@ -106,6 +148,7 @@ pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, wi
         .clay_layout = clay_layout,
         .text_engine = text_engine,
         .root_widget_id = root_widget_id,
+        .created_at_ms = timing.nowMs(),
     };
 }
 

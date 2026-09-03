@@ -48,6 +48,17 @@ const max_text_widget_len = @max(TextField.max_len, TextArea.max_len);
 /// W15: see main.zig's original doc comment on this same constant.
 pub const tooltip_hover_threshold_ms: i64 = 100;
 
+/// How long after a window's own creation `drawWindow`'s redraw gate
+/// forces every real draw regardless of `layout_generation` -- see
+/// `WindowContext.created_at_ms`'s own doc comment for the real,
+/// live-confirmed reason this exists (a freshly-created window's first
+/// present isn't reliably guaranteed to actually display by the OS
+/// compositor). 500ms is comfortably longer than any realistic compositor/
+/// window-manager warmup delay while still being a one-time, per-window
+/// cost too small to matter for the idle-CPU fix this gate is otherwise
+/// part of.
+pub const window_redraw_warmup_ms: i64 = 500;
+
 /// Pixels of scroll per SDL wheel "notch" -- see main.zig's original doc
 /// comment on this same constant.
 const wheel_pixels_per_notch: f32 = 4.0;
@@ -60,6 +71,81 @@ const wheel_pixels_per_notch: f32 = 4.0;
 pub fn containsId(ids: []const u32, id: u32) bool {
     for (ids) |x| if (x == id) return true;
     return false;
+}
+
+/// Syncs every open window's own text-bearing widgets' real `TTF_Text`
+/// render objects (the thing SDL_ttf actually draws glyphs from) against
+/// the live registry's *current* text content -- `main.zig` calls this
+/// once early in the frame (unchanged, original position/timing) and a
+/// second time right after this same frame's own events have been
+/// processed, mirroring `rebuildFrameSnapshot`'s own two-call shape and
+/// fixing the same underlying class of bug for the *other* real
+/// mechanism a stale pre-event call leaves behind: `WidgetHost.
+/// syncTextObjects` reads the live registry directly (not a snapshot), so
+/// calling it only once, before events, meant a just-typed character's
+/// `TTF_Text` object was updated one frame late -- invisible under the
+/// old unthrottled loop, a real visible one-keystroke lag once
+/// `SDL_WaitEventTimeout` bounds this loop to real event/wake cadence
+/// (the exact same root cause as `rebuildFrameSnapshot`'s own doc
+/// comment, just a second, independent place it manifests).
+pub fn syncAllWindowText(widgets: *WidgetHost, io: std.Io, windows: []const WindowManager.WindowContext, font: *c.TTF_Font) void {
+    var struct_snap: [max_widgets_on_screen]WidgetHost.Slot = undefined;
+    const struct_n = widgets.snapshot(io, &struct_snap);
+    for (windows) |wctx| {
+        var ids: [max_widgets_on_screen]u32 = undefined;
+        const idn = FloatingOrder.windowSubset(struct_snap[0..struct_n], wctx.root_widget_id, &ids);
+        widgets.syncTextObjects(io, wctx.text_engine, font, ids[0..idn]);
+    }
+}
+
+/// Rebuilds this frame's registry-wide snapshot and each open window's own
+/// widget/is_floating/topmost_modal subset from the *current* live
+/// registry state -- `main.zig` calls this once early in the frame (for
+/// layout/scroll-push purposes, before this same frame's own input events
+/// are processed) and a second time right before the draw pass, so
+/// drawing reflects this same frame's own just-processed events instead
+/// of showing them one frame late.
+///
+/// Real, live-confirmed bug this second call fixes: `main.zig`'s original
+/// design took exactly one snapshot per frame, before the event loop, and
+/// reused it for both event dispatch and drawing -- invisible under the
+/// old unthrottled loop (the *next* iteration, microseconds later, would
+/// already show the correction), but a real, visible one-keystroke input
+/// lag once `SDL_WaitEventTimeout` bounds the loop to real event/wake
+/// cadence (a typed character updated the registry immediately via
+/// `WidgetHost.appendTextTo`, called synchronously from this same frame's
+/// event-draining loop, but wasn't visible on screen until the *next*
+/// keystroke's own draw call, since that draw call used the stale
+/// snapshot captured before the current keystroke was ever processed).
+///
+/// Returns the registry-wide widget count (mirrors `WidgetHost.snapshot`'s
+/// own return value, since callers need it to slice `widget_snapshot`).
+pub fn rebuildFrameSnapshot(
+    widgets: *WidgetHost,
+    io: std.Io,
+    windows: []const WindowManager.WindowContext,
+    widget_snapshot: []WidgetHost.Slot,
+    per_window_slots: [][max_widgets_on_screen]WidgetHost.Slot,
+    per_window_slot_count: []usize,
+    per_window_is_floating: [][max_widgets_on_screen]bool,
+    per_window_topmost_modal: []?u32,
+) usize {
+    const widget_count = widgets.snapshot(io, widget_snapshot);
+    for (windows, 0..) |wctx, i| {
+        var ids: [max_widgets_on_screen]u32 = undefined;
+        const idn = FloatingOrder.windowSubset(widget_snapshot[0..widget_count], wctx.root_widget_id, &ids);
+        var n: usize = 0;
+        for (widget_snapshot[0..widget_count]) |s| {
+            if (containsId(ids[0..idn], s.id)) {
+                per_window_slots[i][n] = s;
+                n += 1;
+            }
+        }
+        per_window_slot_count[i] = n;
+        FloatingOrder.computeIsFloating(per_window_slots[i][0..n], per_window_is_floating[i][0..n]);
+        per_window_topmost_modal[i] = FloatingOrder.topmostModalRoot(per_window_slots[i][0..n]);
+    }
+    return widget_count;
 }
 
 /// Multi-window Stage 3: the `SDL_WindowID` a given SDL event targets, or
@@ -835,6 +921,18 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         }
     }
 
+    // Real, deliberate exception to the generation-based redraw gate below:
+    // Spinner always animates from wall-clock time with no registry-side
+    // state at all (see Spinner.zig's own doc comment), and Button's
+    // post-click flash color is likewise computed from `now_ms <
+    // flash_until_ms` inside the draw pass, not from anything that bumps
+    // `layout_generation` -- a generation-only gate would freeze both
+    // solid, exactly the idle case this fix targets. Folded into this same
+    // per-slot loop (already iterating every effectively-visible,
+    // not-behind-a-modal slot for hover hit-testing) rather than a second
+    // pass over the same data.
+    var needs_continuous_redraw = false;
+    const now_ms = timing.nowMs();
     var hovering_any = false;
     var hovered_widget_id_this_frame: ?u32 = null;
     for (slots) |slot| {
@@ -845,10 +943,16 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         switch (slot.widget) {
             // A disabled Button shows neither the pointer cursor nor a
             // tooltip hover -- it isn't actually clickable right now, so
-            // neither affordance should suggest otherwise.
-            .button => |b| if (slot.clay_style.enabled and b.containsPoint(wctx.interaction.mouse_x, wctx.interaction.mouse_y)) {
-                hovering_any = true;
-                hovered_widget_id_this_frame = slot.id;
+            // neither affordance should suggest otherwise. The flash check
+            // is independent of both `enabled` and hover state -- a click
+            // flash still needs to fade even if the button became disabled
+            // or the mouse moved away immediately afterward.
+            .button => |b| {
+                if (slot.clay_style.enabled and b.containsPoint(wctx.interaction.mouse_x, wctx.interaction.mouse_y)) {
+                    hovering_any = true;
+                    hovered_widget_id_this_frame = slot.id;
+                }
+                if (now_ms < b.flash_until_ms) needs_continuous_redraw = true;
             },
             .textfield => |t| if (t.containsPoint(wctx.interaction.mouse_x, wctx.interaction.mouse_y)) {
                 hovering_any = true;
@@ -890,7 +994,8 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
                 hovering_any = true;
                 hovered_widget_id_this_frame = slot.id;
             },
-            .label, .container, .progress_bar, .divider, .badge, .spinner => {},
+            .spinner => needs_continuous_redraw = true,
+            .label, .container, .progress_bar, .divider, .badge => {},
         }
     }
     if (hovering_any != wctx.interaction.cursor_is_pointer) {
@@ -920,6 +1025,29 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             }
         }
     }
+
+    // Skips the actual GPU work (clear/fill/decorate/present) when nothing
+    // for this window changed since its own last real draw -- this is the
+    // draw-level half of the idle-CPU fix (main.zig's SDL_WaitEventTimeout
+    // is the other half, bounding how *often* this function even gets
+    // called). `needs_continuous_redraw` (computed above, in the same pass
+    // as hover hit-testing) covers Spinner/Button-flash, the two real cases
+    // that don't bump `layout_generation` at all -- see this block's own
+    // reasoning just above. An active slider/range-slider drag is a third
+    // real exception: `notifySliderValue`/`notifyRangeSliderValue` above
+    // push the new value to the guest, but nothing guarantees a same-frame
+    // `layout_generation` bump back before *this* draw needs to reflect the
+    // thumb's new position, so a drag in progress always redraws too. The
+    // hover/tooltip logic above still runs every call regardless -- it's
+    // cheap and already self-gates via its own hovered-widget-changed
+    // checks, only the renderer work below is worth skipping.
+    const current_generation = widgets.currentGeneration(io);
+    const dragging = wctx.interaction.dragging_slider_id != null;
+    const warming_up = now_ms - wctx.created_at_ms < window_redraw_warmup_ms;
+    const needs_redraw = wctx.last_drawn_generation == null or wctx.last_drawn_generation.? != current_generation or dragging or needs_continuous_redraw or warming_up;
+    if (!needs_redraw) return;
+    wctx.last_drawn_generation = current_generation;
+    wctx.draw_count += 1;
 
     var clip_rects: [max_widgets_on_screen]?c.SDL_FRect = undefined;
     ScrollClip.computeClipRects(slots, clip_rects[0..widget_count]);

@@ -15,11 +15,19 @@
 
 const std = @import("std");
 const Io = std.Io;
+const c = @import("c.zig").c;
 const json_util = @import("json_util.zig");
 const EventQueue = @import("EventQueue.zig");
 const Runtime = @import("Runtime.zig");
 
-pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue) void {
+/// `wake_event_type` is `main.zig`'s own `SDL_RegisterEvents(1)` result --
+/// pushed after every `natyv_dispatch` call below so the main thread's own
+/// `SDL_WaitEventTimeout` wakes immediately on a worker-thread-driven
+/// widget change, instead of waiting out its own timeout or a real OS
+/// event. `SDL_PushEvent` is documented safe to call from any thread
+/// (confirmed against SDL3's own header), so no `Io`/cross-thread
+/// synchronization is needed for this beyond the call itself.
+pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32) void {
     while (true) {
         const event = queue.pop(io) orelse break;
         defer queue.freeEntry(event);
@@ -42,6 +50,20 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue) void {
         if (runtime.call(io, "natyv_dispatch", payload)) |resp| {
             std.debug.print("[dispatch] widget={d} type={s} -> {s}\n", .{ event.widget_id, @tagName(event.event_type), resp });
         }
+
+        // Wake the main thread's own SDL_WaitEventTimeout unconditionally,
+        // regardless of the call above succeeding/failing/returning null --
+        // even a failed handler can have mutated state before failing, and
+        // the main thread has no other way to learn that promptly. Real
+        // possible mutations this guards: any natyv_create_*/natyv_set_*/
+        // natyv_destroy_* host function the guest's own dispatch handler
+        // calls nested inside natyv_dispatch itself (see this file's own
+        // top doc comment) -- the codebase's documented single-plugin-
+        // call-in-flight invariant means this is the only place any of
+        // those can happen from this thread, so this one push is complete.
+        var wake_event: c.SDL_Event = std.mem.zeroes(c.SDL_Event);
+        wake_event.type = wake_event_type;
+        _ = c.SDL_PushEvent(&wake_event);
     }
     std.debug.print("[dispatch] worker shutting down\n", .{});
 }

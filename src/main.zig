@@ -18,6 +18,15 @@ const Logging = @import("Logging.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
+/// How long the main loop's SDL_WaitEventTimeout blocks before waking on
+/// its own even with no real OS event -- chosen to sit at/under one vsync
+/// interval at the common 60Hz refresh rate (WindowManager's own
+/// SDL_SetRenderVSync is the real frame-pacing mechanism once something
+/// actually redraws; this timeout just bounds how long the loop can go
+/// fully idle between checking things like hover thresholds or a Button's
+/// own flash-timeout, without spinning to do so).
+const frame_wait_timeout_ms: i32 = 16;
+
 /// The id of whichever open window `wid` (an `SDL_WindowID`) names, or
 /// `null` if none currently open matches (e.g. a stray event for a window
 /// that was already torn down this same frame).
@@ -115,6 +124,16 @@ pub fn main(init: std.process.Init) !void {
     }
     defer c.SDL_Quit();
 
+    // A real, dedicated SDL event type Dispatch.run (the worker thread)
+    // pushes after every natyv_dispatch call returns, so the main loop's
+    // own SDL_WaitEventTimeout below wakes immediately on a worker-thread-
+    // driven widget change instead of waiting out its own timeout or a real
+    // OS event -- SDL_RegisterEvents/SDL_PushEvent are both documented safe
+    // to call from any thread, confirmed against SDL3's own header. Done
+    // once here, before the worker thread is spawned, and threaded through
+    // rather than each side deriving it independently.
+    const wake_event_type = c.SDL_RegisterEvents(1);
+
     // F2: the bundled default font (Inter) -- unconditional, not gated by
     // conf.natyv.json, since every app gets it regardless (see the
     // font-rendering plan). Not consumed yet -- that's F3, which swaps
@@ -179,7 +198,7 @@ pub fn main(init: std.process.Init) !void {
     var queue = EventQueue.init(allocator);
     defer queue.deinit();
 
-    const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue });
+    const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue, wake_event_type });
 
     // Multi-window: every open window's own real OS resources + per-window
     // frame state lives in this array -- `windows[0]` is always the original
@@ -298,49 +317,25 @@ pub fn main(init: std.process.Init) !void {
         runtime.widgets.destroyExpiredWidgets(io, timing.nowMs());
 
         // F3: per-window text sync -- each window's own TTF_TextEngine is
-        // renderer-specific (see syncTextObjects' own doc comment), so this
-        // can't be one registry-wide call the way flush/destroy-expired
-        // above are. `allowed_ids` comes from a structural snapshot taken
-        // just for this -- parent_id/window_root don't change from text
-        // syncing itself, so this doesn't need to be this frame's *final*
-        // snapshot.
-        {
-            var struct_snap: [max_widgets_on_screen]WidgetHost.Slot = undefined;
-            const struct_n = runtime.widgets.snapshot(io, &struct_snap);
-            for (windows[0..window_count]) |*wctx| {
-                var ids: [max_widgets_on_screen]u32 = undefined;
-                const idn = FloatingOrder.windowSubset(struct_snap[0..struct_n], wctx.root_widget_id, &ids);
-                runtime.widgets.syncTextObjects(io, wctx.text_engine, default_font.font, ids[0..idn]);
-            }
-        }
+        // renderer-specific (see FrameLoop.syncAllWindowText's own doc
+        // comment), so this can't be one registry-wide call the way flush/
+        // destroy-expired above are. Called again after this same frame's
+        // events are processed, right before drawing -- see that function's
+        // own doc comment for why.
+        FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
 
+        // Each window's own widget subset for this frame -- computed once
+        // here (reused by this frame's event dispatch below, and by the
+        // `.window_close_requested` push inside that same loop), and again
+        // fresh right before drawing -- see FrameLoop.rebuildFrameSnapshot's
+        // own doc comment for why the draw pass needs its own, later call.
         var widget_snapshot: [max_widgets_on_screen]WidgetHost.Slot = undefined;
-        const widget_count = runtime.widgets.snapshot(io, &widget_snapshot);
+        var widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
 
         // Scroll-into-view / file picker -- both anchored to the original
         // startup window, see FrameLoop.drainGlobalPending's own doc
         // comment.
         FrameLoop.drainGlobalPending(&runtime.widgets, io, &queue, windows[0].window, widget_snapshot[0..widget_count]);
-
-        // Each window's own widget subset for this frame -- computed once,
-        // reused by both this frame's event dispatch below and its draw
-        // pass afterward (mirrors the original single-window body's own
-        // "is_floating/topmost_modal computed once before the event loop"
-        // ordering).
-        for (windows[0..window_count], 0..) |wctx, i| {
-            var ids: [max_widgets_on_screen]u32 = undefined;
-            const idn = FloatingOrder.windowSubset(widget_snapshot[0..widget_count], wctx.root_widget_id, &ids);
-            var n: usize = 0;
-            for (widget_snapshot[0..widget_count]) |s| {
-                if (FrameLoop.containsId(ids[0..idn], s.id)) {
-                    per_window_slots[i][n] = s;
-                    n += 1;
-                }
-            }
-            per_window_slot_count[i] = n;
-            FloatingOrder.computeIsFloating(per_window_slots[i][0..n], per_window_is_floating[i][0..n]);
-            per_window_topmost_modal[i] = FloatingOrder.topmostModalRoot(per_window_slots[i][0..n]);
-        }
 
         // Tree view: a real `.scroll` push for each scroll container this
         // frame's layout pass reported, per window.
@@ -348,8 +343,17 @@ pub fn main(init: std.process.Init) !void {
             FrameLoop.pushScrollEvents(&queue, io, wctx, widget_snapshot[0..widget_count]);
         }
 
+        // Blocks (up to frame_wait_timeout_ms) instead of spinning when
+        // there's nothing to do -- this, plus WindowManager's own
+        // SDL_SetRenderVSync, is what actually bounds this loop's iteration
+        // rate; see FrameLoop.zig's own dirty-check for the *drawing* half
+        // of the fix. The first wait can return a real event or time out
+        // with nothing; either way, drain any further already-queued events
+        // via plain non-blocking SDL_PollEvent so a burst doesn't each pay
+        // a separate wait.
         var event: c.SDL_Event = undefined;
-        while (c.SDL_PollEvent(&event)) {
+        var have_event = c.SDL_WaitEventTimeout(&event, frame_wait_timeout_ms);
+        while (have_event) {
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
                 c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
@@ -382,7 +386,35 @@ pub fn main(init: std.process.Init) !void {
                     }
                 },
             }
+            have_event = c.SDL_PollEvent(&event);
         }
+
+        // Real, live-confirmed fix: recompute layout, re-sync text objects,
+        // and refresh the widget snapshot fresh, right before drawing, so
+        // this frame's own just-processed events (a keystroke's
+        // `appendTextTo`, a Refresh click's whole new batch of
+        // natyv_create_* calls, ...) are what actually gets drawn -- see
+        // FrameLoop.layoutWindow/syncAllWindowText/rebuildFrameSnapshot's
+        // own doc comments for the full story (the bug this fixes: input
+        // otherwise looked delayed by exactly one event, invisible under
+        // the old unthrottled loop but real once SDL_WaitEventTimeout
+        // bounds this loop to real event/wake cadence). Layout must run
+        // first -- newly-created widgets (e.g. a Refresh click's freshly
+        // built message rows) have no real on-screen rect at all until a
+        // real Clay layout pass writes one back; without this, the
+        // registry-wide mutation was correctly reflected in the redrawn
+        // widget *data*, but with stale (or no) positions, so some/all new
+        // rows didn't visibly render until some *later*, unrelated event
+        // (e.g. a page-nav click) forced another real layoutWindow call.
+        // Reuses this same iteration's already-captured mouse position --
+        // it can't have changed meaningfully within one loop iteration, and
+        // `layoutWindow`'s own pending-scroll-delta consumption is already
+        // safely zeroed from the earlier call this same iteration.
+        for (windows[0..window_count]) |*wctx| {
+            FrameLoop.layoutWindow(&runtime.widgets, io, wctx, global_mouse_x, global_mouse_y, global_buttons);
+        }
+        FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
+        widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
 
         for (windows[0..window_count], 0..) |*wctx, i| {
             FrameLoop.drawWindow(&runtime.widgets, io, &queue, wctx, per_window_slots[i][0..per_window_slot_count[i]], per_window_is_floating[i][0..per_window_slot_count[i]], per_window_topmost_modal[i], arrow_cursor, pointer_cursor);
