@@ -353,6 +353,20 @@ pub fn main(init: std.process.Init) !void {
         // a separate wait.
         var event: c.SDL_Event = undefined;
         var have_event = c.SDL_WaitEventTimeout(&event, frame_wait_timeout_ms);
+        // A bare timeout (no real event within frame_wait_timeout_ms) means
+        // nothing happened this iteration at all -- the second layout/text-
+        // sync/snapshot pass below exists only to reflect *this iteration's
+        // own events* before drawing (see that block's own doc comment), so
+        // skip it entirely rather than redoing the exact same recompute the
+        // first pass above already did this same iteration. Without this,
+        // a real idle-CPU regression: that second pass ran unconditionally
+        // on every 16ms wake regardless of whether anything happened,
+        // roughly doubling the loop's fixed per-iteration cost forever --
+        // found via the mail-natyv benchmark re-run after this second pass
+        // first landed (idle CPU ~8-16% -> ~41%, never re-measured when
+        // that fix was added since only interactive correctness was
+        // re-tested at the time).
+        const had_real_event = have_event;
         while (have_event) {
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
@@ -410,11 +424,13 @@ pub fn main(init: std.process.Init) !void {
         // it can't have changed meaningfully within one loop iteration, and
         // `layoutWindow`'s own pending-scroll-delta consumption is already
         // safely zeroed from the earlier call this same iteration.
-        for (windows[0..window_count]) |*wctx| {
-            FrameLoop.layoutWindow(&runtime.widgets, io, wctx, global_mouse_x, global_mouse_y, global_buttons);
+        if (had_real_event) {
+            for (windows[0..window_count]) |*wctx| {
+                FrameLoop.layoutWindow(&runtime.widgets, io, wctx, global_mouse_x, global_mouse_y, global_buttons);
+            }
+            FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
+            widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
         }
-        FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
-        widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
 
         for (windows[0..window_count], 0..) |*wctx, i| {
             FrameLoop.drawWindow(&runtime.widgets, io, &queue, wctx, per_window_slots[i][0..per_window_slot_count[i]], per_window_is_floating[i][0..per_window_slot_count[i]], per_window_topmost_modal[i], arrow_cursor, pointer_cursor);
