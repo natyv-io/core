@@ -14,6 +14,7 @@ const Dispatch = @import("Dispatch.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
 const WindowManager = @import("WindowManager.zig");
 const FrameLoop = @import("FrameLoop.zig");
+const Logging = @import("Logging.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
 
@@ -136,6 +137,9 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
+    try Logging.init(io, config.value.logging, app_name_z);
+    defer Logging.deinit();
+
     // `.ntx` tooling Stage 7's bundling step: a binary built via
     // `zig build -Dembed-app-wasm=true` (only ever `natyv build` itself)
     // uses the wasm embedded at compile time instead of reading
@@ -210,6 +214,12 @@ pub fn main(init: std.process.Init) !void {
     var per_window_topmost_modal: [WindowManager.max_open_windows]?u32 = [_]?u32{null} ** WindowManager.max_open_windows;
 
     while (running) {
+        // Logging: a no-op when disabled. Extism only *buffers* guest log
+        // lines internally until this runs -- see Logging.zig's own doc
+        // comment for why draining once per frame (not per dispatch) is
+        // the right cadence.
+        Logging.drain();
+
         // F3: a guest destroying a widget can't destroy its TTF_Text right
         // then -- see WidgetHost.pending_text_destroys' own doc comment.
         // Registry-wide, not per-window: a single queue drained once per
