@@ -343,12 +343,16 @@ pub fn layoutWindow(widgets: *WidgetHost, io: std.Io, wctx: *WindowManager.Windo
     wctx.interaction.mouse_y = global_mouse_y - @as(f32, @floatFromInt(win_y));
 
     wctx.scrolled_count = 0;
+    wctx.did_recompute = false;
     if (wctx.clay_layout) |*clay_layout| {
         var win_w: c_int = undefined;
         var win_h: c_int = undefined;
         _ = c.SDL_GetWindowSize(wctx.window, &win_w, &win_h);
         const mouse_down = (global_buttons & c.SDL_BUTTON_LMASK) != 0;
-        wctx.scrolled_count = clay_layout.layoutIfNeeded(widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), wctx.interaction.mouse_x, wctx.interaction.mouse_y, mouse_down, wctx.interaction.pending_scroll_dx, wctx.interaction.pending_scroll_dy, &wctx.scrolled_ids, wctx.root_widget_id);
+        if (clay_layout.layoutIfNeeded(widgets, io, @floatFromInt(win_w), @floatFromInt(win_h), wctx.interaction.mouse_x, wctx.interaction.mouse_y, mouse_down, wctx.interaction.pending_scroll_dx, wctx.interaction.pending_scroll_dy, &wctx.scrolled_ids, wctx.root_widget_id)) |count| {
+            wctx.scrolled_count = count;
+            wctx.did_recompute = true;
+        }
     }
     wctx.interaction.pending_scroll_dx = 0;
     wctx.interaction.pending_scroll_dy = 0;
@@ -1044,7 +1048,17 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     const current_generation = widgets.currentGeneration(io);
     const dragging = wctx.interaction.dragging_slider_id != null;
     const warming_up = now_ms - wctx.created_at_ms < window_redraw_warmup_ms;
-    const needs_redraw = wctx.last_drawn_generation == null or wctx.last_drawn_generation.? != current_generation or dragging or needs_continuous_redraw or warming_up;
+    // A real Clay recompute this same iteration (scroll or resize, not just
+    // content) writes fresh `rect`/`scroll_data` via `WidgetHost.setRect`/
+    // `setScrollData` -- neither bumps `layout_generation` (see
+    // `ClayLayout.layoutIfNeeded`'s own doc comment), so without this a
+    // scroll or a resize would freeze on screen exactly like the focus ring
+    // did before it got its own generation bump -- confirmed live: scroll
+    // was already silently frozen before this line was added, most likely
+    // ever since the very first draw-level dirty check landed (nothing here
+    // ever exercised scrolling until now). `wctx.did_recompute` is set by
+    // `layoutWindow`, called unconditionally right before this same call.
+    const needs_redraw = wctx.last_drawn_generation == null or wctx.last_drawn_generation.? != current_generation or dragging or needs_continuous_redraw or warming_up or wctx.did_recompute;
     if (!needs_redraw) return;
     wctx.last_drawn_generation = current_generation;
     wctx.draw_count += 1;

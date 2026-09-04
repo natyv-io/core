@@ -59,6 +59,28 @@ fn removeWindow(windows: []WindowManager.WindowContext, window_count: *usize, id
     window_count.* -= 1;
 }
 
+// Idle-CPU fix, part 2: `FrameLoop.rebuildFrameSnapshot`/`syncAllWindowText`
+// do a full copy of the entire widget registry with no dirty-check of their
+// own (unlike `ClayLayout.layoutIfNeeded`, which already has one) -- real,
+// live-measured cost via `sample`, dominant once the rest of the loop was
+// throttled. Safe to skip only when *nothing* could have changed since the
+// snapshot was last rebuilt: `layout_generation` covers every registry
+// mutation (widget create/destroy/style/focus/checked/value/... -- see
+// WidgetHost.zig's own mutators, all audited to bump it on real change), but
+// NOT `WidgetHost.setRect`/`setScrollData`, which a real Clay recompute
+// (scroll or resize, not just content) writes back without ever bumping
+// generation -- see `ClayLayout.layoutIfNeeded`'s own doc comment. So this
+// also has to check `did_recompute` (set by `FrameLoop.layoutWindow`, called
+// unconditionally just before this on both the pre-event and post-event
+// paths) across every open window, not generation alone.
+fn needsSnapshotRebuild(widgets: *WidgetHost, io: std.Io, windows: []const WindowManager.WindowContext, last_generation: ?u64) bool {
+    if (last_generation == null or widgets.currentGeneration(io) != last_generation.?) return true;
+    for (windows) |w| {
+        if (w.did_recompute) return true;
+    }
+    return false;
+}
+
 // M7: app identity, wasm location, and every capability an app needs
 // (SQLite, network + allowed hosts, which widget kinds) now come from
 // conf.natyv.json instead of CLI arguments -- a real install shouldn't
@@ -232,6 +254,18 @@ pub fn main(init: std.process.Init) !void {
     var per_window_is_floating: [WindowManager.max_open_windows][max_widgets_on_screen]bool = undefined;
     var per_window_topmost_modal: [WindowManager.max_open_windows]?u32 = [_]?u32{null} ** WindowManager.max_open_windows;
 
+    // Registry-wide snapshot (as opposed to `per_window_slots` above, each
+    // window's own subset of it) -- hoisted above the loop for the same
+    // reason `per_window_slots` already is: `needsSnapshotRebuild` below can
+    // skip recomputing it on a genuinely idle iteration, and a skipped
+    // iteration must see the previous iteration's still-valid data, not
+    // `undefined`.
+    var widget_snapshot: [max_widgets_on_screen]WidgetHost.Slot = undefined;
+    var widget_count: usize = 0;
+    // The `layout_generation` this snapshot was last rebuilt against --
+    // `null` until the first real rebuild. See `needsSnapshotRebuild`.
+    var last_snapshot_generation: ?u64 = null;
+
     while (running) {
         // Logging: a no-op when disabled. Extism only *buffers* guest log
         // lines internally until this runs -- see Logging.zig's own doc
@@ -321,16 +355,26 @@ pub fn main(init: std.process.Init) !void {
         // comment), so this can't be one registry-wide call the way flush/
         // destroy-expired above are. Called again after this same frame's
         // events are processed, right before drawing -- see that function's
-        // own doc comment for why.
-        FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
-
+        // own doc comment for why. Bundled under the same
+        // needsSnapshotRebuild gate as rebuildFrameSnapshot just below --
+        // both do their own unconditional full-registry `widgets.snapshot`
+        // copy with no internal dirty-check, the real cost this gate exists
+        // to skip on a genuinely idle iteration (see needsSnapshotRebuild's
+        // own doc comment).
+        //
         // Each window's own widget subset for this frame -- computed once
         // here (reused by this frame's event dispatch below, and by the
         // `.window_close_requested` push inside that same loop), and again
         // fresh right before drawing -- see FrameLoop.rebuildFrameSnapshot's
         // own doc comment for why the draw pass needs its own, later call.
-        var widget_snapshot: [max_widgets_on_screen]WidgetHost.Slot = undefined;
-        var widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
+        // `widget_snapshot`/`widget_count` are hoisted above the loop
+        // specifically so a skipped iteration correctly reuses the previous
+        // one's still-valid data instead of stale-but-uninitialized memory.
+        if (needsSnapshotRebuild(&runtime.widgets, io, windows[0..window_count], last_snapshot_generation)) {
+            FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
+            widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
+            last_snapshot_generation = runtime.widgets.currentGeneration(io);
+        }
 
         // Scroll-into-view / file picker -- both anchored to the original
         // startup window, see FrameLoop.drainGlobalPending's own doc
@@ -428,8 +472,14 @@ pub fn main(init: std.process.Init) !void {
             for (windows[0..window_count]) |*wctx| {
                 FrameLoop.layoutWindow(&runtime.widgets, io, wctx, global_mouse_x, global_mouse_y, global_buttons);
             }
-            FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
-            widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
+            // Same needsSnapshotRebuild gate as the pre-event pass above --
+            // a real event doesn't always mean something snapshot-relevant
+            // actually changed (e.g. a plain hover-only mouse move).
+            if (needsSnapshotRebuild(&runtime.widgets, io, windows[0..window_count], last_snapshot_generation)) {
+                FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
+                widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
+                last_snapshot_generation = runtime.widgets.currentGeneration(io);
+            }
         }
 
         for (windows[0..window_count], 0..) |*wctx, i| {

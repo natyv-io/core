@@ -707,6 +707,42 @@ test "2026-09-02 real window resizing: a window-size-only change (no content/scr
     }
 }
 
+test "layoutIfNeeded returns null (not 0) when it skips, distinct from a real recompute with 0 scrolled containers -- main.zig's idle-CPU snapshot-rebuild skip relies on telling these apart" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var runtime = try Runtime.init(allocator, null);
+    defer runtime.deinit();
+
+    var font_cap = try Font.init();
+    defer font_cap.deinit();
+    var clay_layout = try ClayLayout.init(allocator, 300, 100, font_cap.font);
+    defer clay_layout.deinit(allocator);
+    var scroll_scratch: [WidgetHost.max_widgets]u32 = undefined;
+
+    _ = runtime.widgets.insertWithLayout(io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{
+        .sizing = .{ .width = growAxis(), .height = growAxis() },
+    }) orelse return error.RegistryFull;
+
+    // First call: nothing computed yet -- a real recompute, with 0 scroll
+    // containers (there are none in this fixture). Must be `.some(0)`, not
+    // `null` -- a caller telling these apart (e.g. to know whether
+    // setRect/setScrollData might have run) needs the distinction.
+    const first = clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch, null);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(@as(usize, 0), first.?);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+
+    // Second call: same size, no content/scroll change -- genuinely skips.
+    // Must be `null`, not `0` -- this is the exact case a `0`-only return
+    // couldn't distinguish from the first call above.
+    const second = clay_layout.layoutIfNeeded(&runtime.widgets, io, 300, 100, 0, 0, false, 0, 0, &scroll_scratch, null);
+    try std.testing.expect(second == null);
+    try std.testing.expectEqual(@as(usize, 1), clay_layout.recompute_count);
+}
+
 test "W16: a floating widget that would overflow the bottom of the window flips to open above its trigger instead" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});

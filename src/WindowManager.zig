@@ -65,6 +65,17 @@ pub const WindowContext = struct {
     /// establish.
     scrolled_ids: [WidgetHost.max_widgets]u32 = undefined,
     scrolled_count: usize = 0,
+    /// Set alongside `scrolled_count` by `FrameLoop.layoutWindow` -- `true`
+    /// only when this window's own `layoutIfNeeded` call actually ran a real
+    /// recompute this call (content changed, a scroll delta, or a resize),
+    /// as opposed to hitting its own early-return. Needed because
+    /// `scrolled_count == 0` is ambiguous on its own (it means both "nothing
+    /// to report" and "recomputed, but no scroll container's offset moved")
+    /// -- `main.zig`'s idle-CPU snapshot-rebuild skip needs to tell those
+    /// apart, since only a real recompute may have written fresh `rect`/
+    /// `scroll_data` via `WidgetHost.setRect`/`setScrollData`, neither of
+    /// which bumps `layout_generation`.
+    did_recompute: bool = false,
     /// This window's own equivalent of `ClayLayout.last_computed_generation`
     /// -- the `WidgetHost.layout_generation` value as of this window's last
     /// real `SDL_RenderClear`/redraw/`SDL_RenderPresent` pass, `null` until

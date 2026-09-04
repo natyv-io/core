@@ -523,7 +523,15 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
 /// subtree forces window B's independent instance to also recompute that
 /// frame even though nothing in B changed, correct just not maximally
 /// efficient.
-pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32, scrolled_ids_out: []u32, window_root_id: ?u32) usize {
+/// Returns `null` when nothing needed a real recompute at all (the early
+/// return just below) -- distinct from `0`, which means a real recompute
+/// *did* run but no scroll container's offset actually moved. `main.zig`'s
+/// idle-CPU snapshot-rebuild skip relies on telling these two apart: `0`
+/// alone is ambiguous (could mean "skipped" or "recomputed, nothing
+/// scrolled"), but only the latter means `WidgetHost.setRect`/
+/// `setScrollData` may have been called this call, which is the real signal
+/// a snapshot rebuild needs (see `FrameLoop.layoutWindow`'s own doc comment).
+pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, window_h: f32, mouse_x: f32, mouse_y: f32, mouse_down: bool, scroll_dx: f32, scroll_dy: f32, scrolled_ids_out: []u32, window_root_id: ?u32) ?usize {
     // Multi-window Stage 2: selects *this* instance's own Clay context
     // before touching any Clay global state -- a defensive no-op today
     // (exactly one `ClayLayout` instance ever exists), but required once a
@@ -533,7 +541,7 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
     const content_changed = self.last_computed_generation == null or self.last_computed_generation.? != current_generation;
     const scrolled = scroll_dx != 0 or scroll_dy != 0;
     const resized = self.last_window_w == null or self.last_window_w.? != window_w or self.last_window_h.? != window_h;
-    if (!content_changed and !scrolled and !resized) return 0;
+    if (!content_changed and !scrolled and !resized) return null;
 
     var full_snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     const full_n = widgets.snapshot(io, &full_snap);
