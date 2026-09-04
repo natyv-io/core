@@ -266,6 +266,25 @@ pub fn main(init: std.process.Init) !void {
     // `null` until the first real rebuild. See `needsSnapshotRebuild`.
     var last_snapshot_generation: ?u64 = null;
 
+    // Idle-CPU fix, part 3: whether *any* open window currently needs a
+    // short-timeout wait to keep animating (a visible Spinner, a Button
+    // still fading its click flash, or a window still inside its post-
+    // creation warmup -- see WindowContext.needs_frequent_wake's own doc
+    // comment), set by the end of each iteration's draw loop and consulted
+    // at the *top* of the next one. `true` initially -- correct and safe
+    // default for the very first iteration, before any window has drawn
+    // even once to report its own real state. When this is `false`, the
+    // wait below blocks indefinitely (`SDL_WaitEvent`, no timeout) instead
+    // of waking on a fixed cadence just to re-check nothing changed --
+    // real, live-measured idle CPU floor after the snapshot-rebuild-skip
+    // fix was almost entirely this fixed-cadence wake itself (mouse/window-
+    // position syscalls, an expired-widget scan, and the hover hit-test
+    // loop, all cheap individually but paid ~60x/sec forever). A worker-
+    // thread-driven mutation (Dispatch.run's SDL_PushEvent) or any real OS
+    // event still wakes this immediately either way -- only the "wake on a
+    // timer for no reason" cost goes away.
+    var any_needs_frequent_wake = true;
+
     while (running) {
         // Logging: a no-op when disabled. Extism only *buffers* guest log
         // lines internally until this runs -- see Logging.zig's own doc
@@ -387,16 +406,21 @@ pub fn main(init: std.process.Init) !void {
             FrameLoop.pushScrollEvents(&queue, io, wctx, widget_snapshot[0..widget_count]);
         }
 
-        // Blocks (up to frame_wait_timeout_ms) instead of spinning when
-        // there's nothing to do -- this, plus WindowManager's own
+        // Blocks (up to frame_wait_timeout_ms, or indefinitely -- see
+        // any_needs_frequent_wake's own doc comment) instead of spinning
+        // when there's nothing to do -- this, plus WindowManager's own
         // SDL_SetRenderVSync, is what actually bounds this loop's iteration
         // rate; see FrameLoop.zig's own dirty-check for the *drawing* half
         // of the fix. The first wait can return a real event or time out
-        // with nothing; either way, drain any further already-queued events
-        // via plain non-blocking SDL_PollEvent so a burst doesn't each pay
-        // a separate wait.
+        // with nothing (or, in indefinite mode, always returns with a real
+        // event); either way, drain any further already-queued events via
+        // plain non-blocking SDL_PollEvent so a burst doesn't each pay a
+        // separate wait.
         var event: c.SDL_Event = undefined;
-        var have_event = c.SDL_WaitEventTimeout(&event, frame_wait_timeout_ms);
+        var have_event = if (any_needs_frequent_wake)
+            c.SDL_WaitEventTimeout(&event, frame_wait_timeout_ms)
+        else
+            c.SDL_WaitEvent(&event);
         // A bare timeout (no real event within frame_wait_timeout_ms) means
         // nothing happened this iteration at all -- the second layout/text-
         // sync/snapshot pass below exists only to reflect *this iteration's
@@ -484,6 +508,21 @@ pub fn main(init: std.process.Init) !void {
 
         for (windows[0..window_count], 0..) |*wctx, i| {
             FrameLoop.drawWindow(&runtime.widgets, io, &queue, wctx, per_window_slots[i][0..per_window_slot_count[i]], per_window_is_floating[i][0..per_window_slot_count[i]], per_window_topmost_modal[i], arrow_cursor, pointer_cursor);
+        }
+
+        // Recompute for the *next* iteration's wait mode -- see
+        // any_needs_frequent_wake's own doc comment. Every window's
+        // `needs_frequent_wake` was just set fresh by the drawWindow calls
+        // above (unconditionally, regardless of whether each one actually
+        // redrew), so this always reflects this iteration's real state.
+        // Also forced true by any pending widget expiry (see
+        // WidgetHost.hasPendingExpiry's own doc comment) -- a toast-style
+        // auto-dismissing widget needs the loop to keep checking on a timer
+        // even with nothing else happening, or it would never get cleaned
+        // up under an indefinite wait.
+        any_needs_frequent_wake = runtime.widgets.hasPendingExpiry(io);
+        for (windows[0..window_count]) |w| {
+            if (w.needs_frequent_wake) any_needs_frequent_wake = true;
         }
     }
 

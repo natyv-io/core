@@ -1059,6 +1059,21 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     // ever exercised scrolling until now). `wctx.did_recompute` is set by
     // `layoutWindow`, called unconditionally right before this same call.
     const needs_redraw = wctx.last_drawn_generation == null or wctx.last_drawn_generation.? != current_generation or dragging or needs_continuous_redraw or warming_up or wctx.did_recompute;
+    // Set unconditionally, even when the redraw itself is about to be
+    // skipped below -- `main.zig` reads this after every call to decide the
+    // *next* iteration's wait mode, and needs it regardless of whether this
+    // particular call actually drew anything. Also true while a hover is in
+    // progress but hasn't shown its tooltip yet (`hover_start_ms` set,
+    // `tooltip_active_for` not) -- that transition is purely wall-clock
+    // (`timing.nowMs() - start >= tooltip_hover_threshold_ms` above), no
+    // discrete event fires it, so a stationary mouse with nothing else
+    // happening would never get its tooltip under an indefinite wait
+    // otherwise. Same hazard class as WidgetHost.hasPendingExpiry's own doc
+    // comment -- found by auditing every `timing.nowMs()` call site in this
+    // codebase for the same "wall-clock-gated, no discrete event" pattern
+    // once the expiry case turned up, not caught live.
+    const tooltip_pending = wctx.interaction.hover_start_ms != null and wctx.interaction.tooltip_active_for == null;
+    wctx.needs_frequent_wake = needs_continuous_redraw or warming_up or tooltip_pending;
     if (!needs_redraw) return;
     wctx.last_drawn_generation = current_generation;
     wctx.draw_count += 1;

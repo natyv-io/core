@@ -1259,6 +1259,28 @@ pub fn destroyExpiredWidgets(self: *Self, call_io: Io, now_ms: i64) void {
     for (expired_roots[0..expired_count]) |root_id| self.destroySubtreeLocked(root_id);
 }
 
+/// `true` when any slot has a real `expires_at_ms` set, regardless of
+/// whether it's actually due yet -- `main.zig`'s idle-CPU wait-mode
+/// decision needs this: `destroyExpiredWidgets` above only ever runs when
+/// the main loop wakes for some other reason, so a toast-style expiring
+/// widget with nothing else happening on screen would never get cleaned up
+/// under an indefinite `SDL_WaitEvent` wait. Forces the short-timeout wait
+/// to stay active for as long as *anything* has a pending expiry, so the
+/// loop keeps checking every `frame_wait_timeout_ms` until it's actually
+/// due -- correct but not maximally efficient (it doesn't compute the
+/// exact nearest deadline), a deliberate simplicity/safety tradeoff over a
+/// precise dynamic timeout.
+pub fn hasPendingExpiry(self: *Self, call_io: Io) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    for (self.slots) |maybe_slot| {
+        if (maybe_slot) |s| {
+            if (s.expires_at_ms != null) return true;
+        }
+    }
+    return false;
+}
+
 /// Destroys `root_id` and every descendant reachable via `parent_id`.
 /// Two-phase deliberately -- collects the full set to destroy first
 /// (against still-fully-intact slot data), then destroys everything in a

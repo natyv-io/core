@@ -106,6 +106,17 @@ pub const WindowContext = struct {
     /// across N calls), the same role `ClayLayout.recompute_count` already
     /// plays one layer up.
     draw_count: usize = 0,
+    /// Set by `FrameLoop.drawWindow` on every call (regardless of whether it
+    /// actually redraws) to `needs_continuous_redraw or warming_up` --
+    /// `true` while this window has a visible Spinner, a Button still
+    /// fading its click flash, or is still inside its post-creation warmup
+    /// window. `main.zig` ORs this across every open window to decide
+    /// whether the *next* iteration's wait needs a short timeout (to keep
+    /// animating) or can block indefinitely (`SDL_WaitEvent`, true 0% CPU)
+    /// -- see main.zig's own doc comment on that decision for the full
+    /// reasoning and why a fixed timeout forever was the last real chunk of
+    /// idle CPU left after the snapshot-rebuild-skip fix.
+    needs_frequent_wake: bool = false,
 };
 
 /// Creates a real second OS window: `SDL_Window` + `SDL_Renderer` + (when
