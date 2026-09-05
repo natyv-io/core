@@ -838,30 +838,10 @@ pub fn setTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
     defer parsed.deinit();
     const req = parsed.value;
 
-    self.mutex.lockUncancelable(self.io());
-    defer self.mutex.unlock(self.io());
-    const slot = self.findLocked(req.widget_id) orelse {
+    if (!self.setText(self.io(), req.widget_id, req.text)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
-    };
-    switch (slot.widget) {
-        .button => |*b| b.setLabel(req.text),
-        .textfield => |*t| t.setText(req.text),
-        .textarea => |*ta| ta.setText(req.text),
-        .label => |*l| l.setText(req.text),
-        .checkbox => |*cb| cb.setLabel(req.text),
-        .toggle => |*tg| tg.setLabel(req.text),
-        .radio_button => |*r| r.setLabel(req.text),
-        .badge => |*bd| bd.setLabel(req.text),
-        // W17: a stepper's value text is host-derived from `.value`
-        // (see `NumericStepper.setValue`), and a segmented control's
-        // segment labels are set once at creation with no v1 API to
-        // change them afterward -- same "not an error, just doesn't
-        // apply" precedent as Container/ProgressBar/Slider/Divider here.
-        // W19: Tabs' labels join the same "set once at creation" set.
-        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => {},
     }
-    if (slot.clay_managed) self.layout_generation +%= 1;
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
 

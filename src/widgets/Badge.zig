@@ -7,6 +7,7 @@
 //! same "guest composes it from primitives" precedent Breadcrumbs/Dialog
 //! already established, not a host-level feature of Badge itself.
 
+const std = @import("std");
 const c = @import("../c.zig").c;
 
 const Self = @This();
@@ -34,16 +35,18 @@ sync_count: u32 = 0,
 
 pub fn init(rect: c.SDL_FRect, tone: Tone, initial_label: []const u8) Self {
     var self: Self = .{ .rect = rect, .tone = tone };
-    self.setLabel(initial_label);
+    _ = self.setLabel(initial_label);
     return self;
 }
 
-pub fn setLabel(self: *Self, s: []const u8) void {
+pub fn setLabel(self: *Self, s: []const u8) bool {
     const n = @min(s.len, max_label_len);
+    if (self.label_len == n and std.mem.eql(u8, self.label_buf[0..n], s[0..n])) return false;
     @memcpy(self.label_buf[0..n], s[0..n]);
     self.label_buf[n] = 0;
     self.label_len = n;
     self.text_generation +%= 1;
+    return true;
 }
 
 pub fn label(self: *const Self) []const u8 {

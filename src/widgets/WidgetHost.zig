@@ -2018,3 +2018,67 @@ pub fn setStyle(self: *Self, call_io: Io, id: u32, background_color: ?c.SDL_FCol
     if (changed and slot.clay_managed) self.layout_generation +%= 1;
     return true;
 }
+
+test "setText only bumps layout_generation on a real content change" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    const id = host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, null, .{}).?;
+
+    const gen0 = host.layout_generation;
+    try std.testing.expect(host.setText(test_io, id, "x"));
+    try std.testing.expect(host.layout_generation != gen0);
+
+    // Same value again: the widget exists (returns true) but nothing
+    // actually changed, so the generation must not move.
+    const gen1 = host.layout_generation;
+    try std.testing.expect(host.setText(test_io, id, "x"));
+    try std.testing.expectEqual(gen1, host.layout_generation);
+
+    try std.testing.expect(host.setText(test_io, id, "y"));
+    try std.testing.expect(host.layout_generation != gen1);
+}
+
+test "setText on an unknown widget id returns false" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    try std.testing.expect(!host.setText(test_io, 999, "x"));
+}
+
+/// Real widget-kind dispatch + change-detection lives here (mirrors
+/// `setStyle` above), not in `setTextHostFn` -- lets this be tested with a
+/// plain `WidgetHost` instance, no Extism ABI involved. Returns `false`
+/// only when `id` doesn't exist. `layout_generation` only bumps when the
+/// widget's own setter reports a real content change, not on every call --
+/// the same gap `setStyle`/`setFocused`/`setEnabled` already closed
+/// elsewhere.
+pub fn setText(self: *Self, call_io: Io, id: u32, text_value: []const u8) bool {
+    self.mutex.lockUncancelable(call_io);
+    const slot = self.findLocked(id) orelse {
+        self.mutex.unlock(call_io);
+        return false;
+    };
+    const changed = switch (slot.widget) {
+        .button => |*b| b.setLabel(text_value),
+        .textfield => |*t| t.setText(text_value),
+        .textarea => |*ta| ta.setText(text_value),
+        .label => |*l| l.setText(text_value),
+        .checkbox => |*cb| cb.setLabel(text_value),
+        .toggle => |*tg| tg.setLabel(text_value),
+        .radio_button => |*r| r.setLabel(text_value),
+        .badge => |*bd| bd.setLabel(text_value),
+        // W17: a stepper's value text is host-derived from `.value` (see
+        // `NumericStepper.setValue`), and a segmented control's segment
+        // labels (W19: same for Tabs) are set once at creation with no v1
+        // API to change them afterward -- not an error, just doesn't apply,
+        // same precedent as Container/ProgressBar/Slider/Divider here.
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => false,
+    };
+    self.mutex.unlock(call_io);
+
+    if (changed and slot.clay_managed) self.layout_generation +%= 1;
+    return true;
+}

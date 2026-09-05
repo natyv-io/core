@@ -15,6 +15,7 @@
 //! full "why not just set it once at creation" reasoning -- a Clay-managed
 //! Label starts with a zeroed rect until the first real layout pass runs).
 
+const std = @import("std");
 const c = @import("../c.zig").c;
 
 const Self = @This();
@@ -33,16 +34,18 @@ wrapped_width: i32 = -1,
 
 pub fn init(rect: c.SDL_FRect, initial_text: []const u8) Self {
     var self: Self = .{ .rect = rect };
-    self.setText(initial_text);
+    _ = self.setText(initial_text);
     return self;
 }
 
-pub fn setText(self: *Self, s: []const u8) void {
+pub fn setText(self: *Self, s: []const u8) bool {
     const n = @min(s.len, max_text_len);
+    if (self.len == n and std.mem.eql(u8, self.buf[0..n], s[0..n])) return false;
     @memcpy(self.buf[0..n], s[0..n]);
     self.buf[n] = 0;
     self.len = n;
     self.text_generation +%= 1;
+    return true;
 }
 
 pub fn text(self: *const Self) []const u8 {

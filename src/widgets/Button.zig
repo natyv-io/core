@@ -4,6 +4,7 @@
 //! via natyv_create_button), so it's owned in a fixed buffer rather than a
 //! static string literal.
 
+const std = @import("std");
 const c = @import("../c.zig").c;
 const timing = @import("../timing.zig");
 
@@ -47,16 +48,18 @@ focused: bool = false,
 
 pub fn init(rect: c.SDL_FRect, initial_label: []const u8) Self {
     var self: Self = .{ .rect = rect };
-    self.setLabel(initial_label);
+    _ = self.setLabel(initial_label);
     return self;
 }
 
-pub fn setLabel(self: *Self, s: []const u8) void {
+pub fn setLabel(self: *Self, s: []const u8) bool {
     const n = @min(s.len, max_label_len);
+    if (self.label_len == n and std.mem.eql(u8, self.label_buf[0..n], s[0..n])) return false;
     @memcpy(self.label_buf[0..n], s[0..n]);
     self.label_buf[n] = 0;
     self.label_len = n;
     self.text_generation +%= 1;
+    return true;
 }
 
 pub fn label(self: *const Self) []const u8 {

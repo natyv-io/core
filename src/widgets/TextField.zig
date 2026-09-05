@@ -4,6 +4,7 @@
 //! guest-supplied at creation; content is host-owned (typed by the user) but
 //! readable/settable by the guest via natyv_get_text/natyv_set_text.
 
+const std = @import("std");
 const c = @import("../c.zig").c;
 
 const Self = @This();
@@ -49,11 +50,13 @@ pub fn text(self: *const Self) []const u8 {
     return self.buf[0..self.len];
 }
 
-pub fn setText(self: *Self, s: []const u8) void {
+pub fn setText(self: *Self, s: []const u8) bool {
     const n = @min(s.len, max_len);
+    if (self.len == n and std.mem.eql(u8, self.buf[0..n], s[0..n])) return false;
     @memcpy(self.buf[0..n], s[0..n]);
     self.len = n;
     self.text_generation +%= 1;
+    return true;
 }
 
 pub fn clear(self: *Self) void {
