@@ -1048,6 +1048,27 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     const current_generation = widgets.currentGeneration(io);
     const dragging = wctx.interaction.dragging_slider_id != null;
     const warming_up = now_ms - wctx.created_at_ms < window_redraw_warmup_ms;
+    // Real, live-caught bug (2026-09-06): `needs_continuous_redraw` only
+    // ever reports whether a flash/Spinner animation is *still* active right
+    // now -- the one frame it transitions from active to expired (`now_ms`
+    // just crossed `flash_until_ms`) is exactly the frame this reports
+    // `false`, same as any ordinary idle frame. If nothing *else* also
+    // changes on that same frame, `needs_redraw` below evaluates false too,
+    // that transition frame gets skipped entirely, and the widget freezes
+    // showing its last mid-animation appearance (e.g. a Button stuck on its
+    // flash color) -- `needs_frequent_wake` (below) also goes false right
+    // then, so nothing forces another look until some unrelated later event
+    // happens to bump generation. Caught via the memory-reclamation spike's
+    // own recycle mechanism (`natyv_resume`'s widget mutation lands
+    // asynchronously from the worker thread, with no guarantee which exact
+    // main-loop wake it lines up with, so this one-frame gap was far more
+    // likely to actually get hit than during ordinary synchronous clicking)
+    // -- but the gap itself predates and has nothing to do with recycling;
+    // any Button click could in principle land on it. Fixed generically: a
+    // falling edge on `needs_continuous_redraw` (was true last call, false
+    // now) forces exactly one more redraw, so the animation's settled state
+    // always actually gets drawn.
+    const flash_or_spinner_just_ended = wctx.was_continuous_redraw and !needs_continuous_redraw;
     // A real Clay recompute this same iteration (scroll or resize, not just
     // content) writes fresh `rect`/`scroll_data` via `WidgetHost.setRect`/
     // `setScrollData` -- neither bumps `layout_generation` (see
@@ -1058,7 +1079,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     // ever since the very first draw-level dirty check landed (nothing here
     // ever exercised scrolling until now). `wctx.did_recompute` is set by
     // `layoutWindow`, called unconditionally right before this same call.
-    const needs_redraw = wctx.last_drawn_generation == null or wctx.last_drawn_generation.? != current_generation or dragging or needs_continuous_redraw or warming_up or wctx.did_recompute;
+    const needs_redraw = wctx.last_drawn_generation == null or wctx.last_drawn_generation.? != current_generation or dragging or needs_continuous_redraw or flash_or_spinner_just_ended or warming_up or wctx.did_recompute;
     // Set unconditionally, even when the redraw itself is about to be
     // skipped below -- `main.zig` reads this after every call to decide the
     // *next* iteration's wait mode, and needs it regardless of whether this
@@ -1074,6 +1095,10 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     // once the expiry case turned up, not caught live.
     const tooltip_pending = wctx.interaction.hover_start_ms != null and wctx.interaction.tooltip_active_for == null;
     wctx.needs_frequent_wake = needs_continuous_redraw or warming_up or tooltip_pending;
+    // Updated unconditionally too, same reasoning as `needs_frequent_wake`
+    // just above -- the *next* call needs this call's real value to detect
+    // its own falling edge, regardless of whether this call actually drew.
+    wctx.was_continuous_redraw = needs_continuous_redraw;
     if (!needs_redraw) return;
     wctx.last_drawn_generation = current_generation;
     wctx.draw_count += 1;

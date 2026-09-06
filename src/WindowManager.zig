@@ -117,6 +117,25 @@ pub const WindowContext = struct {
     /// reasoning and why a fixed timeout forever was the last real chunk of
     /// idle CPU left after the snapshot-rebuild-skip fix.
     needs_frequent_wake: bool = false,
+    /// `needs_continuous_redraw`'s own value as of the *previous*
+    /// `FrameLoop.drawWindow` call -- lets that function detect the exact
+    /// frame a Button's click-flash or Spinner animation transitions from
+    /// active to expired (`now_ms` just crossed `flash_until_ms`), which
+    /// `needs_redraw`'s other conditions can otherwise miss entirely: on
+    /// that transition frame, `needs_continuous_redraw` itself is already
+    /// `false` (the animation just ended), and if nothing else happens to
+    /// also change on that exact frame, the animation's own settled/
+    /// reverted appearance never gets drawn -- the widget visibly freezes
+    /// at its last mid-animation frame (e.g. a Button stuck showing its
+    /// flash color) until some unrelated later event forces a real redraw.
+    /// Real, live-caught bug (2026-09-06, natyv-core memory-reclamation
+    /// spike) -- `natyv_resume`'s own widget mutation lands asynchronously
+    /// from the worker thread, with no guarantee about which exact main-
+    /// loop wake it lines up with, so this exact one-frame gap was far more
+    /// likely to actually get hit than during ordinary synchronous clicking
+    /// (though the underlying gap in `drawWindow`'s redraw gate isn't
+    /// specific to recycling at all -- see that function's own doc comment).
+    was_continuous_redraw: bool = false,
 };
 
 /// Creates a real second OS window: `SDL_Window` + `SDL_Renderer` + (when
