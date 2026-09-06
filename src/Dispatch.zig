@@ -19,6 +19,7 @@ const c = @import("c.zig").c;
 const json_util = @import("json_util.zig");
 const EventQueue = @import("EventQueue.zig");
 const Runtime = @import("Runtime.zig");
+const process_memory = @import("process_memory.zig");
 
 /// `wake_event_type` is `main.zig`'s own `SDL_RegisterEvents(1)` result --
 /// pushed after every `natyv_dispatch` call below so the main thread's own
@@ -27,7 +28,38 @@ const Runtime = @import("Runtime.zig");
 /// event. `SDL_PushEvent` is documented safe to call from any thread
 /// (confirmed against SDL3's own header), so no `Io`/cross-thread
 /// synchronization is needed for this beyond the call itself.
-pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32) void {
+///
+/// Memory-reclamation, real trigger (2026-09-06) -- supersedes the
+/// original spike's fixed-dispatch-count stand-in. `recycle_threshold_mb`
+/// (sourced from `conf.natyv.json`'s `memory.recycle_threshold_mb`, see
+/// `Config.MemoryConfig`) is compared against real process RSS
+/// (`process_memory.residentSetSizeBytes`) after every dispatch, since
+/// guest code only ever runs inside a host-initiated call
+/// (`natyv_init`/`natyv_dispatch`/`natyv_checkpoint`/`natyv_resume`) --
+/// RSS structurally can't grow between dispatches, so this loop's own
+/// per-dispatch position is already the only place that needs checking, no
+/// separate timer thread required. `null` means no automatic recycling at
+/// all (checked first, before `runtime.can_recycle`, purely because it's
+/// the field most apps will actually leave unset) -- same fail-safe-off
+/// posture as every other capability in `Config.zig`. `Runtime.recycle`
+/// itself is still a no-op for any app that hasn't declared both
+/// `natyv_checkpoint`/`natyv_resume`, so `runtime.can_recycle` is checked
+/// too, before ever touching the RSS syscall -- a threshold configured
+/// against an app that can't actually recycle should cost nothing.
+const recycle_cooldown_dispatches: u32 = 3;
+
+pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32, recycle_threshold_mb: ?u32) void {
+    // Sits alongside the threshold check below, not exposed as its own
+    // `conf.natyv.json` field -- a rate limit protecting against thrashing,
+    // not a policy choice a dev needs to tune. Once a recycle fires, the
+    // RSS check is skipped for this many dispatches before resuming --
+    // without it, a threshold configured close to an app's own real
+    // post-resume floor would refire a real recycle (a force-close of
+    // every open TCP connection, ~30ms measured) on every single
+    // subsequent dispatch. Trade-off, stated plainly: RSS can drift above
+    // the configured threshold during the cooldown window -- this is a
+    // soft ceiling, not a hard one.
+    var recycle_cooldown_remaining: u32 = 0;
     while (true) {
         const event = queue.pop(io) orelse break;
         defer queue.freeEntry(event);
@@ -51,6 +83,39 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32) 
             std.debug.print("[dispatch] widget={d} type={s} -> {s}\n", .{ event.widget_id, @tagName(event.event_type), resp });
         }
 
+        // Between dispatches, same as every other nested host-function call
+        // in this codebase relies on -- see `Runtime.recycle`'s own doc
+        // comment for why this window is the safe one. Must run *before*
+        // the wake-event push below, not after: `natyv_resume` (called
+        // inside `recycle`) mutates widget state exactly the same way a
+        // normal dispatch handler does, and needs the same one wake-event
+        // to tell the main thread to notice it -- putting the push first
+        // (the original shape, before this was found live) leaves resume's
+        // own mutation with no wake-event of its own, since nothing pushes
+        // a second one afterward. Real, live-caught bug: a resumed
+        // instance's Label update and a Button's own click-flash revert
+        // could each silently miss their next redraw this way, since the
+        // draw-level dirty check gated on `layout_generation` (see
+        // `FrameLoop.drawWindow`'s own doc comment) only ever runs when
+        // *something* wakes the main thread's event wait in the first
+        // place -- not intermittently, but reliably wrong on every real
+        // recycle boundary regardless of what triggered it.
+        if (recycle_threshold_mb) |threshold_mb| {
+            if (runtime.can_recycle) {
+                if (recycle_cooldown_remaining > 0) {
+                    recycle_cooldown_remaining -= 1;
+                } else if (process_memory.residentSetSizeBytes(io)) |rss_bytes| {
+                    const threshold_bytes = @as(u64, threshold_mb) * 1024 * 1024;
+                    if (rss_bytes >= threshold_bytes) {
+                        runtime.recycle(io);
+                        recycle_cooldown_remaining = recycle_cooldown_dispatches;
+                    }
+                } else |err| {
+                    std.debug.print("[dispatch] RSS check failed: {}\n", .{err});
+                }
+            }
+        }
+
         // Wake the main thread's own SDL_WaitEventTimeout unconditionally,
         // regardless of the call above succeeding/failing/returning null --
         // even a failed handler can have mutated state before failing, and
@@ -58,9 +123,11 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32) 
         // possible mutations this guards: any natyv_create_*/natyv_set_*/
         // natyv_destroy_* host function the guest's own dispatch handler
         // calls nested inside natyv_dispatch itself (see this file's own
-        // top doc comment) -- the codebase's documented single-plugin-
-        // call-in-flight invariant means this is the only place any of
-        // those can happen from this thread, so this one push is complete.
+        // top doc comment), plus (see above) whatever `recycle` itself just
+        // did -- the codebase's documented single-plugin-call-in-flight
+        // invariant means this is the only place any of those can happen
+        // from this thread, so this one push, now placed after both,
+        // is complete.
         var wake_event: c.SDL_Event = std.mem.zeroes(c.SDL_Event);
         wake_event.type = wake_event_type;
         _ = c.SDL_PushEvent(&wake_event);

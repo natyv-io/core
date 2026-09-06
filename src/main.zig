@@ -220,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
     var queue = EventQueue.init(allocator);
     defer queue.deinit();
 
-    const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue, wake_event_type });
+    const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue, wake_event_type, config.value.memory.recycle_threshold_mb });
 
     // Multi-window: every open window's own real OS resources + per-window
     // frame state lives in this array -- `windows[0]` is always the original

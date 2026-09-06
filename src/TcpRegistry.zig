@@ -152,6 +152,15 @@ pub fn close(self: *Self, id: u32, io: Io) void {
 /// explicitly is the caller's job whenever an `Io` is actually in hand
 /// (e.g. right before dropping a `Runtime` while the app's own `Io` is
 /// still alive), not something `deinit` can do unconditionally.
+///
+/// Also the recycle path's own force-close point (`Runtime.recycle`) -- a
+/// guest's own handle to any open connection lived in its now-wiped linear
+/// memory regardless, so nothing is lost by never trying to preserve a live
+/// socket across a recycle. `id_to_index` is cleared here too (previously
+/// only `close`'s single-connection path did this) -- harmless when this
+/// only ever ran once at shutdown, but a real leak once it runs repeatedly:
+/// the registry is only `max_connections` (8) slots deep, so leaking one
+/// stale entry per recycle would exhaust it after 8 cycles.
 pub fn closeAll(self: *Self, io: Io) void {
     for (&self.slots) |*slot| {
         if (slot.*) |*conn| {
@@ -160,6 +169,7 @@ pub fn closeAll(self: *Self, io: Io) void {
         }
         slot.* = null;
     }
+    self.id_to_index.clearRetainingCapacity();
 }
 
 /// Frees `id_to_index`'s own backing memory -- the fixed-size `slots`/

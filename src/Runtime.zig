@@ -80,6 +80,19 @@ sqlite: ?SqliteCapability,
 tcp: ?TcpCapability = null,
 widgets: WidgetHost,
 plugin: ?*c.ExtismPlugin = null,
+/// The pre-compiled artifact `loadPlugin` builds via `extism_compiled_plugin_new`
+/// -- kept alive for the process's whole lifetime so `recycle` can cheaply
+/// re-instantiate from it (`extism_plugin_new_from_compiled`) without paying
+/// a full Cranelift re-JIT or re-registering the host-function array on
+/// every recycle. `null` only ever transiently, before the first `loadPlugin`
+/// call succeeds.
+compiled: ?*c.ExtismCompiledPlugin = null,
+/// Whether the loaded app implements both `natyv_checkpoint` and
+/// `natyv_resume` -- detected once, right after the first successful
+/// `loadPlugin`. Both are required, not either: an app implementing only
+/// one is a real, silent misconfiguration otherwise. An app implementing
+/// neither simply never gets recycled -- `recycle` is a no-op in that case.
+can_recycle: bool = false,
 
 pub const Error = SqliteCapability.Error || error{PluginLoadFailed};
 
@@ -114,6 +127,7 @@ pub fn enableNetwork(self: *Self, allowed_sockets: []const Config.AllowedSocket)
 
 pub fn deinit(self: *Self) void {
     if (self.plugin) |p| c.extism_plugin_free(p);
+    if (self.compiled) |cp| c.extism_compiled_plugin_free(cp);
     if (build_options.sqlite_enabled) {
         if (self.sqlite) |*s| s.close();
     }
@@ -131,6 +145,12 @@ pub fn deinit(self: *Self) void {
 /// Plain widget-kind registration (`widgets.registerInto` below) is always
 /// unconditional -- widgets are declarative purely through `.ntx` tag use,
 /// no separate per-app opt-in (confirmed decision, 2026-08-29).
+///
+/// Builds the host-function array and manifest once, then goes through
+/// `extism_compiled_plugin_new` + `extism_plugin_new_from_compiled` rather
+/// than a single `extism_plugin_new` call -- the same compiled artifact this
+/// produces (`self.compiled`) is what `recycle` below re-instantiates from
+/// cheaply, with no re-JIT and no re-registering the host-function array.
 pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enabled: bool) Error!void {
     var funcs: [max_host_functions]?*const c.ExtismFunction = undefined;
     var n: usize = 0;
@@ -152,12 +172,23 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
     defer self.allocator.free(manifest_json);
 
     var errmsg: [*c]u8 = null;
-    self.plugin = c.extism_plugin_new(manifest_json.ptr, manifest_json.len, &funcs[0], n, true, &errmsg);
+    self.compiled = c.extism_compiled_plugin_new(manifest_json.ptr, manifest_json.len, &funcs[0], n, true, &errmsg);
+    if (self.compiled == null) {
+        std.debug.print("[runtime] failed to compile plugin: {s}\n", .{errmsg});
+        return error.PluginLoadFailed;
+    }
+    c.extism_plugin_new_error_free(errmsg);
+
+    errmsg = null;
+    self.plugin = c.extism_plugin_new_from_compiled(self.compiled, &errmsg);
     if (self.plugin == null) {
         std.debug.print("[runtime] failed to create plugin: {s}\n", .{errmsg});
         return error.PluginLoadFailed;
     }
     c.extism_plugin_new_error_free(errmsg);
+
+    self.can_recycle = c.extism_plugin_function_exists(self.plugin, "natyv_checkpoint") and
+        c.extism_plugin_function_exists(self.plugin, "natyv_resume");
 }
 
 /// Calls a guest export by name and returns its output bytes on success, or
@@ -170,6 +201,14 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
 /// and the C ABI callback has no other way to receive one. See
 /// `widgets/WidgetHost.zig`'s doc comment for the full invariant.
 pub fn call(self: *Self, io: Io, name: [:0]const u8, payload: []const u8) ?[]const u8 {
+    return self.callOn(io, self.plugin, name, payload);
+}
+
+/// `call`'s real implementation, generalized to target an explicit plugin
+/// pointer rather than always `self.plugin` -- needed by `recycle` below,
+/// whose safe window briefly has two live instances (the old one, still
+/// `self.plugin`, and a new one not yet swapped in).
+fn callOn(self: *Self, io: Io, plugin: ?*c.ExtismPlugin, name: [:0]const u8, payload: []const u8) ?[]const u8 {
     self.widgets.current_io = io;
     defer self.widgets.current_io = null;
     if (self.tcp) |*tcp| tcp.current_io = io;
@@ -178,15 +217,15 @@ pub fn call(self: *Self, io: Io, name: [:0]const u8, payload: []const u8) ?[]con
     };
 
     const start = timing.nowMs();
-    const rc = c.extism_plugin_call(self.plugin, name.ptr, payload.ptr, payload.len);
+    const rc = c.extism_plugin_call(plugin, name.ptr, payload.ptr, payload.len);
     const elapsed = timing.nowMs() - start;
     if (rc != 0) {
-        const err = c.extism_plugin_error(self.plugin);
+        const err = c.extism_plugin_error(plugin);
         std.debug.print("[runtime] {s} FAILED after {d}ms: {s}\n", .{ name, elapsed, err });
         return null;
     }
-    const len = c.extism_plugin_output_length(self.plugin);
-    const data = c.extism_plugin_output_data(self.plugin);
+    const len = c.extism_plugin_output_length(plugin);
+    const data = c.extism_plugin_output_data(plugin);
     std.debug.print("[runtime] {s} ok ({d}ms)\n", .{ name, elapsed });
     return data[0..len];
 }
@@ -197,4 +236,59 @@ pub fn call(self: *Self, io: Io, name: [:0]const u8, payload: []const u8) ?[]con
 /// simply reports that export as missing, treated as "nothing to build").
 pub fn initGuest(self: *Self, io: Io) void {
     _ = self.call(io, "natyv_init", "");
+}
+
+/// Checkpoints the live guest instance, builds a fresh one from the same
+/// compiled artifact (`self.compiled`, see `loadPlugin`), resumes it, and
+/// only on success swaps it in -- never destroy-then-create, since the
+/// alternative failure mode is zero live guest instances mid-process. A
+/// no-op if the app never declared both `natyv_checkpoint`/`natyv_resume`
+/// (see `can_recycle`), or if any step fails -- a failure keeps the current
+/// instance running untouched and just logs, matching this being a
+/// manually-triggered spike mechanism, not a policy that must never fail.
+///
+/// Must be called only between dispatches (see `Dispatch.zig`'s trigger
+/// hook) -- the same single-call-in-flight window every other nested
+/// host-function call in this codebase already relies on.
+pub fn recycle(self: *Self, io: Io) void {
+    if (!self.can_recycle) return;
+
+    const checkpoint_raw = self.call(io, "natyv_checkpoint", "") orelse {
+        std.debug.print("[runtime] recycle: natyv_checkpoint failed, keeping current instance\n", .{});
+        return;
+    };
+    // Duped immediately, before touching anything else -- `checkpoint_raw`
+    // borrows the old plugin's own output buffer, and creating the new
+    // instance next is exactly the kind of intervening extism_plugin_call
+    // this borrow has never before had to survive. See the plan's own
+    // correctness note on this.
+    const checkpoint = self.allocator.dupe(u8, checkpoint_raw) catch {
+        std.debug.print("[runtime] recycle: OOM duping checkpoint, keeping current instance\n", .{});
+        return;
+    };
+    defer self.allocator.free(checkpoint);
+
+    var errmsg: [*c]u8 = null;
+    const new_plugin = c.extism_plugin_new_from_compiled(self.compiled, &errmsg);
+    if (new_plugin == null) {
+        std.debug.print("[runtime] recycle: failed to create new instance: {s}\n", .{errmsg});
+        return;
+    }
+    c.extism_plugin_new_error_free(errmsg);
+
+    if (self.callOn(io, new_plugin, "natyv_resume", checkpoint) == null) {
+        std.debug.print("[runtime] recycle: natyv_resume failed on new instance, discarding it\n", .{});
+        c.extism_plugin_free(new_plugin);
+        return;
+    }
+
+    // The new instance is proven live -- only now is it safe to tear down
+    // the old one and force-close whatever TCP connections it held (its own
+    // handles to them lived in its now-wiped linear memory regardless).
+    const old_plugin = self.plugin;
+    self.plugin = new_plugin;
+    if (old_plugin) |p| c.extism_plugin_free(p);
+    if (self.tcp) |*tcp| tcp.registry.closeAll(io);
+
+    std.debug.print("[runtime] recycle: swapped to a fresh guest instance\n", .{});
 }
