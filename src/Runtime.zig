@@ -26,6 +26,7 @@ const Manifest = @import("Manifest.zig");
 const Config = @import("Config");
 const SqliteCapability = @import("capabilities/Sqlite.zig");
 const TcpCapability = @import("capabilities/Tcp.zig");
+const PersistCapability = @import("capabilities/Persist.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const json_util = @import("json_util.zig");
 // L1: Clay's own arena/BeginLayout/EndLayout lifecycle isn't wired into the
@@ -63,7 +64,7 @@ const Bindings = @import("Bindings");
 
 const Self = @This();
 
-const max_host_functions = SqliteCapability.host_function_count + TcpCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
+const max_host_functions = SqliteCapability.host_function_count + TcpCapability.host_function_count + PersistCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
 
 allocator: std.mem.Allocator,
 /// `null` when conf.natyv.json's `sqlite.enabled` is false -- no connection
@@ -78,6 +79,12 @@ sqlite: ?SqliteCapability,
 /// `init`'s ~60 existing call sites across `RuntimeTest.zig` would
 /// otherwise need updating for a capability none of them actually test.
 tcp: ?TcpCapability = null,
+/// Host-owned persisted state backing the Go SDK's `natyv.Persisted[T]` --
+/// always on, like `widgets`, not gated behind a config flag the way
+/// `sqlite`/`tcp` are: this is core SDK machinery every app can reach for,
+/// not an opt-in capability. See `capabilities/Persist.zig`'s own doc
+/// comment for the full design.
+persist: PersistCapability,
 widgets: WidgetHost,
 plugin: ?*c.ExtismPlugin = null,
 /// The pre-compiled artifact `loadPlugin` builds via `extism_compiled_plugin_new`
@@ -109,7 +116,12 @@ pub fn init(allocator: std.mem.Allocator, db_path: ?[:0]const u8) Error!Self {
         (if (db_path) |path| try SqliteCapability.open(allocator, path) else null)
     else
         null;
-    return .{ .allocator = allocator, .sqlite = sqlite, .widgets = .{ .allocator = allocator } };
+    return .{
+        .allocator = allocator,
+        .sqlite = sqlite,
+        .persist = PersistCapability.init(allocator),
+        .widgets = .{ .allocator = allocator },
+    };
 }
 
 /// Sets up the `tcp` capability (`tcp_connect`/`tcp_read`/`tcp_write`/
@@ -132,6 +144,7 @@ pub fn deinit(self: *Self) void {
         if (self.sqlite) |*s| s.close();
     }
     if (self.tcp) |*tcp| tcp.deinit();
+    self.persist.deinit();
     self.widgets.deinit();
 }
 
@@ -158,6 +171,7 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
         if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
     }
     if (self.tcp) |*tcp| n += tcp.registerInto(funcs[n..]);
+    n += self.persist.registerInto(funcs[n..]);
     n += self.widgets.registerInto(funcs[n..]);
     if (clay_enabled) n += self.widgets.registerClayInto(funcs[n..]);
     // `[]?*anyopaque`, not `[]?*const c.ExtismFunction` -- see

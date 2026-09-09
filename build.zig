@@ -462,6 +462,15 @@ pub fn build(b: *std.Build) void {
     tls_tests.root_module.linkLibrary(mbedtls_dep.artifact("mbedtls"));
     const run_tls_tests = b.addRunArtifact(tls_tests);
 
+    const persist_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/PersistStore.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_persist_tests = b.addRunArtifact(persist_tests);
+
     const drawbatcher_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/DrawBatcher.zig"),
@@ -548,6 +557,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mbedtls_smoke_tests.step);
     test_step.dependOn(&run_tcp_tests.step);
     test_step.dependOn(&run_tls_tests.step);
+    test_step.dependOn(&run_persist_tests.step);
     test_step.dependOn(&run_drawbatcher_tests.step);
     test_step.dependOn(&run_scrollclip_tests.step);
     test_step.dependOn(&run_scrollbar_tests.step);
