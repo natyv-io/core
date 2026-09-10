@@ -229,7 +229,16 @@ pub fn main(init: std.process.Init) !void {
     // than as a special case. Every window after it is opened/closed by a
     // guest's own `natyv_clay_create_window`/`natyv_destroy_window` calls,
     // drained from `WidgetHost`'s pending queues each frame below.
-    var windows: [WindowManager.max_open_windows]WindowManager.WindowContext = undefined;
+    // Heap-allocated (once, here, freed on return) for the same reason
+    // `per_window_slots`/`widget_snapshot` below now are: `WindowContext`
+    // itself grew large enough to blow the main thread's stack across 8
+    // of them once `DrawBatcher.max_colors`'s own 2026-09-07 bump (8 -> 32,
+    // see that constant's own doc comment) made its `rects` field
+    // meaningfully bigger -- a second real, live-reproduced segfault from
+    // the same root class (a big struct multiplied by max_open_windows,
+    // stack-local), caught the same way.
+    const windows = try allocator.alloc(WindowManager.WindowContext, WindowManager.max_open_windows);
+    defer allocator.free(windows);
     var window_count: usize = 0;
     windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, null);
     window_count += 1;
@@ -248,8 +257,16 @@ pub fn main(init: std.process.Init) !void {
     // both this frame's event dispatch and its draw pass -- same "declared
     // once before the loop, reused every frame" precedent the original
     // single-window body's own `widget_snapshot`/`clip_rects`/`is_floating`
-    // locals already set.
-    var per_window_slots: [WindowManager.max_open_windows][max_widgets_on_screen]WidgetHost.Slot = undefined;
+    // locals already set. Heap-allocated (once, here, freed on return) since
+    // `max_widgets`'s 2026-09-07 bump (192 -> 2048, see that constant's own
+    // doc comment): a `[8][2048]Slot` stack-local blew the main thread's
+    // stack the moment this function was entered, a real, live-reproduced
+    // segfault -- confirmed at exactly this bump, not present at 192. Still
+    // exactly one allocation for this function's entire lifetime, not a
+    // per-frame cost, so this doesn't reintroduce the per-frame allocation
+    // this whole arc has otherwise avoided.
+    const per_window_slots = try allocator.alloc([max_widgets_on_screen]WidgetHost.Slot, WindowManager.max_open_windows);
+    defer allocator.free(per_window_slots);
     var per_window_slot_count: [WindowManager.max_open_windows]usize = [_]usize{0} ** WindowManager.max_open_windows;
     var per_window_is_floating: [WindowManager.max_open_windows][max_widgets_on_screen]bool = undefined;
     var per_window_topmost_modal: [WindowManager.max_open_windows]?u32 = [_]?u32{null} ** WindowManager.max_open_windows;
@@ -259,8 +276,10 @@ pub fn main(init: std.process.Init) !void {
     // reason `per_window_slots` already is: `needsSnapshotRebuild` below can
     // skip recomputing it on a genuinely idle iteration, and a skipped
     // iteration must see the previous iteration's still-valid data, not
-    // `undefined`.
-    var widget_snapshot: [max_widgets_on_screen]WidgetHost.Slot = undefined;
+    // `undefined`. Heap-allocated for the same reason `per_window_slots`
+    // just above now is.
+    const widget_snapshot = try allocator.alloc(WidgetHost.Slot, max_widgets_on_screen);
+    defer allocator.free(widget_snapshot);
     var widget_count: usize = 0;
     // The `layout_generation` this snapshot was last rebuilt against --
     // `null` until the first real rebuild. See `needsSnapshotRebuild`.
@@ -324,7 +343,7 @@ pub fn main(init: std.process.Init) !void {
             for (teardown_ids[0..teardown_n]) |wid| {
                 if (findWindowIndexByRoot(windows[0..window_count], wid)) |idx| {
                     WindowManager.destroyWindowContext(&windows[idx], allocator);
-                    removeWindow(&windows, &window_count, idx);
+                    removeWindow(windows, &window_count, idx);
                 }
             }
 
@@ -390,8 +409,8 @@ pub fn main(init: std.process.Init) !void {
         // specifically so a skipped iteration correctly reuses the previous
         // one's still-valid data instead of stale-but-uninitialized memory.
         if (needsSnapshotRebuild(&runtime.widgets, io, windows[0..window_count], last_snapshot_generation)) {
-            FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
-            widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
+            FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font, widget_snapshot);
+            widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
             last_snapshot_generation = runtime.widgets.currentGeneration(io);
         }
 
@@ -500,8 +519,8 @@ pub fn main(init: std.process.Init) !void {
             // a real event doesn't always mean something snapshot-relevant
             // actually changed (e.g. a plain hover-only mouse move).
             if (needsSnapshotRebuild(&runtime.widgets, io, windows[0..window_count], last_snapshot_generation)) {
-                FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font);
-                widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], &widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
+                FrameLoop.syncAllWindowText(&runtime.widgets, io, windows[0..window_count], default_font.font, widget_snapshot);
+                widget_count = FrameLoop.rebuildFrameSnapshot(&runtime.widgets, io, windows[0..window_count], widget_snapshot, per_window_slots[0..window_count], per_window_slot_count[0..window_count], per_window_is_floating[0..window_count], per_window_topmost_modal[0..window_count]);
                 last_snapshot_generation = runtime.widgets.currentGeneration(io);
             }
         }

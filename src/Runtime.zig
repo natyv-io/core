@@ -264,12 +264,21 @@ pub fn initGuest(self: *Self, io: Io) void {
 /// Must be called only between dispatches (see `Dispatch.zig`'s trigger
 /// hook) -- the same single-call-in-flight window every other nested
 /// host-function call in this codebase already relies on.
-pub fn recycle(self: *Self, io: Io) void {
-    if (!self.can_recycle) return;
+///
+/// Returns whether the swap actually happened -- `Dispatch.zig`'s own
+/// caller uses this to decide whether to push a synthetic wake dispatch
+/// (see its own doc comment for why: a widget revealed from inside the
+/// same natyv_resume call that built it can render with no visible style,
+/// so the newly-resumed instance's own pending region reveals need a
+/// genuinely separate, later real natyv_dispatch call to settle correctly
+/// -- pushing one automatically means the user never has to be the one to
+/// provide it by moving the mouse or clicking something).
+pub fn recycle(self: *Self, io: Io) bool {
+    if (!self.can_recycle) return false;
 
     const checkpoint_raw = self.call(io, "natyv_checkpoint", "") orelse {
         std.debug.print("[runtime] recycle: natyv_checkpoint failed, keeping current instance\n", .{});
-        return;
+        return false;
     };
     // Duped immediately, before touching anything else -- `checkpoint_raw`
     // borrows the old plugin's own output buffer, and creating the new
@@ -278,7 +287,7 @@ pub fn recycle(self: *Self, io: Io) void {
     // correctness note on this.
     const checkpoint = self.allocator.dupe(u8, checkpoint_raw) catch {
         std.debug.print("[runtime] recycle: OOM duping checkpoint, keeping current instance\n", .{});
-        return;
+        return false;
     };
     defer self.allocator.free(checkpoint);
 
@@ -286,14 +295,15 @@ pub fn recycle(self: *Self, io: Io) void {
     const new_plugin = c.extism_plugin_new_from_compiled(self.compiled, &errmsg);
     if (new_plugin == null) {
         std.debug.print("[runtime] recycle: failed to create new instance: {s}\n", .{errmsg});
-        return;
+        return false;
     }
     c.extism_plugin_new_error_free(errmsg);
 
-    if (self.callOn(io, new_plugin, "natyv_resume", checkpoint) == null) {
+    const resume_result = self.callOn(io, new_plugin, "natyv_resume", checkpoint);
+    if (resume_result == null) {
         std.debug.print("[runtime] recycle: natyv_resume failed on new instance, discarding it\n", .{});
         c.extism_plugin_free(new_plugin);
-        return;
+        return false;
     }
 
     // The new instance is proven live -- only now is it safe to tear down
@@ -304,5 +314,6 @@ pub fn recycle(self: *Self, io: Io) void {
     if (old_plugin) |p| c.extism_plugin_free(p);
     if (self.tcp) |*tcp| tcp.registry.closeAll(io);
 
-    std.debug.print("[runtime] recycle: swapped to a fresh guest instance\n", .{});
+    std.debug.print("[runtime] recycle: swapped to a fresh guest instance, t={d}ms\n", .{c.SDL_GetTicks()});
+    return true;
 }

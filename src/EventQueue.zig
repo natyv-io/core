@@ -79,6 +79,10 @@ pub const Entry = struct {
     /// event, not just modal-related ones, so a future surface kind
     /// (NativeWindow) needs no wire-contract change.
     surface_id: u32 = 0,
+    /// Stamped from the queue's own `generation` at push time -- see
+    /// `bumpGeneration`'s own doc comment for why this exists and what
+    /// `pop` does with it.
+    generation: u32 = 0,
 };
 
 allocator: std.mem.Allocator,
@@ -87,6 +91,12 @@ cond: Io.Condition = .init,
 items: std.ArrayList(Entry) = .empty,
 seq_counter: u32 = 0,
 shutdown: bool = false,
+/// Bumped by `bumpGeneration` after every real recycle -- see its own doc
+/// comment. Every entry still sitting in the queue (or arriving from the
+/// main thread microseconds later, mid-recycle) at that point was stamped
+/// with an older value at push time, and `pop` silently discards rather
+/// than returns it.
+generation: u32 = 0,
 
 pub fn init(allocator: std.mem.Allocator) Self {
     return .{ .allocator = allocator };
@@ -137,7 +147,7 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
     self.seq_counter += 1;
     const seq = self.seq_counter;
 
-    self.items.append(self.allocator, .{ .widget_id = widget_id, .event_type = event_type, .payload = owned, .seq = seq, .surface_id = surface_id }) catch |err| {
+    self.items.append(self.allocator, .{ .widget_id = widget_id, .event_type = event_type, .payload = owned, .seq = seq, .surface_id = surface_id, .generation = self.generation }) catch |err| {
         std.debug.print("[queue]  DROPPED push, alloc failed: {}\n", .{err});
         self.allocator.free(owned);
         return;
@@ -149,11 +159,42 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
 pub fn pop(self: *Self, io: Io) ?Entry {
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
-    while (self.items.items.len == 0) {
-        if (self.shutdown) return null;
-        self.cond.waitUncancelable(io, &self.mutex);
+    while (true) {
+        while (self.items.items.len == 0) {
+            if (self.shutdown) return null;
+            self.cond.waitUncancelable(io, &self.mutex);
+        }
+        const entry = self.items.orderedRemove(0);
+        if (entry.generation != self.generation) {
+            // Stale -- queued before the most recent recycle. See
+            // bumpGeneration's own doc comment for why silently discarding
+            // this (instead of returning it for dispatch against an id
+            // that no longer exists on the freshly-rebuilt instance) is
+            // correct, not a data loss.
+            self.allocator.free(entry.payload);
+            continue;
+        }
+        return entry;
     }
-    return self.items.orderedRemove(0);
+}
+
+/// Marks every entry currently queued (or arriving from the main thread
+/// microseconds from now, mid-recycle) as stale -- called by `Dispatch.zig`
+/// right after a real recycle swap completes. A recycle rebuilds the
+/// entire widget tree with fresh ids; an event queued *before* it, whether
+/// already sitting in the queue or pushed while `natyv_resume` was still
+/// running (a real, ~1-second-plus window -- more than enough time for a
+/// genuine, real user click to land in it), carries an old id that means
+/// nothing dispatched against the new instance. Confirmed live: such a
+/// click previously looked indistinguishable from "nothing happened" --
+/// the dispatch itself succeeded, silently no-opping against a guest-side
+/// handler map that has nothing registered for that now-meaningless id.
+/// `pop` is what actually discards a stale entry, using the generation
+/// this stamps going forward; nothing already popped is affected.
+pub fn bumpGeneration(self: *Self, io: Io) void {
+    self.mutex.lockUncancelable(io);
+    defer self.mutex.unlock(io);
+    self.generation +%= 1;
 }
 
 pub fn requestShutdown(self: *Self, io: Io) void {

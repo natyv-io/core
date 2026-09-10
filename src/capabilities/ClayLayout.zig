@@ -214,6 +214,21 @@ recompute_count: usize = 0,
 /// layoutIfNeeded's deltaTime comment). `null` before the first recompute.
 last_recompute_ms: ?i64 = null,
 
+/// `layoutIfNeeded`'s own scratch snapshot buffers -- heap-allocated once
+/// here (this window's whole lifetime), not per-call, and not stack-local
+/// locals inside `layoutIfNeeded` itself: `max_widgets`'s 2026-09-07 bump
+/// (192 -> 2048, see that constant's own doc comment) turned what used to
+/// be two small `[192]Slot` stack arrays into two ~350KB+ ones, and two of
+/// those declared inside one function blew the calling thread's stack the
+/// moment `layoutIfNeeded` was entered -- a real, live-reproduced segfault
+/// (`main.zig`'s own equivalent per-frame snapshot buffers hit the exact
+/// same class of crash, fixed the same way). Owned here rather than by the
+/// caller since `ClayLayout` is already the natural, per-window,
+/// allocate-once-reuse-forever home for this instance's own layout-pass
+/// scratch space -- matches `arena_memory` just above.
+full_snap_scratch: []WidgetHost.Slot,
+snap_scratch: []WidgetHost.Slot,
+
 pub fn init(allocator: std.mem.Allocator, window_w: f32, window_h: f32, default_font: *c.TTF_Font) !Self {
     // Defensive, not just symmetric with `deinit` below: if any previous
     // Clay lifecycle in this process (another ClayLayout instance, or
@@ -240,7 +255,10 @@ pub fn init(allocator: std.mem.Allocator, window_w: f32, window_h: f32, default_
         .userData = null,
     }) orelse return error.ClayInitializeFailed;
     c.Clay_SetMeasureTextFunction(measureText, default_font);
-    return .{ .arena_memory = memory, .context = context };
+    const full_snap_scratch = try allocator.alloc(WidgetHost.Slot, WidgetHost.max_widgets);
+    errdefer allocator.free(full_snap_scratch);
+    const snap_scratch = try allocator.alloc(WidgetHost.Slot, WidgetHost.max_widgets);
+    return .{ .arena_memory = memory, .context = context, .full_snap_scratch = full_snap_scratch, .snap_scratch = snap_scratch };
 }
 
 pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -248,6 +266,8 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     // memory it points into, so nothing after this call can dereference it.
     c.Clay_SetCurrentContext(null);
     allocator.free(self.arena_memory);
+    allocator.free(self.full_snap_scratch);
+    allocator.free(self.snap_scratch);
 }
 
 /// Recursively opens every Clay-managed widget in `slots` whose `parent_id`
@@ -543,20 +563,18 @@ pub fn layoutIfNeeded(self: *Self, widgets: *WidgetHost, io: Io, window_w: f32, 
     const resized = self.last_window_w == null or self.last_window_w.? != window_w or self.last_window_h.? != window_h;
     if (!content_changed and !scrolled and !resized) return null;
 
-    var full_snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
-    const full_n = widgets.snapshot(io, &full_snap);
-    const full = full_snap[0..full_n];
+    const full_n = widgets.snapshot(io, self.full_snap_scratch);
+    const full = self.full_snap_scratch[0..full_n];
     var subset_ids: [WidgetHost.max_widgets]u32 = undefined;
     const subset_n = FloatingOrder.windowSubset(full, window_root_id, &subset_ids);
-    var snap: [WidgetHost.max_widgets]WidgetHost.Slot = undefined;
     var n: usize = 0;
     for (full) |s| {
         if (containsId(subset_ids[0..subset_n], s.id)) {
-            snap[n] = s;
+            self.snap_scratch[n] = s;
             n += 1;
         }
     }
-    const slots = snap[0..n];
+    const slots = self.snap_scratch[0..n];
     // Built once per real recompute, shared by every `nearestScrollBoundary`
     // call and the parent-chain walks below -- see
     // `WidgetHost.SnapshotIndex`'s own doc comment.

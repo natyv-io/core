@@ -159,15 +159,42 @@ const Self = @This();
 /// created on demand) pushed clay-fixture's own natyv_init baseline to 94,
 /// which the W16 calendar-grid peak above (94 + ~60) then genuinely
 /// exceeded the old 128 cap with -- confirmed via a real `widget registry
-/// full` test failure, not assumed. Every other fixed-size array in the
-/// codebase keyed to widget count (DrawBatcher.zig, ClayLayout.zig's
-/// snapshot buffer, the expiry-cascade buffers below) derives from this one
-/// constant, so this is the only line that needs to change. Memory cost is
-/// trivial (a few more KB across small fixed-size arrays of small
-/// structs) -- a deliberate, explained bump per
-/// feedback_natyv_memory_efficiency's own "as new widgets/capabilities
-/// land" anticipation, not organic creep.
-pub const max_widgets = 192;
+/// full` test failure, not assumed.
+///
+/// Bumped again 2026-09-07, 192 -> 2048 -- mail-natyv's own real caching
+/// design (both Inbox and Sent kept alive simultaneously, for instant
+/// back-navigation, at a dev-adjustable page size up to 20) genuinely
+/// needs ~127 widgets per cached folder at that page size, ~262 for both
+/// at once -- confirmed via a real `widget registry full` failure live,
+/// root-caused with temporary per-create/destroy counting instrumentation
+/// that confirmed the registry's own create/destroy accounting was
+/// perfectly balanced throughout (never an actual leak), just genuinely
+/// short of room. 2048 leaves comfortable headroom above that real
+/// worst case (two folders at max page size, plus a message or compose
+/// view open alongside, plus a recycle's own make-before-break swap
+/// transiently holding both the old and new subtree at once -- see
+/// region.Registry.Restore) without chasing the exact number precisely.
+/// A real, more thorough fix -- making the registry (and every other
+/// fixed-size array keyed to this constant) grow dynamically instead of
+/// carrying any fixed ceiling at all -- was scoped and deliberately
+/// deferred: `max_widgets` also sizes per-frame render-loop scratch
+/// buffers across main.zig/FrameLoop.zig/ClayLayout.zig/DrawBatcher.zig/
+/// WindowManager.zig, not just this file's own `slots` -- a genuinely
+/// large, cross-cutting refactor of the render loop's core data flow, not
+/// a one-line change. This bump is the deliberate, lower-risk interim
+/// fix; the dynamic-growth version is future work, not started.
+///
+/// Every other fixed-size array in the codebase keyed to widget count
+/// (DrawBatcher.zig, ClayLayout.zig's snapshot buffer, main.zig/
+/// FrameLoop.zig's own per-frame snapshot buffers, WindowManager.zig's
+/// scroll tracking, the expiry-cascade buffers below) derives from this
+/// one constant, so this is the only line that needs to change. Memory
+/// cost is still trivial in absolute terms even at 2048 (each array here
+/// is small primitives or a modest struct; the whole set sums to well
+/// under a few MB) against this app's own real tens-of-MB baseline -- a
+/// deliberate, explained bump per feedback_natyv_memory_efficiency's own
+/// "as new widgets/capabilities land" anticipation, not organic creep.
+pub const max_widgets = 2048;
 // button/textfield/label create, set_text, get_text, destroy_widget (6) +
 // checkbox/radio_button/progress_bar create (3) + get_checked/set_checked/
 // get_value/set_value (4) -- W1 widget breadth. + slider create (1) -- W3.
@@ -198,7 +225,15 @@ pub const max_widgets = 192;
 // + natyv_set_style (1) -- Styling system Stage 2, generic per-slot
 // resolved-style application, same "guest-composed, no new WidgetKind"
 // reasoning as natyv_set_visible/natyv_set_size.
-pub const host_function_count = 28;
+// + natyv_destroy_children (1) -- the rebuildable-region primitive:
+// destroys every current descendant of a widget while keeping the widget
+// itself alive, generic and unrelated to any WidgetKind, same "always
+// registered" reasoning as natyv_destroy_widget above.
+// + natyv_destroy_children_except (1) -- the make-before-break region-swap
+// primitive: same as natyv_destroy_children, but spares one named child's
+// own subtree too, so a freshly-built replacement can be revealed before
+// the previous content is torn down instead of after.
+pub const host_function_count = 30;
 
 pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner };
 pub const Widget = union(WidgetKind) {
@@ -597,7 +632,7 @@ pub fn isEffectivelyVisible(slots: []const Slot, index: SnapshotIndex, slot: Slo
 
 /// Fixed-capacity, allocation-free id -> `Slot` lookup over a snapshot slice
 /// (`[]const Slot`) -- distinct from `id_to_index` above, which only ever
-/// indexes the *live* registry's own `self.slots`, never a copied-out
+/// indexes the *live* registry's own `self.slots.items`, never a copied-out
 /// snapshot handed around by value. `isEffectivelyVisible` above and
 /// `FloatingOrder.zig`/`ScrollClip.zig`/`ClayLayout.zig`'s own ancestor-walk
 /// helpers all used to re-scan the whole snapshot slice linearly on every
@@ -616,22 +651,36 @@ pub fn isEffectivelyVisible(slots: []const Slot, index: SnapshotIndex, slot: Slo
 /// even when every slot is live at once, keeping the average probe chain
 /// short.
 pub const SnapshotIndex = struct {
-    // Coupled to `max_widgets` (192) the same way DrawBatcher/ClayLayout's
-    // own snapshot buffers already are -- comfortably above it (~0.375 load
+    // Coupled to `max_widgets` (2048, bumped 2026-09-07 -- see that
+    // constant's own doc comment) the same way DrawBatcher/ClayLayout's own
+    // snapshot buffers already are -- comfortably above it (~0.25 load
     // factor at the hard cap) so probe chains stay short. If `max_widgets`
-    // is ever bumped again (it's been bumped twice already), revisit this
+    // is ever bumped again (it's been bumped three times now), revisit this
     // alongside it.
-    const capacity = 512;
+    const capacity = 8192;
     const empty: u32 = std.math.maxInt(u32);
 
     slot_of: [capacity]u32 = [_]u32{empty} ** capacity,
 
+    /// Bounded to at most `capacity` probes, matching `find`'s own existing
+    /// bound below -- `slots.len` can never actually exceed `capacity` in
+    /// practice (both are ultimately sized off the same `max_widgets`), but
+    /// this closes what would otherwise be a real infinite loop if it ever
+    /// did (every slot fills, no empty one is ever found), rather than
+    /// relying on that invariant silently holding forever. An entry that
+    /// can't be placed (table genuinely full) is simply left unindexed --
+    /// `find` then reports it as not present, the same safe degradation
+    /// `queuePendingTextDestroy` already accepts elsewhere in this file,
+    /// not a crash or hang.
     pub fn build(slots: []const Slot) SnapshotIndex {
         var self: SnapshotIndex = .{};
         for (slots, 0..) |slot, i| {
             var probe = slot.id & (capacity - 1);
-            while (self.slot_of[probe] != empty) : (probe = (probe + 1) & (capacity - 1)) {}
-            self.slot_of[probe] = @intCast(i);
+            var probes: usize = 0;
+            while (self.slot_of[probe] != empty and probes < capacity) : (probes += 1) {
+                probe = (probe + 1) & (capacity - 1);
+            }
+            if (probes < capacity) self.slot_of[probe] = @intCast(i);
         }
         return self;
     }
@@ -653,7 +702,30 @@ pub const SnapshotIndex = struct {
 
 allocator: std.mem.Allocator,
 mutex: Io.Mutex = .init,
-slots: [max_widgets]?Slot = [_]?Slot{null} ** max_widgets,
+/// Heap-allocated, growable -- was a fixed `[max_widgets]?Slot` array
+/// until 2026-09-07. `WidgetHost` is embedded *by value* inside `Runtime`,
+/// which is itself a stack-local in main.zig (`var runtime = try
+/// Runtime.init(...)`) and gets constructed-and-returned-by-value inside
+/// `Runtime.init` itself -- so a fixed array here means `Runtime`'s own
+/// size (and every other place that embeds or returns a `WidgetHost`/
+/// `Runtime` by value) scales directly with `max_widgets`. Real,
+/// live-reproduced consequence: `max_widgets`'s own bump (192 -> 2048, see
+/// that constant's own doc comment) turned a small, harmless embedded
+/// array into a large one and produced a real cascade of stack-overflow
+/// segfaults across unrelated call sites (`main.zig`'s own per-frame
+/// scratch buffers, then its `windows` array once `DrawBatcher` also grew,
+/// then `Runtime.init` itself) -- fixing each embedding site
+/// one-by-one wasn't converging, since `WidgetHost`/`Runtime` are embedded
+/// or passed by value in more places than could be found by inspection
+/// alone. Making `slots` itself heap-backed fixes this at the root:
+/// `WidgetHost`'s own size (and therefore `Runtime`'s) no longer depends
+/// on `max_widgets` at all, regardless of how many places embed either by
+/// value. `max_widgets` itself is unchanged as a named constant (still
+/// used as a scratch-buffer size in tests, and as an initial-growth
+/// reference) but is no longer a hard ceiling `slots` can hit -- growth is
+/// governed entirely by `insertLockedWithLayout`'s own free-slot-scan-then-
+/// append logic below.
+slots: std.ArrayListUnmanaged(?Slot) = .empty,
 next_id: u32 = 1,
 /// id -> index into `slots`, kept in sync at every real site a slot ever
 /// gets assigned or freed (`insertLockedWithLayout`; `destroySubtreeLocked`,
@@ -665,7 +737,7 @@ next_id: u32 = 1,
 /// file for null-assignment sites, not the whole tree) and shipped a real,
 /// reproducible crash: `natyv_destroy_widget` nulled the slot without
 /// removing the map entry, so any later `findLocked` on that id found a
-/// stale index pointing at a `null` slot and panicked on `self.slots[idx].?`
+/// stale index pointing at a `null` slot and panicked on `self.slots.items[idx].?`
 /// -- caught by Quinn's own real click-through on `clay-fixture`, not by
 /// any unit test (every test exercised `destroySubtreeLocked`'s cascading
 /// path, never the everyday single-widget destroy the fixture's own
@@ -697,11 +769,15 @@ current_io: ?Io = null,
 /// destroy its `TTF_Text` right then and there -- `destroyWidgetHostFn`
 /// queues the pointer here instead, and `flushPendingTextDestroys` (called
 /// once per frame from `main.zig`, main thread) does the real
-/// `TTF_DestroyText` call. Sized for the worst case between two frames:
-/// every widget destroyed at once, times 2 (a TextField queues both its
-/// entered-text and placeholder objects).
-pending_text_destroys: [max_widgets * 2]?*c.TTF_Text = [_]?*c.TTF_Text{null} ** (max_widgets * 2),
-pending_text_destroy_count: usize = 0,
+/// `TTF_DestroyText` call. Heap-allocated, growable (was a fixed
+/// `[max_widgets * 2]` array until 2026-09-07, same "embedded by value
+/// inside WidgetHost/Runtime" stack-overflow reasoning as `slots` above)
+/// -- grows to whatever the worst case between two frames actually needs
+/// (every widget destroyed at once, times 2 for a TextField's entered-text
+/// and placeholder objects) and is reused via `clearRetainingCapacity`
+/// every frame rather than freed, so steady-state operation costs no
+/// further allocation once it's grown to its own real peak once.
+pending_text_destroys: std.ArrayListUnmanaged(?*c.TTF_Text) = .empty,
 /// Scroll-into-view: same cross-thread hand-off shape as
 /// `pending_text_destroys` above, for the same reason -- Clay's live scroll
 /// offset lives behind a single global, non-thread-safe C context
@@ -899,6 +975,10 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_destroy_widget", &in_types[0], 1, &out_types[0], 1, HostFunctions.destroyWidgetHostFn, self, null);
     n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_destroy_children", &in_types[0], 1, &out_types[0], 1, HostFunctions.destroyChildrenHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_destroy_children_except", &in_types[0], 1, &out_types[0], 1, HostFunctions.destroyChildrenExceptHostFn, self, null);
+    n += 1;
     // W1: generic non-text state accessors (bool/float) -- same "always
     // registered, nothing to gate" reasoning as set_text/get_text/
     // destroy_widget above (a guest can't get a widget_id to call these
@@ -1021,7 +1101,7 @@ pub fn insertLocked(self: *Self, widget: Widget) ?u32 {
 }
 
 fn insertLockedWithLayout(self: *Self, widget: Widget, parent_id: ?u32, clay_style: ClayStyle) ?u32 {
-    for (&self.slots, 0..) |*slot, idx| {
+    for (self.slots.items, 0..) |*slot, idx| {
         if (slot.* == null) {
             const id = self.next_id;
             self.next_id += 1;
@@ -1034,7 +1114,21 @@ fn insertLockedWithLayout(self: *Self, widget: Widget, parent_id: ?u32, clay_sty
             return id;
         }
     }
-    return null;
+    // No existing (destroyed-and-freed) slot to reuse -- grow the registry
+    // by one instead of failing. `slots` has no fixed ceiling of its own
+    // (see its own doc comment); this only returns null on a genuine
+    // allocation failure, matching the existing `id_to_index.put` failure
+    // convention just above.
+    const idx = self.slots.items.len;
+    self.slots.append(self.allocator, null) catch return null;
+    const id = self.next_id;
+    self.next_id += 1;
+    self.id_to_index.put(self.allocator, id, idx) catch {
+        self.slots.items.len -= 1;
+        return null;
+    };
+    self.slots.items[idx] = .{ .id = id, .widget = widget, .parent_id = parent_id, .clay_style = clay_style };
+    return id;
 }
 
 /// Locks, inserts a widget with explicit Clay parent/style data, and
@@ -1118,16 +1212,20 @@ pub fn setScrollData(self: *Self, call_io: Io, id: u32, data: ScrollBar.Data) vo
 /// only two places a slot is ever assigned or freed.
 pub fn findLocked(self: *Self, id: u32) ?*Slot {
     const idx = self.id_to_index.get(id) orelse return null;
-    return &(self.slots[idx].?);
+    return &(self.slots.items[idx].?);
 }
 
-/// Frees `id_to_index`'s own backing memory -- the fixed-size `slots`
-/// array needs no equivalent, but a hash map does. Not called anywhere
-/// yet (no `Runtime.deinit`-style teardown reaches `WidgetHost` today),
-/// wired in alongside this change so the leak-checked GPA in debug
-/// builds doesn't start reporting one the moment this map exists.
+/// Frees `id_to_index`/`slots`/`pending_text_destroys`'s own backing
+/// memory -- `slots` and `pending_text_destroys` only needed this once
+/// they became heap-backed (2026-09-07, see `slots`'s own doc comment).
+/// Not called anywhere yet (no `Runtime.deinit`-style teardown reaches
+/// `WidgetHost` today), wired in alongside this change so the
+/// leak-checked GPA in debug builds doesn't start reporting one the
+/// moment this state exists.
 pub fn deinit(self: *Self) void {
     self.id_to_index.deinit(self.allocator);
+    self.slots.deinit(self.allocator);
+    self.pending_text_destroys.deinit(self.allocator);
 }
 
 /// F3: creates/updates every button/textfield/label's cached `TTF_Text`
@@ -1153,7 +1251,7 @@ pub fn deinit(self: *Self) void {
 pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font: *c.TTF_Font, allowed_ids: []const u32) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
-    for (&self.slots) |*slot| {
+    for (self.slots.items) |*slot| {
         if (slot.*) |*s| {
             if (std.mem.indexOfScalar(u32, allowed_ids, s.id) == null) continue;
             switch (s.widget) {
@@ -1204,7 +1302,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
 pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
-    for (&self.slots) |*slot| {
+    for (self.slots.items) |*slot| {
         if (slot.*) |*s| {
             switch (s.widget) {
                 .button => |*b| b.destroyText(),
@@ -1246,7 +1344,7 @@ pub fn destroyExpiredWidgets(self: *Self, call_io: Io, now_ms: i64) void {
 
     var expired_roots: [max_widgets]u32 = undefined;
     var expired_count: usize = 0;
-    for (self.slots) |maybe_slot| {
+    for (self.slots.items) |maybe_slot| {
         if (maybe_slot) |s| {
             if (s.expires_at_ms) |exp| {
                 if (now_ms >= exp) {
@@ -1273,7 +1371,7 @@ pub fn destroyExpiredWidgets(self: *Self, call_io: Io, now_ms: i64) void {
 pub fn hasPendingExpiry(self: *Self, call_io: Io) bool {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
-    for (self.slots) |maybe_slot| {
+    for (self.slots.items) |maybe_slot| {
         if (maybe_slot) |s| {
             if (s.expires_at_ms != null) return true;
         }
@@ -1281,31 +1379,30 @@ pub fn hasPendingExpiry(self: *Self, call_io: Io) bool {
     return false;
 }
 
-/// Destroys `root_id` and every descendant reachable via `parent_id`.
-/// Two-phase deliberately -- collects the full set to destroy first
-/// (against still-fully-intact slot data), then destroys everything in a
-/// second pass. Doing it in one pass would risk nulling an ancestor's slot
-/// before a not-yet-visited descendant's own parent_id chain-walk reaches
-/// it, which would sever that walk early (`findLocked` on an
-/// already-nulled ancestor returns nothing) and wrongly leave a real
-/// descendant behind.
-fn destroySubtreeLocked(self: *Self, root_id: u32) void {
-    var to_destroy: [max_widgets]u32 = undefined;
+/// Collects every strict descendant of `root_id` (never `root_id` itself)
+/// reachable via `parent_id`, against still-fully-intact slot data --
+/// shared by `destroySubtreeLocked` (root + descendants) and
+/// `destroyDescendantsLocked` (descendants only, root kept alive), so
+/// both stay in sync with exactly one real traversal implementation.
+fn collectDescendantsLocked(self: *Self, root_id: u32, out: *[max_widgets]u32) usize {
     var count: usize = 0;
-    for (self.slots) |maybe_slot| {
+    for (self.slots.items) |maybe_slot| {
         if (maybe_slot) |s| {
             if (s.id != root_id and self.isDescendantLocked(s.id, root_id)) {
-                to_destroy[count] = s.id;
+                out[count] = s.id;
                 count += 1;
             }
         }
     }
-    to_destroy[count] = root_id;
-    count += 1;
+    return count;
+}
 
-    for (&self.slots) |*slot| {
+/// Destroys every id in `ids` -- shared final pass for both
+/// `destroySubtreeLocked` and `destroyDescendantsLocked`.
+fn destroyIdsLocked(self: *Self, ids: []const u32) void {
+    for (self.slots.items) |*slot| {
         if (slot.*) |*s| {
-            for (to_destroy[0..count]) |id| {
+            for (ids) |id| {
                 if (s.id == id) {
                     // Multi-window Stage 5 fix: queues each widget's
                     // TTF_Text for the main thread to actually destroy next
@@ -1336,6 +1433,63 @@ fn destroySubtreeLocked(self: *Self, root_id: u32) void {
             }
         }
     }
+}
+
+/// Destroys `root_id` and every descendant reachable via `parent_id`.
+/// Two-phase deliberately -- collects the full set to destroy first
+/// (against still-fully-intact slot data), then destroys everything in a
+/// second pass. Doing it in one pass would risk nulling an ancestor's slot
+/// before a not-yet-visited descendant's own parent_id chain-walk reaches
+/// it, which would sever that walk early (`findLocked` on an
+/// already-nulled ancestor returns nothing) and wrongly leave a real
+/// descendant behind.
+fn destroySubtreeLocked(self: *Self, root_id: u32) void {
+    var to_destroy: [max_widgets]u32 = undefined;
+    var count = self.collectDescendantsLocked(root_id, &to_destroy);
+    to_destroy[count] = root_id;
+    count += 1;
+    self.destroyIdsLocked(to_destroy[0..count]);
+}
+
+/// Same traversal as `destroySubtreeLocked`, but keeps `root_id` itself
+/// alive -- the real primitive a rebuildable region needs: tear down
+/// everything currently under a stable parent so its own registered
+/// rebuild function can recreate fresh contents under it, without the
+/// parent's own id (which the guest may still be holding a persisted
+/// reference to) ever changing.
+fn destroyDescendantsLocked(self: *Self, root_id: u32) void {
+    var to_destroy: [max_widgets]u32 = undefined;
+    const count = self.collectDescendantsLocked(root_id, &to_destroy);
+    self.destroyIdsLocked(to_destroy[0..count]);
+}
+
+/// Same traversal as `destroyDescendantsLocked`, but also spares
+/// `except_id` and its own entire subtree -- the make-before-break region
+/// swap's real primitive: a region's resume path builds a replacement
+/// subtree as a hidden new child of the stable parent *before* tearing
+/// down the previous one (see `region.Registry.Restore`'s own doc
+/// comment), so the teardown step has to keep that fresh subtree alive
+/// while destroying everything else the parent still holds. Deliberately
+/// not implemented as "collect descendants of root_id, then remove
+/// except_id from the list" -- except_id is itself a descendant of
+/// root_id, so its own children would still be caught by that approach;
+/// this checks `isDescendantLocked(s.id, except_id)` too, excluding the
+/// whole subtree at once.
+fn destroyDescendantsExceptLocked(self: *Self, root_id: u32, except_id: u32) void {
+    var to_destroy: [max_widgets]u32 = undefined;
+    var count: usize = 0;
+    for (self.slots.items) |maybe_slot| {
+        if (maybe_slot) |s| {
+            if (s.id != root_id and s.id != except_id and
+                self.isDescendantLocked(s.id, root_id) and
+                !self.isDescendantLocked(s.id, except_id))
+            {
+                to_destroy[count] = s.id;
+                count += 1;
+            }
+        }
+    }
+    self.destroyIdsLocked(to_destroy[0..count]);
 }
 
 /// Destroys a window's own root (a `window_root` slot) and every
@@ -1379,6 +1533,43 @@ pub fn destroyWidgetSubtree(self: *Self, call_io: Io, root_id: u32) bool {
     return true;
 }
 
+/// `natyv_destroy_children`'s real implementation -- the rebuildable-region
+/// primitive: destroys every current descendant of `root_id` but leaves
+/// `root_id` itself alive, so a region's own stable parent (e.g. a
+/// persisted `contentArea`) survives while its contents get torn down
+/// ahead of a region's registered rebuild function recreating them fresh.
+/// Same "false on unknown id" contract as `destroyWidgetSubtree`.
+pub fn destroyWidgetChildren(self: *Self, call_io: Io, root_id: u32) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(root_id) == null) return false;
+    self.destroyDescendantsLocked(root_id);
+    return true;
+}
+
+/// `natyv_destroy_children_except`'s real implementation -- the
+/// make-before-break region-swap primitive: destroys every current child
+/// of `root_id` except `except_id`'s own subtree, which survives intact.
+/// A region's resume path calls this *after* successfully building a
+/// replacement subtree (`except_id`) as a hidden sibling of whatever it's
+/// about to replace, so the previous content stays fully visible and
+/// intact for the entire time the replacement is being built -- the fix
+/// for the visible "destroy first, then rebuild" flash a naive
+/// `destroyWidgetChildren`-then-rebuild sequence produces whenever the
+/// rebuild does anything slow (a network round trip, for mail-natyv's own
+/// real IMAP reconnect). Same "false on unknown id" contract as
+/// `destroyWidgetChildren` -- checked only for `root_id`; an `except_id`
+/// that doesn't actually exist under `root_id` degrades safely (nothing
+/// matches the exclusion, so this behaves exactly like
+/// `destroyWidgetChildren`), never a crash.
+pub fn destroyWidgetChildrenExcept(self: *Self, call_io: Io, root_id: u32, except_id: u32) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(root_id) == null) return false;
+    self.destroyDescendantsExceptLocked(root_id, except_id);
+    return true;
+}
+
 /// True when `id` is a strict descendant of `root_id` (walks `parent_id`
 /// up the chain) -- `id == root_id` itself is checked separately by every
 /// caller. Same shape `FloatingOrder.isDescendantOfOrSelf` uses over a
@@ -1398,16 +1589,13 @@ fn isDescendantLocked(self: *Self, id: u32, root_id: u32) bool {
 /// doc comment) and nulls it out on the widget -- called from
 /// `destroyWidgetHostFn` (worker thread) instead of calling `TTF_DestroyText`
 /// directly there, since that call is only valid on the thread that created
-/// the text. Silently drops the pointer if the queue is already at its
-/// (generous, whole-registry-sized) capacity rather than overflow -- a tiny,
-/// practically-unreachable leak is preferable to a panic in a guest-facing
-/// host function.
+/// the text. Silently drops the pointer on a real allocation failure rather
+/// than erroring or panicking -- a tiny, practically-unreachable leak is
+/// preferable to a panic in a guest-facing host function, the same
+/// posture this already had when the queue was a fixed-capacity array.
 fn queuePendingTextDestroy(self: *Self, obj_ptr: *?*c.TTF_Text) void {
     if (obj_ptr.*) |obj| {
-        if (self.pending_text_destroy_count < self.pending_text_destroys.len) {
-            self.pending_text_destroys[self.pending_text_destroy_count] = obj;
-            self.pending_text_destroy_count += 1;
-        }
+        self.pending_text_destroys.append(self.allocator, obj) catch {};
         obj_ptr.* = null;
     }
 }
@@ -1434,9 +1622,10 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .badge => |*bd| self.queuePendingTextDestroy(&bd.text_obj),
         .numeric_stepper => |*ns| self.queuePendingTextDestroy(&ns.text_obj),
         // W17: up to `SegmentedControl.max_segments` (6) text objects per
-        // widget -- still well within `pending_text_destroys`' documented
-        // "practically unreachable" slack (256 slots) for any realistic
-        // number of segmented controls destroyed in a single frame.
+        // widget -- `pending_text_destroys` grows to fit whatever a real
+        // frame's worth of destroys actually needs (see its own doc
+        // comment), so this was never a capacity concern even before it
+        // became a growable queue.
         .segmented_control => |*sc| for (0..sc.count) |i| self.queuePendingTextDestroy(&sc.text_objs[i]),
         // W19: same "up to max_tabs text objects" shape as SegmentedControl.
         .tabs => |*tb| for (0..tb.count) |i| self.queuePendingTextDestroy(&tb.text_objs[i]),
@@ -1452,10 +1641,12 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
 pub fn flushPendingTextDestroys(self: *Self, call_io: Io) void {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
-    for (self.pending_text_destroys[0..self.pending_text_destroy_count]) |maybe_obj| {
+    for (self.pending_text_destroys.items) |maybe_obj| {
         if (maybe_obj) |obj| c.TTF_DestroyText(obj);
     }
-    self.pending_text_destroy_count = 0;
+    // Keeps the backing allocation for reuse next frame instead of freeing
+    // it -- this queue only ever needs to grow to its own real peak once.
+    self.pending_text_destroys.clearRetainingCapacity();
 }
 
 /// Worker-thread side of the scroll-into-view hand-off -- see
@@ -1502,7 +1693,7 @@ pub fn snapshot(self: *Self, call_io: Io, out: []Slot) usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     var n: usize = 0;
-    for (self.slots) |slot| {
+    for (self.slots.items) |slot| {
         if (n >= out.len) break;
         if (slot) |s| {
             out[n] = s;
@@ -1600,7 +1791,7 @@ pub fn setFocused(self: *Self, call_io: Io, id: ?u32) bool {
     defer self.mutex.unlock(call_io);
     var focused_wants_text_input = false;
     var changed = false;
-    for (&self.slots) |*slot| {
+    for (self.slots.items) |*slot| {
         if (slot.*) |*s| {
             const this_one = id != null and s.id == id.?;
             if (s.widget.isFocused() != this_one) changed = true;
@@ -1624,7 +1815,7 @@ pub fn focusableIdsSorted(self: *Self, call_io: Io, out: []u32) usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     var n: usize = 0;
-    for (self.slots) |slot| {
+    for (self.slots.items) |slot| {
         if (n >= out.len) break;
         if (slot) |s| {
             if (s.widget.isFocusable()) {
@@ -1726,7 +1917,7 @@ pub fn selectRadioExclusive(self: *Self, call_io: Io, id: u32) void {
         };
     };
     var changed = false;
-    for (&self.slots) |*slot| {
+    for (self.slots.items) |*slot| {
         if (slot.*) |*s| {
             if (s.widget == .radio_button and s.widget.radio_button.group_id == group_id) {
                 const should_select = s.id == id;

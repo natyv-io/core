@@ -171,6 +171,13 @@ pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, wi
     // interval) is deliberately non-fatal -- an app is still fully usable
     // without vsync, just leaning more on main.zig's own SDL_WaitEventTimeout
     // to bound the frame loop's iteration rate instead.
+    // 2026-09-10: tested at 0 (disabled) to check whether
+    // CAMetalLayer.displaySyncEnabled was involved in the recycle-adjacent
+    // "backbuffer correct but display stale" bug -- confirmed via a real
+    // live test that it is NOT (bug reproduced identically, idle CPU
+    // stayed a clean 0.0% either way, confirming VSync itself isn't what
+    // drives idle CPU in this loop -- SDL_WaitEvent's own blocking is).
+    // Reverted back to 1 (real, permanent value) once that test concluded.
     if (!c.SDL_SetRenderVSync(renderer, 1)) {
         std.debug.print("SDL_SetRenderVSync failed: {s}\n", .{c.SDL_GetError()});
     }

@@ -107,7 +107,40 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32, 
                 } else if (process_memory.residentSetSizeBytes(io)) |rss_bytes| {
                     const threshold_bytes = @as(u64, threshold_mb) * 1024 * 1024;
                     if (rss_bytes >= threshold_bytes) {
-                        runtime.recycle(io);
+                        if (runtime.recycle(io)) {
+                            // Any event queued before this exact point --
+                            // whether already sitting in the queue, or
+                            // pushed by the main thread while natyv_resume
+                            // (nested inside recycle, above) was still
+                            // running -- carries a widget id that's now
+                            // meaningless against the freshly-rebuilt
+                            // instance. bumpGeneration marks all of it
+                            // stale so EventQueue.pop discards it instead
+                            // of dispatching it (see that function's own
+                            // doc comment for the real bug this closes:
+                            // confirmed live, such a click previously
+                            // looked indistinguishable from "nothing
+                            // happened").
+                            queue.bumpGeneration(io);
+                            // A resumed instance's own region reveals are
+                            // deferred (see sdks/go/region/region.go's
+                            // FlushPendingReveals) until a genuinely
+                            // separate, later real natyv_dispatch call --
+                            // pushing one here, through the exact same
+                            // queue/pop/dispatch path a real user event
+                            // takes, means that settling happens on this
+                            // loop's own very next iteration instead of
+                            // waiting for the user to happen to move the
+                            // mouse or click something. Pushed *after*
+                            // bumpGeneration so it carries the new
+                            // generation, not the one just invalidated.
+                            // widget_id 0 and a harmless hover-false
+                            // payload: nothing in a real app ever has a
+                            // registered handler for id 0, so this is a
+                            // genuine no-op dispatch once past the flush
+                            // itself.
+                            queue.push(io, 0, .hover, "{\"hovering\":false}", 0);
+                        }
                         recycle_cooldown_remaining = recycle_cooldown_dispatches;
                     }
                 } else |err| {

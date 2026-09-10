@@ -19,10 +19,26 @@ const WidgetHost = @import("widgets/WidgetHost.zig");
 
 const Self = @This();
 
-/// Comfortably above the number of distinct fill colors natyv's widgets
-/// actually use at once today (button normal/flash, textfield
-/// normal/focused -- four) -- a safety bound, not a tuned limit.
-const max_colors = 8;
+/// Bumped 2026-09-07, 8 -> 32 -- sized against `clay-fixture`'s own then-
+/// current baseline (button normal/flash, textfield normal/focused --
+/// four), which badly undercounted a real, styled app: mail-natyv's own
+/// `styles.ntss` alone declares 6 distinct `backgroundColor` tokens
+/// (root/toolbarBtn/row/primaryBtn/secondaryBtn/dangerBtn), before even
+/// counting host-side interaction-state colors (checkbox/toggle/radio,
+/// hover/focus rings, etc.) layered on top -- a single frame showing a
+/// full folder view (toolbar + N message rows, each with its own
+/// checkbox) can genuinely need more than 8 distinct fill colors at once.
+/// `add`'s own silent-drop-on-overflow behavior (see its doc comment)
+/// meant exceeding the old cap didn't error or crash -- it just silently
+/// stopped drawing some widgets' backgrounds for that frame, exactly the
+/// real, live-reproduced "some message rows show no background fill"
+/// symptom this was root-caused from. Same one-line-fix shape as
+/// `WidgetHost.max_widgets`'s own bump just above in this arc -- heap
+/// memory cost stays trivial (`rects` lives on `WindowManager.
+/// WindowContext.draw_batcher`, a real per-window struct field, not a
+/// stack-local, so there's no stack-overflow risk the way `max_widgets`
+/// itself had to be fixed for elsewhere).
+const max_colors = 32;
 
 colors: [max_colors]c.SDL_Color = undefined,
 rects: [max_colors][WidgetHost.max_widgets]c.SDL_FRect = undefined,

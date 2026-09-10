@@ -88,9 +88,17 @@ pub fn containsId(ids: []const u32, id: u32) bool {
 /// `SDL_WaitEventTimeout` bounds this loop to real event/wake cadence
 /// (the exact same root cause as `rebuildFrameSnapshot`'s own doc
 /// comment, just a second, independent place it manifests).
-pub fn syncAllWindowText(widgets: *WidgetHost, io: std.Io, windows: []const WindowManager.WindowContext, font: *c.TTF_Font) void {
-    var struct_snap: [max_widgets_on_screen]WidgetHost.Slot = undefined;
-    const struct_n = widgets.snapshot(io, &struct_snap);
+/// `struct_snap` is caller-provided scratch space, not a local -- both real
+/// callers (`main.zig`) already own a `[]WidgetHost.Slot` buffer of their
+/// own (`widget_snapshot`) that's about to be freshly overwritten by their
+/// very next `rebuildFrameSnapshot` call anyway, so reusing it here costs
+/// nothing new. A local `[max_widgets_on_screen]WidgetHost.Slot` here
+/// blew the calling thread's stack the moment this function was entered,
+/// once `max_widgets`'s 2026-09-07 bump (192 -> 2048, see that constant's
+/// own doc comment) made it large enough to -- a real, live-reproduced
+/// segfault, the same class `layoutIfNeeded`'s own equivalent buffers hit.
+pub fn syncAllWindowText(widgets: *WidgetHost, io: std.Io, windows: []const WindowManager.WindowContext, font: *c.TTF_Font, struct_snap: []WidgetHost.Slot) void {
+    const struct_n = widgets.snapshot(io, struct_snap);
     for (windows) |wctx| {
         var ids: [max_widgets_on_screen]u32 = undefined;
         const idn = FloatingOrder.windowSubset(struct_snap[0..struct_n], wctx.root_widget_id, &ids);
@@ -374,6 +382,24 @@ pub fn pushScrollEvents(queue: *EventQueue, io: std.Io, wctx: *WindowManager.Win
     }
 }
 
+/// True unless clip excludes (x, y) -- a null clip (no scroll ancestor at
+/// all, see ScrollClip.computeClipRects) always allows. Real bug this
+/// fixes (found live 2026-09-09, via mail-natyv's own real click-through):
+/// hit-testing (both hover, in drawWindow below, and click, in
+/// tryHitWidget/handleEvent) used to test a widget's own raw rect only,
+/// with no awareness of its scroll ancestors' clipped viewport at all --
+/// unlike drawing, which has always respected clip_rects. A row scrolled
+/// out of view (but not destroyed, and not explicitly hidden via
+/// SetVisible) kept its real rect wherever Clay laid it out, which could
+/// still coincide on screen with something else actually drawn there (a
+/// fixed-position pager below a scrollable message list, say) -- clicking
+/// that visible control could silently activate the invisible, scrolled-
+/// away row underneath instead.
+fn withinClip(clip: ?c.SDL_FRect, x: f32, y: f32) bool {
+    const r = clip orelse return true;
+    return x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h;
+}
+
 fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
     return switch (widget) {
         .button => |b| b.containsPoint(mx, my),
@@ -391,8 +417,9 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
     };
 }
 
-fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle) ?u32 {
+fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot, clip: ?c.SDL_FRect, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle) ?u32 {
     if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) return null;
+    if (!withinClip(clip, mx, my)) return null;
     switch (slot.widget) {
         // A disabled Button (ClayStyle.enabled's own doc comment) is
         // treated as a real miss here -- no click event, no flash, and it
@@ -719,7 +746,7 @@ fn drawScrollbarFor(slot: WidgetHost.Slot, clay_layout: ClayLayout, renderer: ?*
 /// single-window body already established: before any event in this
 /// window is processed).
 ///
-pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []const WidgetHost.Slot, is_floating: []const bool, topmost_modal: ?u32, event: c.SDL_Event) void {
+pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []WidgetHost.Slot, is_floating: []const bool, topmost_modal: ?u32, event: c.SDL_Event) void {
     // Built once per event, shared by every `FloatingOrder`/
     // `isEffectivelyVisible` lookup below instead of each one re-scanning
     // `slots` linearly on its own -- see `WidgetHost.SnapshotIndex`'s own
@@ -732,10 +759,20 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                 const my = event.button.y;
                 var hit_focusable: ?u32 = null;
 
+                // See withinClip's own doc comment -- without this, a
+                // widget scrolled out of its scroll ancestor's visible
+                // viewport (but not destroyed or explicitly hidden) stays
+                // fully clickable at its real, off-screen-looking rect,
+                // which can coincide with whatever's actually drawn there
+                // instead (e.g. a fixed-position pager below a scrollable
+                // list).
+                var clip_rects: [max_widgets_on_screen]?c.SDL_FRect = undefined;
+                ScrollClip.computeClipRects(slots, clip_rects[0..slots.len]);
+
                 if (topmost_modal) |modal_id| {
-                    for (slots) |slot| {
+                    for (slots, clip_rects[0..slots.len]) |slot, clip| {
                         if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
-                        if (tryHitWidget(widgets, io, queue, slots, index, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                        if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
                     }
                 } else {
                     var topmost_floating_root: ?u32 = null;
@@ -745,17 +782,17 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                         const root = FloatingOrder.nearestFloatingRoot(slots, index, slot.id) orelse continue;
                         if (topmost_floating_root == null or root > topmost_floating_root.?) topmost_floating_root = root;
                     }
-                    for (slots, is_floating) |slot, floating| {
+                    for (slots, clip_rects[0..slots.len], is_floating) |slot, clip, floating| {
                         if (!floating) continue;
                         if (topmost_floating_root) |root| {
                             if (FloatingOrder.nearestFloatingRoot(slots, index, slot.id) != root) continue;
                         }
-                        if (tryHitWidget(widgets, io, queue, slots, index, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                        if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
                     }
                     if (hit_focusable == null) {
-                        for (slots, is_floating) |slot, floating| {
+                        for (slots, clip_rects[0..slots.len], is_floating) |slot, clip, floating| {
                             if (floating) continue;
-                            if (tryHitWidget(widgets, io, queue, slots, index, slot, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                            if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
                         }
                     }
                 }
@@ -914,6 +951,14 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     // `WidgetHost.SnapshotIndex`'s own doc comment.
     const index = WidgetHost.SnapshotIndex.build(slots);
 
+    // Hoisted above the hover-hit-test loop below (previously computed
+    // much later, only for the draw passes) so hover hit-testing can share
+    // it too -- see withinClip's own doc comment for the real bug this
+    // fixes (hover used to have no scroll-clip awareness at all, same gap
+    // handleEvent's click handling had).
+    var clip_rects: [max_widgets_on_screen]?c.SDL_FRect = undefined;
+    ScrollClip.computeClipRects(slots, clip_rects[0..widget_count]);
+
     if (wctx.interaction.dragging_slider_id) |id| {
         for (slots) |slot| {
             if (slot.id == id and slot.widget == .slider) {
@@ -939,11 +984,12 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     const now_ms = timing.nowMs();
     var hovering_any = false;
     var hovered_widget_id_this_frame: ?u32 = null;
-    for (slots) |slot| {
+    for (slots, clip_rects[0..widget_count]) |slot, clip| {
         if (topmost_modal) |modal_id| {
             if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
         }
         if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
+        if (!withinClip(clip, wctx.interaction.mouse_x, wctx.interaction.mouse_y)) continue;
         switch (slot.widget) {
             // A disabled Button shows neither the pointer cursor nor a
             // tooltip hover -- it isn't actually clickable right now, so
@@ -1045,7 +1091,39 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     // hover/tooltip logic above still runs every call regardless -- it's
     // cheap and already self-gates via its own hovered-widget-changed
     // checks, only the renderer work below is worth skipping.
-    const current_generation = widgets.currentGeneration(io);
+    //
+    // Real, live-caught bug (2026-09-07, found via the memory-reclamation
+    // ergonomics layer's mail-natyv retrofit -- a genuine host-level bug,
+    // unrelated to that retrofit itself): this used to read
+    // `widgets.currentGeneration(io)` fresh and independently here, instead
+    // of using the generation value the *actually-computed* geometry
+    // reflects (`wctx.clay_layout.?.last_computed_generation`, set only
+    // when `ClayLayout.layoutIfNeeded` runs a real recompute). A single
+    // guest dispatch that does several sequential widget-tree mutations
+    // (destroying a whole view, then making a different already-existing
+    // one visible again -- exactly what happens navigating from a message
+    // back to a persisted folder view) bumps `layout_generation` multiple
+    // times while the worker thread is still running. If this function's
+    // own independent read landed on a *later* value than the one
+    // `layoutIfNeeded` actually computed geometry for earlier this same
+    // frame, `wctx.last_drawn_generation` got "credited" with a generation
+    // whose geometry was never actually drawn -- permanently losing the
+    // signal to draw the true final state, since the next frame's
+    // generation comparison would then see no change at all. Confirmed via
+    // real instrumentation: `drawWindow` reported `current_gen=181` and
+    // `needs_redraw=true` immediately after a `setVisible` call bumped
+    // generation to 181, but the geometry it drew still reflected an
+    // intermediate `layoutIfNeeded` pass that ran at generation 175 --
+    // the *next* frame's real, correct recompute (175->181) then got
+    // silently skipped, since `current_generation(181) ==
+    // last_drawn_generation(181)` already, from the prior frame's
+    // mismatched credit. Fixed by reading the same value `layoutIfNeeded`
+    // itself used, so this function's bookkeeping can never diverge from
+    // what was actually computed -- falls back to `widgets.currentGeneration`
+    // only when there's no Clay layout for this window at all, or it has
+    // never run a real pass yet (both cases where there's no "actually
+    // computed" generation to defer to regardless).
+    const current_generation = if (wctx.clay_layout) |*cl| (cl.last_computed_generation orelse widgets.currentGeneration(io)) else widgets.currentGeneration(io);
     const dragging = wctx.interaction.dragging_slider_id != null;
     const warming_up = now_ms - wctx.created_at_ms < window_redraw_warmup_ms;
     // Real, live-caught bug (2026-09-06): `needs_continuous_redraw` only
@@ -1102,9 +1180,6 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     if (!needs_redraw) return;
     wctx.last_drawn_generation = current_generation;
     wctx.draw_count += 1;
-
-    var clip_rects: [max_widgets_on_screen]?c.SDL_FRect = undefined;
-    ScrollClip.computeClipRects(slots, clip_rects[0..widget_count]);
 
     _ = c.SDL_SetRenderDrawColor(wctx.renderer, 24, 24, 28, 255);
     _ = c.SDL_RenderClear(wctx.renderer);

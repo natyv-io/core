@@ -80,6 +80,7 @@ const SetValueRequest = struct { widget_id: u32, value: f32 };
 // natyv_dispatch-driven update).
 const SetRangeRequest = struct { widget_id: u32, min: f32, max: f32 };
 const SetVisibleRequest = struct { widget_id: u32, visible: bool };
+const DestroyChildrenExceptRequest = struct { widget_id: u32, except_id: u32 };
 const SetEnabledRequest = struct { widget_id: u32, enabled: bool };
 const SetSizeRequest = struct { widget_id: u32, height: f32 };
 
@@ -154,6 +155,25 @@ const ClayLayoutRequest = struct {
     /// itself and overwrites whatever a guest happened to request here,
     /// since panel visibility is host-owned, not guest-declared).
     visible: bool = true,
+    /// Real bug this and the four fields below fix (found live 2026-09-09,
+    /// via mail-natyv's own real click-through -- see project_natyv_
+    /// render_loop_fix memory for the full finding): every natyv_clay_
+    /// create_* host function and natyv_set_style used to be two entirely
+    /// separate, independently-locked host calls, leaving a real window
+    /// where a freshly-created widget existed with no visual style at all
+    /// -- long enough for an unrelated main-thread redraw (any real SDL
+    /// event, not just a click) to render it with nothing. Setting these
+    /// directly on the *create* request closes that gap outright: insertLocked
+    /// WithLayoutValidated (via toClayStyle below) applies them in the same
+    /// locked section that inserts the widget, so it's never observable in
+    /// an unstyled state. natyv_set_style remains fully real and supported
+    /// for genuinely restyling an *existing* widget later (e.g. a runtime
+    /// state change) -- this is strictly additive, not a replacement.
+    background_color: ?ColorRequest = null,
+    corner_radius: ?[4]f32 = null,
+    border: ?BorderRequest = null,
+    gradient: ?GradientRequest = null,
+    texture: ?u32 = null,
 };
 const ClayContainerRequest = struct { layout: ClayLayoutRequest = .{}, background: bool = false, duration_ms: u32 = 0 };
 const ClayButtonRequest = struct { layout: ClayLayoutRequest = .{}, label: []const u8 };
@@ -186,6 +206,27 @@ const ClayTabPanelRequest = struct { layout: ClayLayoutRequest = .{} };
 // always exactly `width`/`height`, not a guest-chosen sizing *type* -- so
 // there's nothing in `ClayLayoutRequest` this would actually reuse.
 const ClayWindowRequest = struct { title: []const u8 = "", width: f32 = 400, height: f32 = 300 };
+
+/// Shared by `toClayStyle` (create-time, atomic) and `setStyleHostFn`
+/// (restyling an existing widget later) -- both need the exact same wire ->
+/// host conversion for these three, so it lives once here rather than
+/// twice.
+fn toSDLColor(req: ColorRequest) c.SDL_FColor {
+    return .{ .r = req.r, .g = req.g, .b = req.b, .a = req.a };
+}
+
+fn toBorder(req: BorderRequest) WidgetHost.Border {
+    return .{ .width = req.width, .color = toSDLColor(req.color) };
+}
+
+fn toGradient(req: GradientRequest) WidgetHost.Gradient {
+    return .{
+        .start_uv = req.start_pos,
+        .start_color = toSDLColor(req.start_color),
+        .end_uv = req.end_pos,
+        .end_color = toSDLColor(req.end_color),
+    };
+}
 
 fn toSizingAxis(req: ClaySizingAxisRequest) c.Clay_SizingAxis {
     return switch (req.type) {
@@ -223,6 +264,11 @@ fn toClayStyle(req: ClayLayoutRequest) ClayStyle {
         .modal = req.modal,
         .toast = req.toast,
         .visible = req.visible,
+        .background_color = if (req.background_color) |bc| toSDLColor(bc) else null,
+        .corner_radius = req.corner_radius,
+        .border = if (req.border) |b| toBorder(b) else null,
+        .gradient = if (req.gradient) |g| toGradient(g) else null,
+        .texture = req.texture,
     };
 }
 
@@ -1082,15 +1128,10 @@ pub fn setStyleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
     defer parsed.deinit();
     const req = parsed.value;
 
-    const bg: ?c.SDL_FColor = if (req.background_color) |bc| .{ .r = bc.r, .g = bc.g, .b = bc.b, .a = bc.a } else null;
+    const bg: ?c.SDL_FColor = if (req.background_color) |bc| toSDLColor(bc) else null;
     const padding: ?c.Clay_Padding = if (req.padding) |p| .{ .left = p.left, .right = p.right, .top = p.top, .bottom = p.bottom } else null;
-    const border: ?WidgetHost.Border = if (req.border) |b| .{ .width = b.width, .color = .{ .r = b.color.r, .g = b.color.g, .b = b.color.b, .a = b.color.a } } else null;
-    const gradient: ?WidgetHost.Gradient = if (req.gradient) |g| .{
-        .start_uv = g.start_pos,
-        .start_color = .{ .r = g.start_color.r, .g = g.start_color.g, .b = g.start_color.b, .a = g.start_color.a },
-        .end_uv = g.end_pos,
-        .end_color = .{ .r = g.end_color.r, .g = g.end_color.g, .b = g.end_color.b, .a = g.end_color.a },
-    } else null;
+    const border: ?WidgetHost.Border = if (req.border) |b| toBorder(b) else null;
+    const gradient: ?WidgetHost.Gradient = if (req.gradient) |g| toGradient(g) else null;
 
     if (!self.setStyle(self.io(), req.widget_id, bg, padding, req.corner_radius, border, gradient, req.texture)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
@@ -1283,6 +1324,49 @@ pub fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     const req = parsed.value;
 
     if (!self.destroyWidgetSubtree(self.io(), req.widget_id)) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// The rebuildable-region primitive: destroys every current child of
+/// `widget_id` but keeps `widget_id` itself alive, so a region's own
+/// stable parent survives while its contents get torn down ahead of the
+/// guest recreating them fresh (e.g. right before a region's registered
+/// rebuild function runs on `natyv_resume`, or an ordinary in-app
+/// rebuild). Real logic lives on `WidgetHost.destroyWidgetChildren`,
+/// alongside `destroySubtreeLocked`'s other real callers -- same shape as
+/// `destroyWidgetHostFn` above, just keeping the root instead of taking it
+/// too.
+pub fn destroyChildrenHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(WidgetIdRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    if (!self.destroyWidgetChildren(self.io(), req.widget_id)) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
+        return;
+    }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// The make-before-break region-swap primitive: destroys every current
+/// child of `widget_id` except `except_id`'s own subtree. Real logic
+/// lives on `WidgetHost.destroyWidgetChildrenExcept` -- same shape as
+/// `destroyChildrenHostFn` above, just sparing one named child too.
+pub fn destroyChildrenExceptHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(DestroyChildrenExceptRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    if (!self.destroyWidgetChildrenExcept(self.io(), req.widget_id, req.except_id)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }
