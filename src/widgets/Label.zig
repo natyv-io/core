@@ -79,7 +79,27 @@ pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, paddi
     const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - @as(i32, padding.left) - @as(i32, padding.right));
     const wrap_changed = target_wrap != self.wrapped_width;
 
-    if (self.text_obj) |obj| {
+    // Real bug, found 2026-09-11: a genuinely empty Label (self.len == 0 --
+    // e.g. `<Label ref={&x} />` with no text=, or setText("") applied to an
+    // already-empty label, whose own equality short-circuit never bumps
+    // generation) still reached SDL_ttf with a zero-length string and a
+    // non-null pointer -- confirmed via direct evidence (temporary
+    // diagnostic logging showed the real widget buffer was correctly empty
+    // at the exact moment of creation, while the actual on-screen glyphs
+    // were garbled, meaning corruption happens inside/after the SDL_ttf
+    // call, not before it -- SDL_ttf does not cleanly handle this case).
+    // Fix: never hand SDL_ttf a zero-length create/update at all. A
+    // genuinely empty label needs no real TTF_Text object -- drawDecorations
+    // already treats a null text_obj as "draw nothing," exactly correct
+    // here -- and a label transitioning *to* empty gets its existing object
+    // destroyed outright rather than "updated" with zero length.
+    if (self.len == 0) {
+        if (self.text_obj) |obj| {
+            c.TTF_DestroyText(obj);
+            self.text_obj = null;
+        }
+        self.text_obj_generation = self.text_generation;
+    } else if (self.text_obj) |obj| {
         if (self.text_obj_generation != self.text_generation) {
             _ = c.TTF_SetTextString(obj, self.text().ptr, self.len);
             self.text_obj_generation = self.text_generation;

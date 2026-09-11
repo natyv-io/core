@@ -50,6 +50,23 @@ placeholder_obj: ?*c.TTF_Text = null,
 // the container is fluid-width) -- see syncText.
 wrapped_width: i32 = -1,
 
+// Correction, 2026-09-11, same day: this constructor briefly called
+// setText here instead of setPlaceholder, on the mistaken assumption that
+// CreateTextArea's 2nd param was meant as general initial content. Real,
+// deliberate, already-established design (confirmed by re-reading
+// shared/src/ntx/Codegen.zig's own TextArea emission, dated 2026-09-02,
+// which documents the identical wrong assumption being made and corrected
+// once already): this param genuinely is placeholder-only, by design --
+// `.ntx`'s own codegen already routes any real/dynamic content
+// (`text={expr}`) through a separate `.SetText(...)` call emitted right
+// after creation, never through this constructor arg at all. Plain
+// literal child text with no `text=` attribute (e.g. a compose body
+// field's "Body" hint) is the one case that *does* go through this param
+// directly -- and it's real hint text, not seed content: rendering it via
+// setText instead (today's brief mistake) is exactly what made it show up
+// in the same bright, non-dimmed style as real user-typed content instead
+// of the dimmed placeholder style TextField's To/Subject fields correctly
+// use, which is what Quinn actually flagged. Reverted back to match.
 pub fn init(rect: c.SDL_FRect, initial_placeholder: []const u8) Self {
     var self: Self = .{ .rect = rect };
     self.setPlaceholder(initial_placeholder);
@@ -184,7 +201,25 @@ pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, paddi
     const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - @as(i32, padding.left) - @as(i32, padding.right));
     const wrap_changed = target_wrap != self.wrapped_width;
 
-    if (self.text_obj) |obj| {
+    // Real bug, found 2026-09-11 -- see Label.syncText's own doc comment for
+    // the full evidence trail (temporary diagnostic logging proved the
+    // widget's own buffer was correctly empty at creation time, so the
+    // corruption happens inside/after SDL_ttf's own zero-length handling,
+    // not before it). Same fix here: never hand SDL_ttf a zero-length
+    // create/update. Doubly relevant for this widget specifically --
+    // placeholder_len is effectively *always* 0 today, now that
+    // TextArea.init's own real-content fix (same day) means nothing calls
+    // setPlaceholder anymore; without this guard, every real TextArea
+    // would hit the exact zero-length TTF_CreateText bug for its
+    // placeholder_obj on every single sync, even though that object is
+    // only ever actually drawn when self.len == 0 in the first place.
+    if (self.len == 0) {
+        if (self.text_obj) |obj| {
+            c.TTF_DestroyText(obj);
+            self.text_obj = null;
+        }
+        self.text_obj_generation = self.text_generation;
+    } else if (self.text_obj) |obj| {
         if (self.text_obj_generation != self.text_generation) {
             _ = c.TTF_SetTextString(obj, self.text().ptr, self.len);
             self.text_obj_generation = self.text_generation;
@@ -199,10 +234,12 @@ pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, paddi
 
     if (self.placeholder_obj) |obj| {
         if (wrap_changed) _ = c.TTF_SetTextWrapWidth(obj, target_wrap);
-    } else if (c.TTF_CreateText(engine, font, self.placeholder().ptr, self.placeholder_len)) |obj| {
-        _ = c.TTF_SetTextColor(obj, 120, 120, 130, 255);
-        _ = c.TTF_SetTextWrapWidth(obj, target_wrap);
-        self.placeholder_obj = obj;
+    } else if (self.placeholder_len > 0) {
+        if (c.TTF_CreateText(engine, font, self.placeholder().ptr, self.placeholder_len)) |obj| {
+            _ = c.TTF_SetTextColor(obj, 120, 120, 130, 255);
+            _ = c.TTF_SetTextWrapWidth(obj, target_wrap);
+            self.placeholder_obj = obj;
+        }
     }
 
     if (wrap_changed) self.wrapped_width = target_wrap;
