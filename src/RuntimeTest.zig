@@ -99,9 +99,9 @@ test "bookstore example: guest-declared UI end to end through natyv_init + natyv
     }
 
     var text_scratch: [128]u8 = undefined;
-    _ = runtime.widgets.appendTextTo(io, author_id orelse return error.MissingAuthorField, "Frank Herbert", &text_scratch);
-    _ = runtime.widgets.appendTextTo(io, title_id orelse return error.MissingTitleField, "Dune", &text_scratch);
-    _ = runtime.widgets.appendTextTo(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
+    _ = runtime.widgets.insertTextAt(io, author_id orelse return error.MissingAuthorField, "Frank Herbert", &text_scratch);
+    _ = runtime.widgets.insertTextAt(io, title_id orelse return error.MissingTitleField, "Dune", &text_scratch);
+    _ = runtime.widgets.insertTextAt(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
 
     click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
     _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
@@ -210,9 +210,9 @@ test "bookstore: cancelling the delete-confirm dialog leaves the book untouched"
     }
 
     var text_scratch: [128]u8 = undefined;
-    _ = runtime.widgets.appendTextTo(io, author_id orelse return error.MissingAuthorField, "Ursula K. Le Guin", &text_scratch);
-    _ = runtime.widgets.appendTextTo(io, title_id orelse return error.MissingTitleField, "The Dispossessed", &text_scratch);
-    _ = runtime.widgets.appendTextTo(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
+    _ = runtime.widgets.insertTextAt(io, author_id orelse return error.MissingAuthorField, "Ursula K. Le Guin", &text_scratch);
+    _ = runtime.widgets.insertTextAt(io, title_id orelse return error.MissingTitleField, "The Dispossessed", &text_scratch);
+    _ = runtime.widgets.insertTextAt(io, genre_id orelse return error.MissingGenreField, "Sci-Fi", &text_scratch);
 
     click_payload = try std.fmt.bufPrint(&dispatch_buf, "{{\"widget_id\":{d},\"event_type\":\"click\"}}", .{add_id orelse return error.MissingAddButton});
     _ = runtime.call(io, "natyv_dispatch", click_payload) orelse return error.CallFailed;
@@ -3137,10 +3137,10 @@ test "W10: a textarea's multi-line content flows through host-level mutation, re
     // Host-level mutation: proves multi-line bytes flow through the
     // widget's own storage/generation-counter correctly, the same way
     // main.zig's real SDL_EVENT_TEXT_INPUT/SDLK_RETURN handling would
-    // drive it (a literal "\n" is just another string to append -- see
-    // appendTextTo's doc comment).
+    // drive it (a literal "\n" is just another string to insert -- see
+    // insertTextAt's doc comment).
     var text_buf: [TextArea.max_len]u8 = undefined;
-    const written = runtime.widgets.appendTextTo(io, aid, "line one\nline two", &text_buf) orelse return error.AppendFailed;
+    const written = runtime.widgets.insertTextAt(io, aid, "line one\nline two", &text_buf) orelse return error.AppendFailed;
     try std.testing.expectEqualStrings("line one\nline two", text_buf[0..written]);
 
     // Real guest-routed reaction: synthesizes the exact `.text_changed`

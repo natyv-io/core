@@ -21,11 +21,14 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const text_cursor = @import("text_cursor.zig");
 
 const Self = @This();
 
 pub const max_len = 1023;
 const max_placeholder_len = 63;
+
+pub const CursorDirection = text_cursor.CursorDirection;
 
 rect: c.SDL_FRect,
 placeholder_buf: [max_placeholder_len + 1]u8 = undefined,
@@ -33,6 +36,10 @@ placeholder_len: usize = 0,
 buf: [max_len + 1]u8 = undefined,
 len: usize = 0,
 focused: bool = false,
+/// See TextField.zig's identical field for the full doc comment -- these
+/// two widgets deliberately mirror each other's shape throughout.
+cursor: usize = 0,
+selection_anchor: ?usize = null,
 // F3: two separate TTF_Text handles -- entered text and placeholder are
 // drawn as alternatives (never both), same split TextField.zig uses and
 // for the same reason (each carries its own persistent color, set once).
@@ -88,38 +95,133 @@ pub fn text(self: *const Self) []const u8 {
     return self.buf[0..self.len];
 }
 
+/// See TextField.setText's doc comment -- same "reset to end, clear
+/// selection" reasoning for a programmatic replace.
 pub fn setText(self: *Self, s: []const u8) bool {
     const n = @min(s.len, max_len);
     if (self.len == n and std.mem.eql(u8, self.buf[0..n], s[0..n])) return false;
     @memcpy(self.buf[0..n], s[0..n]);
     self.len = n;
+    self.cursor = n;
+    self.selection_anchor = null;
     self.text_generation +%= 1;
     return true;
 }
 
 pub fn clear(self: *Self) void {
     self.len = 0;
+    self.cursor = 0;
+    self.selection_anchor = null;
     self.text_generation +%= 1;
 }
 
-pub fn appendText(self: *Self, s: []const u8) void {
+pub fn hasSelection(self: Self) bool {
+    return self.selection_anchor != null and self.selection_anchor.? != self.cursor;
+}
+
+pub fn selectionRange(self: Self) ?struct { start: usize, end: usize } {
+    const anchor = self.selection_anchor orelse return null;
+    if (anchor == self.cursor) return null;
+    return if (anchor < self.cursor) .{ .start = anchor, .end = self.cursor } else .{ .start = self.cursor, .end = anchor };
+}
+
+pub fn deleteSelection(self: *Self) void {
+    const range = self.selectionRange() orelse return;
+    const tail_len = self.len - range.end;
+    std.mem.copyForwards(u8, self.buf[range.start..][0..tail_len], self.buf[range.end..][0..tail_len]);
+    self.len = range.start + tail_len;
+    self.cursor = range.start;
+    self.selection_anchor = null;
+    self.text_generation +%= 1;
+}
+
+/// See TextField.insertAt's doc comment -- same insert-at-cursor path,
+/// used by both typed characters and paste (and, here, the Enter key's
+/// literal-newline insertion). Supersedes the old append-only
+/// `appendText`. Also see that same doc comment for a real, live-found bug
+/// fix: a plain click leaves a collapsed (cursor == anchor) but still
+/// non-null `selection_anchor`, which `deleteSelection`'s own early return
+/// never clears when there's nothing to actually delete -- explicitly
+/// nulling it here (not just relying on `deleteSelection`) stops that
+/// stale anchor from turning into a phantom selection the *next* edit
+/// would wrongly delete.
+pub fn insertAt(self: *Self, s: []const u8) void {
+    self.deleteSelection();
+    self.selection_anchor = null;
     const room = max_len - self.len;
     const n = @min(room, s.len);
-    @memcpy(self.buf[self.len..][0..n], s[0..n]);
+    if (n == 0) return;
+    const tail_len = self.len - self.cursor;
+    std.mem.copyBackwards(u8, self.buf[self.cursor + n ..][0..tail_len], self.buf[self.cursor..][0..tail_len]);
+    @memcpy(self.buf[self.cursor..][0..n], s[0..n]);
     self.len += n;
+    self.cursor += n;
     self.text_generation +%= 1;
 }
 
+/// Backspace: deletes the selection if active, else the one UTF-8
+/// codepoint immediately before the cursor. A trailing `\n` is a single
+/// ASCII byte, so this naturally deletes "the last line break" in one
+/// backspace the same as any other character -- no special-casing needed
+/// for the multi-line case. Same stale-anchor fix as `insertAt` -- see its
+/// doc comment.
 pub fn backspace(self: *Self) void {
-    if (self.len == 0) return;
-    var i = self.len - 1;
-    // Step back over one UTF-8 codepoint, not just one byte. A trailing
-    // `\n` is a single ASCII byte, so this naturally deletes "the last
-    // line break" in one backspace the same as any other character --
-    // no special-casing needed for the multi-line case.
-    while (i > 0 and (self.buf[i] & 0xC0) == 0x80) : (i -= 1) {}
-    self.len = i;
+    if (self.hasSelection()) {
+        self.deleteSelection();
+        return;
+    }
+    self.selection_anchor = null;
+    if (self.cursor == 0) return;
+    const start = text_cursor.stepBack(self.buf[0..self.len], self.cursor);
+    const tail_len = self.len - self.cursor;
+    std.mem.copyForwards(u8, self.buf[start..][0..tail_len], self.buf[self.cursor..][0..tail_len]);
+    self.len = start + tail_len;
+    self.cursor = start;
     self.text_generation +%= 1;
+}
+
+/// Forward-delete (the Delete/Fn+Delete key) -- the mirror image of
+/// `backspace`. Same stale-anchor fix as `insertAt`/`backspace` -- see
+/// `insertAt`'s doc comment.
+pub fn deleteForward(self: *Self) void {
+    if (self.hasSelection()) {
+        self.deleteSelection();
+        return;
+    }
+    self.selection_anchor = null;
+    if (self.cursor >= self.len) return;
+    const end = text_cursor.stepForward(self.buf[0..self.len], self.len, self.cursor);
+    const tail_len = self.len - end;
+    std.mem.copyForwards(u8, self.buf[self.cursor..][0..tail_len], self.buf[end..][0..tail_len]);
+    self.len = self.cursor + tail_len;
+    self.text_generation +%= 1;
+}
+
+/// See TextField.moveCursor's doc comment -- identical semantics.
+pub fn moveCursor(self: *Self, direction: CursorDirection, extend: bool) bool {
+    const old_cursor = self.cursor;
+    const old_anchor = self.selection_anchor;
+    if (extend) {
+        if (self.selection_anchor == null) self.selection_anchor = self.cursor;
+        self.cursor = switch (direction) {
+            .left => text_cursor.stepBack(self.buf[0..self.len], self.cursor),
+            .right => text_cursor.stepForward(self.buf[0..self.len], self.len, self.cursor),
+        };
+    } else {
+        if (self.selectionRange()) |range| {
+            self.cursor = switch (direction) {
+                .left => range.start,
+                .right => range.end,
+            };
+        } else {
+            self.cursor = switch (direction) {
+                .left => text_cursor.stepBack(self.buf[0..self.len], self.cursor),
+                .right => text_cursor.stepForward(self.buf[0..self.len], self.len, self.cursor),
+            };
+        }
+        self.selection_anchor = null;
+    }
+    return self.cursor != old_cursor or self.selection_anchor != old_anchor;
 }
 
 pub fn containsPoint(self: Self, x: f32, y: f32) bool {
@@ -156,7 +258,7 @@ pub fn fillColor(self: Self) c.SDL_Color {
 // Styling system Stage 2: draw offset is the widget's own real padding
 // (`WidgetHost.effectiveTextPadding`) instead of the original hardcoded
 // `+ 6`.
-pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_Padding) void {
+pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_Padding, font: *c.TTF_Font) void {
     const active = if (self.len > 0) self.text_obj else self.placeholder_obj;
     if (active) |obj| {
         const clip = c.SDL_Rect{
@@ -166,7 +268,100 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_P
             .h = @intFromFloat(@ceil(self.rect.h)),
         };
         _ = c.SDL_SetRenderClipRect(renderer, &clip);
-        _ = c.TTF_DrawRendererText(obj, self.rect.x + @as(f32, @floatFromInt(padding.left)), self.rect.y + @as(f32, @floatFromInt(padding.top)));
+        const text_x = self.rect.x + @as(f32, @floatFromInt(padding.left));
+        const text_y = self.rect.y + @as(f32, @floatFromInt(padding.top));
+        _ = c.TTF_DrawRendererText(obj, text_x, text_y);
+
+        // Selection highlight / caret -- see TextField.drawDecorations's
+        // identical block for the full reasoning (this widget's own
+        // syncText actively destroys text_obj whenever len == 0, so the
+        // empty-focused-caret case here is equally reliant on the
+        // placeholder's own line-height rather than any TTF measurement).
+        // Kept inside the same clip-rect-active window as the text draw
+        // above, so a caret/highlight scrolled past the visible box gets
+        // clipped exactly like the text itself already is.
+        if (self.focused) {
+            if (self.len > 0 and self.text_obj != null) {
+                const text_obj = self.text_obj.?;
+                if (self.hasSelection()) {
+                    const range = self.selectionRange().?;
+                    var count: c_int = 0;
+                    if (c.TTF_GetTextSubStringsForRange(text_obj, @intCast(range.start), @intCast(range.end - range.start), &count)) |substrings| {
+                        // See TextField.drawDecorations's identical block
+                        // for why an explicit ptrCast is needed here.
+                        defer c.SDL_free(@ptrCast(substrings));
+                        var i: usize = 0;
+                        while (substrings[i] != null) : (i += 1) {
+                            // See TextField.drawDecorations's identical
+                            // block for why [0] is required here.
+                            const sub = substrings[i].?;
+                            _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND);
+                            _ = c.SDL_SetRenderDrawColor(renderer, 235, 120, 50, 90);
+                            const hl = c.SDL_FRect{
+                                .x = text_x + @as(f32, @floatFromInt(sub[0].rect.x)),
+                                .y = text_y + @as(f32, @floatFromInt(sub[0].rect.y)),
+                                .w = @floatFromInt(sub[0].rect.w),
+                                .h = @floatFromInt(sub[0].rect.h),
+                            };
+                            _ = c.SDL_RenderFillRect(renderer, &hl);
+                            _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_NONE);
+                        }
+                    }
+                } else {
+                    // Real bug, found live and confirmed with a second real
+                    // screenshot (Quinn: a trailing space still didn't
+                    // advance the caret even after the previous-character
+                    // fix -- status label proved the space really was in
+                    // the buffer, so this was never a data bug). See
+                    // TextField.zig's identical block for the full root
+                    // cause: TTF_SubString.rect is a real *ink* bounding
+                    // box, not a cursor-advance width -- a space has no ink,
+                    // so rect.w for a space's own substring is ~0
+                    // regardless of which offset it's queried at. Fixed the
+                    // same way: use the previous codepoint's rect only for
+                    // its LEFT edge and its LINE (`sub.rect.y`/`sub.rect.h`
+                    // -- still accurate, only WIDTH was ever wrong, and a
+                    // multi-line cursor position isn't at the top line in
+                    // general), then add that exact codepoint's real
+                    // advance width measured directly via TTF_GetStringSize
+                    // against just those bytes. `cursor == 0` has no
+                    // previous character to correct for. One known, narrow
+                    // gap this doesn't cover: a cursor sitting exactly at a
+                    // word-wrap break reached via navigation (not typing)
+                    // will show at the *previous* line's own end rather
+                    // than the new line's start -- out of scope for the bug
+                    // actually reported here.
+                    var sub: c.TTF_SubString = undefined;
+                    const query_offset: usize = if (self.cursor > 0) text_cursor.stepBack(self.buf[0..self.len], self.cursor) else 0;
+                    if (c.TTF_GetTextSubString(text_obj, @intCast(query_offset), &sub)) {
+                        var caret_x = sub.rect.x;
+                        if (self.cursor > 0) {
+                            const char_end = text_cursor.stepForward(self.buf[0..self.len], self.len, query_offset);
+                            const char_bytes = self.buf[query_offset..char_end];
+                            var char_w: c_int = 0;
+                            var char_h: c_int = 0;
+                            _ = c.TTF_GetStringSize(font, char_bytes.ptr, char_bytes.len, &char_w, &char_h);
+                            caret_x += char_w;
+                        }
+                        _ = c.SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+                        const caret = c.SDL_FRect{
+                            .x = text_x + @as(f32, @floatFromInt(caret_x)),
+                            .y = text_y + @as(f32, @floatFromInt(sub.rect.y)),
+                            .w = 2,
+                            .h = @floatFromInt(sub.rect.h),
+                        };
+                        _ = c.SDL_RenderFillRect(renderer, &caret);
+                    }
+                }
+            } else if (self.len == 0) {
+                var w: c_int = 0;
+                var ph: c_int = 0;
+                if (self.placeholder_obj) |pobj| _ = c.TTF_GetTextSize(pobj, &w, &ph);
+                _ = c.SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+                const caret = c.SDL_FRect{ .x = text_x, .y = text_y, .w = 2, .h = @floatFromInt(ph) };
+                _ = c.SDL_RenderFillRect(renderer, &caret);
+            }
+        }
         _ = c.SDL_SetRenderClipRect(renderer, null);
     }
 
@@ -256,4 +451,87 @@ pub fn destroyText(self: *Self) void {
         c.TTF_DestroyText(obj);
         self.placeholder_obj = null;
     }
+}
+
+fn testArea() Self {
+    return Self.init(.{ .x = 0, .y = 0, .w = 200, .h = 100 }, "placeholder");
+}
+
+test "insertAt after a plain click does not drop the first typed character" {
+    // See TextField.zig's identical test for the real bug this reproduces.
+    var f = testArea();
+    f.cursor = 0;
+    f.selection_anchor = 0;
+    f.insertAt("Q");
+    f.insertAt("u");
+    try std.testing.expectEqualStrings("Qu", f.text());
+}
+
+test "insertAt replaces an active selection" {
+    var f = testArea();
+    _ = f.setText("Hello");
+    f.selection_anchor = 1;
+    f.cursor = 4;
+    f.insertAt("X");
+    try std.testing.expectEqualStrings("HXo", f.text());
+    try std.testing.expectEqual(@as(usize, 2), f.cursor);
+    try std.testing.expect(f.selection_anchor == null);
+}
+
+test "backspace at a mid-text cursor deletes the preceding codepoint, not the end" {
+    var f = testArea();
+    _ = f.setText("Hello");
+    f.cursor = 2;
+    f.selection_anchor = 2;
+    f.backspace();
+    try std.testing.expectEqualStrings("Hllo", f.text());
+    try std.testing.expectEqual(@as(usize, 1), f.cursor);
+    try std.testing.expect(f.selection_anchor == null);
+}
+
+test "deleteForward at a mid-text cursor deletes the following codepoint" {
+    var f = testArea();
+    _ = f.setText("Hello");
+    f.cursor = 2;
+    f.selection_anchor = 2;
+    f.deleteForward();
+    try std.testing.expectEqualStrings("Helo", f.text());
+    try std.testing.expectEqual(@as(usize, 2), f.cursor);
+    try std.testing.expect(f.selection_anchor == null);
+}
+
+test "moveCursor without extend collapses to the selection's near edge" {
+    var f = testArea();
+    _ = f.setText("Hello");
+    f.selection_anchor = 1;
+    f.cursor = 4;
+    _ = f.moveCursor(.left, false);
+    try std.testing.expectEqual(@as(usize, 1), f.cursor);
+    try std.testing.expect(f.selection_anchor == null);
+
+    f.selection_anchor = 1;
+    f.cursor = 4;
+    _ = f.moveCursor(.right, false);
+    try std.testing.expectEqual(@as(usize, 4), f.cursor);
+    try std.testing.expect(f.selection_anchor == null);
+}
+
+test "moveCursor with extend grows a selection from a collapsed cursor" {
+    var f = testArea();
+    _ = f.setText("Hello");
+    f.cursor = 2;
+    f.selection_anchor = 2;
+    _ = f.moveCursor(.right, true);
+    try std.testing.expectEqual(@as(usize, 3), f.cursor);
+    try std.testing.expectEqual(@as(usize, 2), f.selection_anchor.?);
+    try std.testing.expect(f.hasSelection());
+}
+
+test "backspace deletes a trailing newline as a single codepoint" {
+    var f = testArea();
+    _ = f.setText("line one\nline two");
+    f.cursor = 9; // right after the \n
+    f.selection_anchor = 9;
+    f.backspace();
+    try std.testing.expectEqualStrings("line oneline two", f.text());
 }

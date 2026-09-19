@@ -144,6 +144,11 @@ const ScrollBar = @import("../ScrollBar.zig");
 // one's registry-internal helpers).
 const HostFunctions = @import("WidgetHostFunctions.zig");
 
+/// Re-exported so FrameLoop.zig's Left/Right key handling can name a
+/// direction without importing TextField.zig itself just for this one type
+/// -- TextField/TextArea both alias the same `text_cursor.CursorDirection`.
+pub const TextCursorDirection = TextField.CursorDirection;
+
 const Self = @This();
 
 /// W16: bumped from 64 to 128 -- a real calendar grid (Date & time picker)
@@ -1723,12 +1728,18 @@ pub fn snapshot(self: *Self, call_io: Io, out: []Slot) usize {
 /// literal newline into a focused textarea (`appendTextTo(io, id, "\n",
 /// ...)`), not a separate mechanism -- a newline is just another string to
 /// append, from this function's point of view.
-pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8) ?usize {
+/// Renamed from `appendTextTo` -- now inserts at the widget's own cursor
+/// (deleting its selection first, if any) rather than always appending to
+/// the end. When there's no selection and `cursor == len` (the default,
+/// untouched-by-the-user state), behavior is identical to the old
+/// append-to-end, so every existing caller that never moves the cursor is
+/// unaffected.
+pub fn insertTextAt(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     if (self.findLocked(id)) |slot| {
         if (slot.widget == .textfield) {
-            slot.widget.textfield.appendText(s);
+            slot.widget.textfield.insertAt(s);
             // FIT-sized Clay nodes size themselves from content -- a text
             // change can change a Clay-managed widget's geometry, so it
             // needs to force a recompute. A legacy (non-Clay) textfield's
@@ -1738,7 +1749,7 @@ pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8)
             @memcpy(out[0..text.len], text);
             return text.len;
         } else if (slot.widget == .textarea) {
-            slot.widget.textarea.appendText(s);
+            slot.widget.textarea.insertAt(s);
             if (slot.clay_managed) self.layout_generation +%= 1;
             const text = slot.widget.textarea.text();
             @memcpy(out[0..text.len], text);
@@ -1748,8 +1759,11 @@ pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8)
     return null;
 }
 
-/// W6: see `appendTextTo`'s doc comment -- same shape. W10: `.textarea`
-/// joins `.textfield` here too, same reasoning.
+/// W6: see `insertTextAt`'s doc comment -- same shape. W10: `.textarea`
+/// joins `.textfield` here too, same reasoning. The widget-level
+/// `backspace()` itself became cursor-aware (deletes the selection if any,
+/// else one codepoint before the cursor) without needing a name change
+/// here -- it's still accurate to what the Backspace key does.
 pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -1766,6 +1780,207 @@ pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
             const text = slot.widget.textarea.text();
             @memcpy(out[0..text.len], text);
             return text.len;
+        }
+    }
+    return null;
+}
+
+/// The Delete/Fn+Delete key -- mirrors `backspaceOn` exactly, in the other
+/// direction.
+pub fn deleteForwardOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        if (slot.widget == .textfield) {
+            slot.widget.textfield.deleteForward();
+            if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textfield.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
+        } else if (slot.widget == .textarea) {
+            slot.widget.textarea.deleteForward();
+            if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textarea.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
+        }
+    }
+    return null;
+}
+
+/// Arrow-key cursor movement for a focused TextField/TextArea. `direction`
+/// mirrors each widget's own `CursorDirection`; `extend` is Shift held.
+/// Returns whether anything actually changed -- callers use this to decide
+/// whether to bump `layout_generation` (cursor/selection changes affect
+/// drawn state -- the caret, the highlight -- without changing text
+/// content or Clay geometry, so this is a separate decision from the
+/// `slot.clay_managed`-gated bump `insertTextAt`/`backspaceOn` do).
+pub fn moveCursorOn(self: *Self, call_io: Io, id: u32, direction: TextCursorDirection, extend: bool) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        const changed = switch (slot.widget) {
+            .textfield => |*t| t.moveCursor(direction, extend),
+            .textarea => |*ta| ta.moveCursor(direction, extend),
+            else => false,
+        };
+        if (changed) self.layout_generation +%= 1;
+        return changed;
+    }
+    return false;
+}
+
+/// The click/click-drag hit test: positions a focused TextField/TextArea's
+/// cursor against its own synced `TTF_Text` object. `local_x`/`local_y`
+/// must already be in the text object's own local space (screen position
+/// minus the widget's draw origin -- see FrameLoop.zig's call sites, which
+/// mirror each widget's own real draw-position formula, since TextField
+/// centers vertically and TextArea anchors top-left). `.set_both` is a
+/// plain click (collapses to a caret at the clicked offset); `.extend` is
+/// drag continuation (moves the cursor, leaves the anchor from the
+/// original down-click in place). Falls back to the nearest end (0 or
+/// `len`, whichever half of the rect was clicked) when `text_obj` hasn't
+/// been synced yet -- e.g. a click on the very first frame after creation,
+/// before any render pass has run.
+pub const CursorPositionMode = enum { set_both, extend };
+
+pub fn positionCursorAt(self: *Self, call_io: Io, id: u32, local_x: f32, local_y: f32, mode: CursorPositionMode) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        if (slot.widget == .textfield) {
+            return positionCursorAtTextField(&slot.widget.textfield, local_x, local_y, mode, self);
+        } else if (slot.widget == .textarea) {
+            return positionCursorAtTextArea(&slot.widget.textarea, local_x, local_y, mode, self);
+        }
+    }
+    return false;
+}
+
+/// `clay_managed` is deliberately not consulted here (unlike
+/// `insertTextAt`/`backspaceOn`'s gated bump) -- cursor/selection changes
+/// are purely visual (the caret, the highlight), never affecting Clay
+/// geometry, the same category `setFocused`'s own unconditional bump
+/// already covers for the focus ring.
+fn positionCursorAtTextField(t: *TextField, local_x: f32, local_y: f32, mode: CursorPositionMode, self: *Self) bool {
+    const offset: usize = blk: {
+        // `t.len > 0` guards against a zero-length `text_obj` -- see
+        // TextField.syncText's own doc comment for the real crash this
+        // fixes: TTF_CreateText mishandling a zero-length string. `len ==
+        // 0` implies `text_obj == null` now (syncText destroys it), but
+        // checking both here is cheap and matches drawDecorations's own
+        // belt-and-suspenders posture, not just relying on that invariant.
+        if (t.len > 0 and t.text_obj != null) {
+            const obj = t.text_obj.?;
+            var sub: c.TTF_SubString = undefined;
+            if (c.TTF_GetTextSubStringForPoint(obj, @intFromFloat(local_x), @intFromFloat(local_y), &sub)) {
+                break :blk @intCast(@max(0, sub.offset));
+            }
+        }
+        break :blk if (local_x <= t.rect.w / 2) 0 else t.len;
+    };
+    const old_cursor = t.cursor;
+    const old_anchor = t.selection_anchor;
+    switch (mode) {
+        .set_both => {
+            t.cursor = offset;
+            t.selection_anchor = offset;
+        },
+        .extend => t.cursor = offset,
+    }
+    const changed = t.cursor != old_cursor or t.selection_anchor != old_anchor;
+    if (changed) self.layout_generation +%= 1;
+    return changed;
+}
+
+fn positionCursorAtTextArea(ta: *TextArea, local_x: f32, local_y: f32, mode: CursorPositionMode, self: *Self) bool {
+    const offset: usize = blk: {
+        // See positionCursorAtTextField's identical guard -- TextArea's own
+        // syncText already had this zero-length protection before this
+        // change, but checking `len > 0` here too matches the same
+        // belt-and-suspenders posture, not just trusting that invariant.
+        if (ta.len > 0 and ta.text_obj != null) {
+            const obj = ta.text_obj.?;
+            var sub: c.TTF_SubString = undefined;
+            if (c.TTF_GetTextSubStringForPoint(obj, @intFromFloat(local_x), @intFromFloat(local_y), &sub)) {
+                break :blk @intCast(@max(0, sub.offset));
+            }
+        }
+        break :blk if (local_y <= ta.rect.h / 2) 0 else ta.len;
+    };
+    const old_cursor = ta.cursor;
+    const old_anchor = ta.selection_anchor;
+    switch (mode) {
+        .set_both => {
+            ta.cursor = offset;
+            ta.selection_anchor = offset;
+        },
+        .extend => ta.cursor = offset,
+    }
+    const changed = ta.cursor != old_cursor or ta.selection_anchor != old_anchor;
+    if (changed) self.layout_generation +%= 1;
+    return changed;
+}
+
+/// Clipboard copy: the selected range if one is active, else the whole
+/// field -- a harmless, convenient fallback for "nothing selected."
+pub fn clipboardCopy(self: *Self, call_io: Io, id: u32, out: []u8) ?[]const u8 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        switch (slot.widget) {
+            .textfield => |*t| {
+                const text = if (t.selectionRange()) |r| t.text()[r.start..r.end] else t.text();
+                @memcpy(out[0..text.len], text);
+                return out[0..text.len];
+            },
+            .textarea => |*ta| {
+                const text = if (ta.selectionRange()) |r| ta.text()[r.start..r.end] else ta.text();
+                @memcpy(out[0..text.len], text);
+                return out[0..text.len];
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// Clipboard cut: only meaningful, and only mutates, when a selection is
+/// active -- deliberately a no-op (not "cut everything") otherwise, since
+/// Copy defaulting to "everything" is a harmless read; Cut doing the same
+/// would make a mis-typed Cmd+X quietly destructive. Returns both the cut
+/// text (for the OS clipboard) and the field's own remaining text (for the
+/// caller's `text_changed` notification) from one lock/mutate pass, rather
+/// than making the caller take a second lock just to re-read post-cut
+/// content.
+pub fn clipboardCut(self: *Self, call_io: Io, id: u32, cut_out: []u8, remaining_out: []u8) ?struct { cut: []const u8, remaining: []const u8 } {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        switch (slot.widget) {
+            .textfield => |*t| {
+                const range = t.selectionRange() orelse return null;
+                const cut_text = t.text()[range.start..range.end];
+                @memcpy(cut_out[0..cut_text.len], cut_text);
+                const cut_len = cut_text.len;
+                t.deleteSelection();
+                if (slot.clay_managed) self.layout_generation +%= 1;
+                const remaining = t.text();
+                @memcpy(remaining_out[0..remaining.len], remaining);
+                return .{ .cut = cut_out[0..cut_len], .remaining = remaining_out[0..remaining.len] };
+            },
+            .textarea => |*ta| {
+                const range = ta.selectionRange() orelse return null;
+                const cut_text = ta.text()[range.start..range.end];
+                @memcpy(cut_out[0..cut_text.len], cut_text);
+                const cut_len = cut_text.len;
+                ta.deleteSelection();
+                if (slot.clay_managed) self.layout_generation +%= 1;
+                const remaining = ta.text();
+                @memcpy(remaining_out[0..remaining.len], remaining);
+                return .{ .cut = cut_out[0..cut_len], .remaining = remaining_out[0..remaining.len] };
+            },
+            else => return null,
         }
     }
     return null;

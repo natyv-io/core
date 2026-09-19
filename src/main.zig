@@ -526,7 +526,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         for (windows[0..window_count], 0..) |*wctx, i| {
-            FrameLoop.drawWindow(&runtime.widgets, io, &queue, wctx, per_window_slots[i][0..per_window_slot_count[i]], per_window_is_floating[i][0..per_window_slot_count[i]], per_window_topmost_modal[i], arrow_cursor, pointer_cursor);
+            FrameLoop.drawWindow(&runtime.widgets, io, &queue, wctx, per_window_slots[i][0..per_window_slot_count[i]], per_window_is_floating[i][0..per_window_slot_count[i]], per_window_topmost_modal[i], arrow_cursor, pointer_cursor, default_font.font);
         }
 
         // Recompute for the *next* iteration's wait mode -- see

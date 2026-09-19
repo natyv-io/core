@@ -19,6 +19,7 @@
 //! per-window.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const Slider = @import("widgets/Slider.zig");
@@ -417,7 +418,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
     };
 }
 
-fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot, clip: ?c.SDL_FRect, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle) ?u32 {
+fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, slot: WidgetHost.Slot, clip: ?c.SDL_FRect, mx: f32, my: f32, dragging_slider_id: *?u32, dragging_range_handle: *?RangeSlider.Handle, text_selecting_id: *?u32) ?u32 {
     if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) return null;
     if (!withinClip(clip, mx, my)) return null;
     switch (slot.widget) {
@@ -442,10 +443,34 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             activateWidget(widgets, io, queue, slot.id, .radio_button, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
+        // Click positions the cursor (collapsing any selection) against the
+        // widget's own real draw-position formula, not a generic one --
+        // TextField vertically centers its text (mirrors its own
+        // drawDecorations exactly, including the same TTF_GetTextSize call
+        // to find that offset), TextArea anchors top-left. WidgetHost's own
+        // positionCursorAt falls back to nearest-end when text_obj hasn't
+        // synced yet (e.g. the very first frame after creation).
         .textfield => |t| if (t.containsPoint(mx, my)) {
+            const padding = WidgetHost.effectiveTextPadding(slot.clay_style.padding);
+            const local_x = mx - t.rect.x - @as(f32, @floatFromInt(padding.left));
+            var text_h: f32 = 0;
+            if (t.text_obj) |obj| {
+                var w: c_int = 0;
+                var h: c_int = 0;
+                _ = c.TTF_GetTextSize(obj, &w, &h);
+                text_h = @floatFromInt(h);
+            }
+            const local_y = my - (t.rect.y + t.rect.h / 2 - text_h / 2);
+            _ = widgets.positionCursorAt(io, slot.id, local_x, local_y, .set_both);
+            text_selecting_id.* = slot.id;
             return slot.id;
         },
         .textarea => |ta| if (ta.containsPoint(mx, my)) {
+            const padding = WidgetHost.effectiveTextPadding(slot.clay_style.padding);
+            const local_x = mx - ta.rect.x - @as(f32, @floatFromInt(padding.left));
+            const local_y = my - ta.rect.y - @as(f32, @floatFromInt(padding.top));
+            _ = widgets.positionCursorAt(io, slot.id, local_x, local_y, .set_both);
+            text_selecting_id.* = slot.id;
             return slot.id;
         },
         .slider => |s| if (s.containsPoint(mx, my)) {
@@ -652,7 +677,7 @@ fn intersectClipRects(a: c.SDL_Rect, b: c.SDL_Rect) c.SDL_Rect {
 /// rather than replacing it, and always restores the prior clip
 /// afterward -- both call sites below already scope their own outer
 /// clip the same way.
-fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding, shape_cache: *ShapeCache.Cache) void {
+fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding, shape_cache: *ShapeCache.Cache, font: *c.TTF_Font) void {
     const padding = WidgetHost.effectiveTextPadding(raw_padding);
 
     const had_prior_clip = c.SDL_RenderClipEnabled(renderer);
@@ -672,8 +697,8 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, 
 
     switch (widget) {
         .button => |b| b.drawDecorations(renderer, padding),
-        .textfield => |t| t.drawDecorations(renderer, padding),
-        .textarea => |ta| ta.drawDecorations(renderer, padding),
+        .textfield => |t| t.drawDecorations(renderer, padding, font),
+        .textarea => |ta| ta.drawDecorations(renderer, padding, font),
         .label => |l| l.drawDecorations(renderer, padding),
         .checkbox => |cb| cb.drawDecorations(renderer),
         .toggle => |tg| tg.drawDecorations(renderer),
@@ -691,7 +716,7 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, 
     }
 }
 
-fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, image_cache: *ImageCache.Cache) void {
+fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, image_cache: *ImageCache.Cache, font: *c.TTF_Font) void {
     const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
     if (slot.widget.fillRect()) |fr| {
@@ -705,7 +730,7 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
         var w = slot.widget;
         drawStyledFill(renderer, shape_cache, image_cache, slot.clay_style, w.rectPtr().*, transparent);
     }
-    drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding, shape_cache);
+    drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding, shape_cache, font);
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
 }
 
@@ -772,7 +797,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                 if (topmost_modal) |modal_id| {
                     for (slots, clip_rects[0..slots.len]) |slot, clip| {
                         if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
-                        if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                        if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle, &wctx.interaction.text_selecting_id)) |id| hit_focusable = id;
                     }
                 } else {
                     var topmost_floating_root: ?u32 = null;
@@ -787,12 +812,12 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                         if (topmost_floating_root) |root| {
                             if (FloatingOrder.nearestFloatingRoot(slots, index, slot.id) != root) continue;
                         }
-                        if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                        if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle, &wctx.interaction.text_selecting_id)) |id| hit_focusable = id;
                     }
                     if (hit_focusable == null) {
                         for (slots, clip_rects[0..slots.len], is_floating) |slot, clip, floating| {
                             if (floating) continue;
-                            if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle)) |id| hit_focusable = id;
+                            if (tryHitWidget(widgets, io, queue, slots, index, slot, clip, mx, my, &wctx.interaction.dragging_slider_id, &wctx.interaction.dragging_range_handle, &wctx.interaction.text_selecting_id)) |id| hit_focusable = id;
                         }
                     }
                 }
@@ -803,12 +828,15 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
             if (event.button.button == c.SDL_BUTTON_LEFT) {
                 wctx.interaction.dragging_slider_id = null;
                 wctx.interaction.dragging_range_handle = null;
+                // Selection itself persists after release -- only the
+                // drag-in-progress flag clears, mirroring dragging_slider_id.
+                wctx.interaction.text_selecting_id = null;
             }
         },
         c.SDL_EVENT_TEXT_INPUT => {
             if (wctx.interaction.focused_widget_id) |id| {
                 var text_buf: [max_text_widget_len]u8 = undefined;
-                if (widgets.appendTextTo(io, id, std.mem.span(event.text.text), &text_buf)) |n| {
+                if (widgets.insertTextAt(io, id, std.mem.span(event.text.text), &text_buf)) |n| {
                     notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
                 }
             }
@@ -822,6 +850,48 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                 var text_buf: [max_text_widget_len]u8 = undefined;
                 if (widgets.backspaceOn(io, id, &text_buf)) |n| {
                     notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
+                }
+            },
+            c.SDLK_DELETE => if (wctx.interaction.focused_widget_id) |id| {
+                var text_buf: [max_text_widget_len]u8 = undefined;
+                if (widgets.deleteForwardOn(io, id, &text_buf)) |n| {
+                    notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
+                }
+            },
+            // Cmd on macOS, Ctrl elsewhere -- matches each OS's own native
+            // clipboard-shortcut convention. No prior OS-conditional-input
+            // precedent exists in this codebase to follow; this is a
+            // fresh, deliberate per-key choice, not an established pattern.
+            c.SDLK_C => if (wctx.interaction.focused_widget_id) |id| {
+                if ((event.key.mod & (if (builtin.os.tag == .macos) c.SDL_KMOD_GUI else c.SDL_KMOD_CTRL)) != 0) {
+                    var text_buf: [max_text_widget_len + 1]u8 = undefined;
+                    if (widgets.clipboardCopy(io, id, text_buf[0..max_text_widget_len])) |text| {
+                        text_buf[text.len] = 0;
+                        _ = c.SDL_SetClipboardText(@ptrCast(&text_buf));
+                    }
+                }
+            },
+            c.SDLK_X => if (wctx.interaction.focused_widget_id) |id| {
+                if ((event.key.mod & (if (builtin.os.tag == .macos) c.SDL_KMOD_GUI else c.SDL_KMOD_CTRL)) != 0) {
+                    var cut_buf: [max_text_widget_len + 1]u8 = undefined;
+                    var remaining_buf: [max_text_widget_len]u8 = undefined;
+                    if (widgets.clipboardCut(io, id, cut_buf[0..max_text_widget_len], &remaining_buf)) |result| {
+                        cut_buf[result.cut.len] = 0;
+                        _ = c.SDL_SetClipboardText(@ptrCast(&cut_buf));
+                        notifyTextChanged(queue, io, id, result.remaining, slots, index);
+                    }
+                }
+            },
+            c.SDLK_V => if (wctx.interaction.focused_widget_id) |id| {
+                if ((event.key.mod & (if (builtin.os.tag == .macos) c.SDL_KMOD_GUI else c.SDL_KMOD_CTRL)) != 0) {
+                    if (c.SDL_GetClipboardText()) |clip_ptr| {
+                        defer c.SDL_free(clip_ptr);
+                        const clip_text = std.mem.span(clip_ptr);
+                        var text_buf: [max_text_widget_len]u8 = undefined;
+                        if (widgets.insertTextAt(io, id, clip_text, &text_buf)) |n| {
+                            notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
+                        }
+                    }
                 }
             },
             c.SDLK_TAB => {
@@ -851,7 +921,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                             }
                             if (slot.widget == .textarea and event.key.key != c.SDLK_SPACE) {
                                 var text_buf: [max_text_widget_len]u8 = undefined;
-                                if (widgets.appendTextTo(io, id, "\n", &text_buf)) |n| {
+                                if (widgets.insertTextAt(io, id, "\n", &text_buf)) |n| {
                                     notifyTextChanged(queue, io, id, text_buf[0..n], slots, index);
                                 }
                             }
@@ -875,6 +945,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                         .segmented_control => |sc| notifySegmentedValue(widgets, io, queue, id, if (sc.selected_index > 0) sc.selected_index - 1 else 0, surface_id),
                         .tabs => |tb| notifyTabsValue(widgets, io, queue, id, if (tb.selected_index > 0) tb.selected_index - 1 else 0, surface_id),
                         .button => queue.push(io, id, .key_nav, "{\"key\":\"left\"}", surface_id),
+                        .textfield, .textarea => _ = widgets.moveCursorOn(io, id, .left, (event.key.mod & c.SDL_KMOD_SHIFT) != 0),
                         else => {},
                     }
                 }
@@ -890,6 +961,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                         .segmented_control => |sc| notifySegmentedValue(widgets, io, queue, id, sc.selected_index + 1, surface_id),
                         .tabs => |tb| notifyTabsValue(widgets, io, queue, id, tb.selected_index + 1, surface_id),
                         .button => queue.push(io, id, .key_nav, "{\"key\":\"right\"}", surface_id),
+                        .textfield, .textarea => _ = widgets.moveCursorOn(io, id, .right, (event.key.mod & c.SDL_KMOD_SHIFT) != 0),
                         else => {},
                     }
                 }
@@ -944,7 +1016,7 @@ fn containsIdInSlots(slots: []const WidgetHost.Slot, id: u32) bool {
 /// cursor is actually over ever calls `SDL_SetCursor` -- for the original
 /// single-window case this is exactly today's behavior (the one window
 /// always has mouse focus whenever the cursor is over it at all).
-pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []WidgetHost.Slot, is_floating: []const bool, topmost_modal: ?u32, arrow_cursor: ?*c.SDL_Cursor, pointer_cursor: ?*c.SDL_Cursor) void {
+pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *WindowManager.WindowContext, slots: []WidgetHost.Slot, is_floating: []const bool, topmost_modal: ?u32, arrow_cursor: ?*c.SDL_Cursor, pointer_cursor: ?*c.SDL_Cursor, font: *c.TTF_Font) void {
     const widget_count = slots.len;
     // Built once per draw pass, shared by every `FloatingOrder`/
     // `isEffectivelyVisible` lookup below -- see
@@ -966,6 +1038,39 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             } else if (slot.id == id and slot.widget == .range_slider) {
                 const handle = wctx.interaction.dragging_range_handle orelse slot.widget.range_slider.active_handle;
                 notifyRangeSliderValue(widgets, io, queue, id, handle, slot.widget.range_slider.valueFromX(wctx.interaction.mouse_x), FloatingOrder.surfaceIdFor(slots, index, id));
+            }
+        }
+    }
+
+    // Text selection drag continuation -- same per-frame-polled-mouse-
+    // position mechanism as the slider block above (mouse_x/mouse_y are
+    // polled once/frame, not event-driven; see InteractionState's own doc
+    // comment), converting to each widget's own local text-space exactly
+    // like tryHitWidget's click handler does.
+    if (wctx.interaction.text_selecting_id) |id| {
+        for (slots) |slot| {
+            if (slot.id != id) continue;
+            switch (slot.widget) {
+                .textfield => |t| {
+                    const padding = WidgetHost.effectiveTextPadding(slot.clay_style.padding);
+                    const local_x = wctx.interaction.mouse_x - t.rect.x - @as(f32, @floatFromInt(padding.left));
+                    var text_h: f32 = 0;
+                    if (t.text_obj) |obj| {
+                        var w: c_int = 0;
+                        var h: c_int = 0;
+                        _ = c.TTF_GetTextSize(obj, &w, &h);
+                        text_h = @floatFromInt(h);
+                    }
+                    const local_y = wctx.interaction.mouse_y - (t.rect.y + t.rect.h / 2 - text_h / 2);
+                    _ = widgets.positionCursorAt(io, id, local_x, local_y, .extend);
+                },
+                .textarea => |ta| {
+                    const padding = WidgetHost.effectiveTextPadding(slot.clay_style.padding);
+                    const local_x = wctx.interaction.mouse_x - ta.rect.x - @as(f32, @floatFromInt(padding.left));
+                    const local_y = wctx.interaction.mouse_y - ta.rect.y - @as(f32, @floatFromInt(padding.top));
+                    _ = widgets.positionCursorAt(io, id, local_x, local_y, .extend);
+                },
+                else => {},
             }
         }
     }
@@ -1124,7 +1229,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     // never run a real pass yet (both cases where there's no "actually
     // computed" generation to defer to regardless).
     const current_generation = if (wctx.clay_layout) |*cl| (cl.last_computed_generation orelse widgets.currentGeneration(io)) else widgets.currentGeneration(io);
-    const dragging = wctx.interaction.dragging_slider_id != null;
+    const dragging = wctx.interaction.dragging_slider_id != null or wctx.interaction.text_selecting_id != null;
     const warming_up = now_ms - wctx.created_at_ms < window_redraw_warmup_ms;
     // Real, live-caught bug (2026-09-06): `needs_continuous_redraw` only
     // ever reports whether a flash/Spinner animation is *still* active right
@@ -1251,7 +1356,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-        drawWidgetDecorations(slot.widget, wctx.renderer, slot.clay_style.padding, &wctx.shape_cache);
+        drawWidgetDecorations(slot.widget, wctx.renderer, slot.clay_style.padding, &wctx.shape_cache, font);
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
     }
 
@@ -1276,7 +1381,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (topmost_modal) |modal_id| {
             if (FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
         }
-        drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache);
+        drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache, font);
     }
     // A floating (but non-modal) scrollable widget's own scrollbar -- e.g.
     // a scrollable Dropdown/Menu panel -- belongs here: above ordinary
@@ -1304,7 +1409,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             if (!floating) continue;
             if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
             if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
-            drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache);
+            drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache, font);
         }
         // A scrollable widget inside the modal itself (e.g. a long
         // message list in a Dialog) -- correctly on top of everything,
