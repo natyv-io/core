@@ -11,6 +11,7 @@
 //! predicted before either W3 or the slider it's for were built.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const Self = @This();
@@ -98,6 +99,20 @@ shutdown: bool = false,
 /// than returns it.
 generation: u32 = 0,
 
+/// Per-event queue tracing. Silent under `zig build test`: these fire on
+/// every single push, so in a unit test they are pure noise -- and Zig's
+/// build runner echoes any step that produced *any* stderr as
+/// `failed command: ...` even when that step passed (build_runner.zig's
+/// "No matter the result, we want to display error/warning messages"
+/// block, gated on `result_stderr.len > 0`). That message is
+/// indistinguishable from a real build failure and cost a real debugging
+/// session. Genuine failures below (a dropped push on alloc failure) stay
+/// unconditional -- those are errors, not traces.
+fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
+    std.debug.print(fmt, args);
+}
+
 pub fn init(allocator: std.mem.Allocator) Self {
     return .{ .allocator = allocator };
 }
@@ -137,7 +152,7 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
                 existing.payload = owned;
                 self.seq_counter += 1;
                 existing.seq = self.seq_counter;
-                std.debug.print("[queue]  coalesced    widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), existing.seq, self.items.items.len });
+                trace("[queue]  coalesced    widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), existing.seq, self.items.items.len });
                 self.cond.signal(io);
                 return;
             }
@@ -152,7 +167,7 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
         self.allocator.free(owned);
         return;
     };
-    std.debug.print("[queue]  pushed       widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), seq, self.items.items.len });
+    trace("[queue]  pushed       widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), seq, self.items.items.len });
     self.cond.signal(io);
 }
 
