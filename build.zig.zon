@@ -11,26 +11,32 @@
         .extism_aarch64_macos = .{
             .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-aarch64-apple-darwin-v1.30.0.tar.gz",
             .hash = "N-V-__8AAFoRKQbJyBexdHaVn_1CaGv54NZyZxQjpKk4DhKu",
+            .lazy = true,
         },
         .extism_x86_64_macos = .{
             .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-apple-darwin-v1.30.0.tar.gz",
             .hash = "N-V-__8AABJ4igZfENpmL70NeY2h63RO2bPPychyHBYgc_VW",
+            .lazy = true,
         },
         .extism_x86_64_linux_gnu = .{
             .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-unknown-linux-gnu-v1.30.0.tar.gz",
             .hash = "N-V-__8AANRaSwmstPv9ox7zLy4Kjj3c4IYRDZCB14tkbS_X",
+            .lazy = true,
         },
         .extism_aarch64_linux_gnu = .{
             .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-aarch64-unknown-linux-gnu-v1.30.0.tar.gz",
             .hash = "N-V-__8AAJBFqgj-JoK1LxhwRPOvAw0-5iFkaWF4zSk7GYGx",
+            .lazy = true,
         },
         .extism_x86_64_windows_gnu = .{
             .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-pc-windows-gnu-v1.30.0.tar.gz",
             .hash = "N-V-__8AAMYC9AfopfBtCj992qD9wRNwojVmC4JNjZuGUTfz",
+            .lazy = true,
         },
         .llvm_mingw = .{
             .url = "https://github.com/mstorsjo/llvm-mingw/releases/download/20260826/llvm-mingw-20260826-ucrt-macos-universal.tar.xz",
             .hash = "N-V-__8AACLxny4duQDp3FGCPOH31CSIZ2WJAe2AEo9XajH0",
+            .lazy = true,
         },
         .mbedtls = .{
             .url = "https://github.com/allyourcodebase/mbedtls/archive/55f2af148634945e9508a3a50de2ccfe65eb971f.tar.gz",
