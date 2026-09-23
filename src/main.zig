@@ -187,6 +187,34 @@ pub fn main(init: std.process.Init) !void {
             "built-in default",
     });
 
+    // Startup-window size, same three-level precedence as the background
+    // above. `natyv_clay_create_window` (further below) deliberately keeps
+    // passing the guest's own requested size instead: the guest asked for
+    // those dimensions explicitly, and a stylesheet shouldn't silently
+    // resize a window it never mentioned.
+    const default_window_width: u16 = 900;
+    const default_window_height: u16 = 700;
+    // if/else-if rather than a chained `orelse`: `WindowStyle.width` is
+    // comptime-known, so when it is non-null Zig folds `a orelse b` to a
+    // plain `u16` and the next `orelse` fails to compile. That only
+    // happens with the *generated* file, never with the Absent stub --
+    // i.e. only once someone actually sets the value, which is exactly
+    // the case a build against the stub cannot catch.
+    const window_width: u16 = if (WindowStyle.width) |w| w else if (config.value.ui.width) |w| w else default_window_width;
+    const window_height: u16 = if (WindowStyle.height) |h| h else if (config.value.ui.height) |h| h else default_window_height;
+    // Reported per dimension, not once for the pair: the two sources
+    // compose per-field, so a mixed case (width from the stylesheet,
+    // height from config) is real and a single label for both would be
+    // actively wrong -- which it was, until a composition test showed it
+    // claiming ".ntss window block" for a height that came from config.
+    timing.traceNote("{s:<38}: {d}x{d} (width: {s}, height: {s})\n", .{
+        "window size",
+        window_width,
+        window_height,
+        if (WindowStyle.width != null) ".ntss" else if (config.value.ui.width != null) "ui.width" else "default",
+        if (WindowStyle.height != null) ".ntss" else if (config.value.ui.height != null) "ui.height" else "default",
+    });
+
     const t_total = timing.traceStart();
     const t_sdl = timing.traceStart();
 
@@ -309,7 +337,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(windows);
     var window_count: usize = 0;
     const t_win = timing.traceStart();
-    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, window_background, null);
+    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, @floatFromInt(window_width), @floatFromInt(window_height), default_font.font, clay_enabled, window_background, null);
     timing.tracePhase("createWindowContext", t_win);
     timing.traceNote("---------------------------------------\n", .{});
     timing.tracePhase("TOTAL to first window", t_total);
