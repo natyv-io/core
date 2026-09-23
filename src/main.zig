@@ -140,6 +140,21 @@ pub fn main(init: std.process.Init) !void {
     const app_name_z = try allocator.dupeZ(u8, config.value.name);
     defer allocator.free(app_name_z);
 
+    // The window's own clear color (`FrameLoop.drawWindow`), resolved once
+    // here rather than per-window so a malformed value fails at startup
+    // with one clear message instead of silently painting the default.
+    // `#18181C` is natyv's built-in dark ground -- the literal this
+    // replaced, kept as the default so an app that sets nothing looks
+    // exactly as it did before.
+    const default_background: c.SDL_Color = .{ .r = 0x18, .g = 0x18, .b = 0x1C, .a = 255 };
+    const window_background: c.SDL_Color = if (config.value.ui.background_color) |hex| blk: {
+        const rgba = Config.parseHexRgba(hex) orelse {
+            std.debug.print("[main] ui.background_color: '{s}' is not a real hex color (expected #RRGGBB or #RRGGBBAA)\n", .{hex});
+            return error.InvalidBackgroundColor;
+        };
+        break :blk .{ .r = rgba.r, .g = rgba.g, .b = rgba.b, .a = rgba.a };
+    } else default_background;
+
     // Startup tracing is opt-in via NATYV_STARTUP_TRACE (see timing.zig).
     timing.trace_enabled = init.environ_map.get("NATYV_STARTUP_TRACE") != null;
     const t_total = timing.traceStart();
@@ -264,7 +279,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(windows);
     var window_count: usize = 0;
     const t_win = timing.traceStart();
-    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, null);
+    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, window_background, null);
     timing.tracePhase("createWindowContext", t_win);
     timing.traceNote("---------------------------------------\n", .{});
     timing.tracePhase("TOTAL to first window", t_total);
@@ -386,7 +401,7 @@ pub fn main(init: std.process.Init) !void {
                 @memcpy(title_buf[0..req.title_len], req.title_buf[0..req.title_len]);
                 title_buf[req.title_len] = 0;
                 const title_z: [:0]const u8 = title_buf[0..req.title_len :0];
-                windows[window_count] = WindowManager.createWindowContext(allocator, title_z, req.width, req.height, default_font.font, clay_enabled, req.widget_id) catch |err| {
+                windows[window_count] = WindowManager.createWindowContext(allocator, title_z, req.width, req.height, default_font.font, clay_enabled, window_background, req.widget_id) catch |err| {
                     std.debug.print("[main] failed to create window for widget {d}: {}\n", .{ req.widget_id, err });
                     continue;
                 };

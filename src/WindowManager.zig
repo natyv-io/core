@@ -53,6 +53,13 @@ pub const WindowContext = struct {
     /// reasoning as `shape_cache`, kept as a separate cache since it's keyed
     /// by asset id rather than shape geometry.
     image_cache: ImageCache.Cache = .{},
+    /// What SDL clears this window's renderer to before any widget draws
+    /// (`FrameLoop.drawWindow`). Comes from `ui.background_color` in
+    /// conf.natyv.json, defaulting to natyv's built-in dark ground.
+    /// Per-window rather than global so a guest-opened window could
+    /// eventually differ from the startup one; today every window is
+    /// created with the same configured value.
+    background: c.SDL_Color,
     /// See file doc comment -- `null` for the original startup window.
     root_widget_id: ?u32,
     interaction: InteractionState = .{},
@@ -151,7 +158,47 @@ pub const WindowContext = struct {
 /// every frame regardless, and `ClayLayout.layoutIfNeeded`'s own dirty
 /// check (`last_window_w`/`last_window_h`) is what actually notices a real
 /// size change and re-lays-out against it.
-pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, width: f32, height: f32, default_font: *c.TTF_Font, clay_enabled: bool, root_widget_id: ?u32) !WindowContext {
+/// A disabled Button's fill, derived from whatever this window's own
+/// background actually is.
+///
+/// Was a fixed constant `(0.14, 0.15, 0.17)` in FrameLoop.zig, hand-tuned
+/// in 2026-09-02 against the then-hardcoded `#18181C` ground: the original
+/// value was *brighter* than e.g. mail-natyv's own secondaryBtn, making
+/// disabled buttons read more prominent than active ones, backwards from
+/// how "disabled" should look. The fix was to sit it just off the app's
+/// dark background rather than at a fixed absolute gray. Once the
+/// background became configurable that constant stopped being correct for
+/// any app that changed it, so the same intent is expressed directly:
+/// offset from the real background, away from it, by a fixed amount.
+///
+/// Direction comes from the background's own relative luminance -- lighten
+/// a dark ground, darken a light one -- so a disabled button stays duller
+/// than a normal one on either. The luminance weights are the usual
+/// 0.2126/0.7152/0.0722, applied to plain sRGB values rather than
+/// linearized ones: this only picks a direction, so the extra precision
+/// would not change an answer.
+///
+/// Against the default `#18181C` this yields ~(0.149, 0.149, 0.165),
+/// within 0.01 per channel of the hand-tuned value it replaces -- which is
+/// the real check that the derivation expresses the original intent rather
+/// than merely compiling.
+pub fn disabledFillFor(background: c.SDL_Color) c.SDL_FColor {
+    const r = @as(f32, @floatFromInt(background.r)) / 255.0;
+    const g = @as(f32, @floatFromInt(background.g)) / 255.0;
+    const b = @as(f32, @floatFromInt(background.b)) / 255.0;
+
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const offset: f32 = if (luminance < 0.5) 0.055 else -0.055;
+
+    return .{
+        .r = std.math.clamp(r + offset, 0.0, 1.0),
+        .g = std.math.clamp(g + offset, 0.0, 1.0),
+        .b = std.math.clamp(b + offset, 0.0, 1.0),
+        .a = 1.0,
+    };
+}
+
+pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, width: f32, height: f32, default_font: *c.TTF_Font, clay_enabled: bool, background: c.SDL_Color, root_widget_id: ?u32) !WindowContext {
     const window = c.SDL_CreateWindow(title.ptr, @intFromFloat(width), @intFromFloat(height), c.SDL_WINDOW_RESIZABLE) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlWindowFailed;
@@ -195,6 +242,7 @@ pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, wi
         .renderer = renderer,
         .clay_layout = clay_layout,
         .text_engine = text_engine,
+        .background = background,
         .root_widget_id = root_widget_id,
         .created_at_ms = timing.nowMs(),
     };
@@ -236,6 +284,12 @@ test "texture fill: WindowContext's real image_cache/shape_cache decode and comp
         .renderer = renderer,
         .clay_layout = null,
         .text_engine = text_engine,
+        // Irrelevant to what this test checks (image_cache decoding), but
+        // `background` deliberately has no default: requiring it here is
+        // what makes the compiler catch a real call site that forgot to
+        // pass the app's configured color and would silently paint the
+        // built-in one instead.
+        .background = .{ .r = 0x18, .g = 0x18, .b = 0x1C, .a = 255 },
         .root_widget_id = null,
     };
 
@@ -252,4 +306,30 @@ test "texture fill: WindowContext's real image_cache/shape_cache decode and comp
 
     wctx.shape_cache.deinit();
     wctx.image_cache.deinit();
+}
+
+test "disabledFillFor reproduces the hand-tuned value for the default background" {
+    // The constant this replaced: (0.14, 0.15, 0.17), tuned by eye against
+    // #18181C. Derivation must land on effectively the same color, or it is
+    // not expressing the original intent.
+    const fill = disabledFillFor(.{ .r = 0x18, .g = 0x18, .b = 0x1C, .a = 255 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.14), fill.r, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.15), fill.g, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.17), fill.b, 0.01);
+}
+
+test "disabledFillFor lightens a dark ground and darkens a light one" {
+    const on_dark = disabledFillFor(.{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    try std.testing.expect(on_dark.r > 0.0);
+
+    const on_light = disabledFillFor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    try std.testing.expect(on_light.r < 1.0);
+}
+
+test "disabledFillFor clamps rather than wrapping at either extreme" {
+    const black = disabledFillFor(.{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    try std.testing.expect(black.r >= 0.0 and black.r <= 1.0);
+
+    const white = disabledFillFor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    try std.testing.expect(white.r >= 0.0 and white.r <= 1.0);
 }

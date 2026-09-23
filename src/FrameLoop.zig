@@ -581,18 +581,14 @@ fn styleOverrideColor(fcolor: ?c.SDL_FColor) ?c.SDL_Color {
 /// correct.
 const transparent: c.SDL_Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
 
-/// A disabled Button's fixed fill color -- see `ClayStyle.enabled`'s own
-/// doc comment for why this always wins over any guest-set NTSS
-/// `backgroundColor`, and why text itself can't also be dimmed to match.
-///
-/// Deliberately darker/duller than any real button color role (2026-09-02,
-/// fixing a real bug: the original (0.3, 0.31, 0.32) was *brighter* than
-/// e.g. mail-natyv's own secondaryBtn (#2A2E37 = 0.165, 0.18, 0.216),
-/// making disabled buttons visually more prominent than active ones --
-/// backwards from how "disabled" should read. Sits close to the app's own
-/// dark root background rather than any fixed absolute gray, so it stays
-/// duller than a normal button's color across any real color scheme.
-const disabled_color: c.SDL_FColor = .{ .r = 0.14, .g = 0.15, .b = 0.17, .a = 1.0 };
+/// A disabled Button's fill now comes from `WindowManager.disabledFillFor`,
+/// derived from the window's own configured background rather than a fixed
+/// constant -- see that function for the full reasoning and the 2026-09-02
+/// bug the original constant was itself fixing. Kept as a note here because
+/// this is where the value is consumed, and because `ClayStyle.enabled`'s
+/// own doc comment still points at this file for why a disabled Button's
+/// fill always wins over any guest-set NTSS `backgroundColor`, and why the
+/// text itself can't also be dimmed to match.
 
 /// Real, once-unnoticed gap between two unrelated opt-ins (2026-09-02):
 /// `Widget.fillRect()` returning null (a plain Container's own W5
@@ -1286,7 +1282,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     wctx.last_drawn_generation = current_generation;
     wctx.draw_count += 1;
 
-    _ = c.SDL_SetRenderDrawColor(wctx.renderer, 24, 24, 28, 255);
+    _ = c.SDL_SetRenderDrawColor(wctx.renderer, wctx.background.r, wctx.background.g, wctx.background.b, wctx.background.a);
     _ = c.SDL_RenderClear(wctx.renderer);
 
     for (slots, clip_rects[0..widget_count], is_floating) |slot, clip, floating| {
@@ -1318,7 +1314,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         // separate parameter everywhere color gets resolved.
         var effective_style = slot.clay_style;
         if (slot.widget == .button and !slot.clay_style.enabled) {
-            effective_style.background_color = disabled_color;
+            effective_style.background_color = WindowManager.disabledFillFor(wctx.background);
         }
 
         if (effective_style.corner_radius != null or effective_style.border != null or effective_style.gradient != null or effective_style.texture != null) {

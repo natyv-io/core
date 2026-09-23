@@ -197,8 +197,25 @@ pub fn build(b: *std.Build) void {
     // on instead of each carrying a copy. `src/main.zig` reaches it via
     // the named import `Config` below (was a plain relative
     // `@import("Config.zig")` before the natyv-io repo split).
-    const shared_dep = b.dependency("shared", .{ .target = target, .optimize = optimize });
-    const config_mod = shared_dep.module("Config");
+    //
+    // `-Dshared-src=` overrides that pinned dependency with a local
+    // natyv-io/shared checkout, the same escape-hatch shape
+    // `-Dextism-prefix` already has. Without it, any change spanning both
+    // repos (a new conf.natyv.json field consumed here, say) can't be
+    // built at all until shared is committed, pushed, and re-pinned --
+    // which makes iterating on one impossible. Safe as a plain module
+    // rather than a full dependency because `Config.zig` imports nothing
+    // but `std`; if it ever grows a dependency of its own this has to
+    // become a real `b.dependency` against the local path instead.
+    const shared_src = b.option([]const u8, "shared-src", "Path to a local natyv-io/shared checkout, overriding the pinned dependency (local development only -- a release always builds against the pinned one)");
+    const config_mod = if (shared_src) |dir|
+        b.createModule(.{
+            .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ dir, "src", "Config.zig" }) },
+            .target = target,
+            .optimize = optimize,
+        })
+    else
+        b.dependency("shared", .{ .target = target, .optimize = optimize }).module("Config");
 
     // `natyv build`'s own bundling step (`-Dembed-app-wasm=true`): when
     // true, `src/main.zig` uses `EmbeddedWasmPresent.zig`'s

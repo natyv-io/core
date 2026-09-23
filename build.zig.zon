@@ -43,8 +43,8 @@
             .hash = "mbedtls-3.6.6-E4NUR4cWAACCHFSwZ5urTBPK4A6EZlm3pSUjfg4c3QAw",
         },
         .shared = .{
-            .url = "git+https://github.com/natyv-io/shared#b8a803939a9972ab0f8285708d41648e69b43842",
-            .hash = "natyv_shared-0.1.0-cp-g4M6uBgA1OZzgqkOV2R3i7y8bWkuCVrykkOKmTW_j",
+            .url = "git+https://github.com/natyv-io/shared#a7e0c61ed51a1b474bf5672bb4adca905e4cafc8",
+            .hash = "natyv_shared-0.1.0-cp-g4L4KCAAEI2ROea6E6Ong58Hdwo4gu1sYzqaEU4fn",
         },
     },
     .paths = .{
