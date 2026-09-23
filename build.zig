@@ -250,6 +250,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // `.ntss`'s reserved `window` block: identical file-swap choreography
+    // to `-Dhas-textures` above, and staged by the same `natyv prepare`
+    // pass. Window-level styling can't travel through the generated Go
+    // style tokens the way widget styling does -- those only ever reach
+    // the guest, and the window background is what SDL clears the renderer
+    // to before any widget draws at all.
+    const window_style = b.option(bool, "window-style", "Use src/assets/WindowStyleGenerated.zig (written by `natyv prepare`) instead of the empty WindowStyleAbsent.zig stub (set by `natyv build`, never by hand)") orelse false;
+    const window_style_mod = b.createModule(.{
+        .root_source_file = b.path(if (window_style) "src/assets/WindowStyleGenerated.zig" else "src/assets/WindowStyleAbsent.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Binding generator: the identical file-swap choreography as
     // `-Dembed-app-wasm` above, just for a real Zig *source* file. `natyv
     // build` (natyv-io/cli) writes a real `src/BindingsGenerated.zig`
@@ -343,6 +356,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("EmbeddedWasm", embedded_wasm_mod);
     exe.root_module.addImport("Bindings", bindings_mod);
     exe.root_module.addImport("TextureAssets", texture_assets_mod);
+    exe.root_module.addImport("WindowStyle", window_style_mod);
 
     // Windows icon embedding (`Config.icon`): natyv-io/cli's
     // `WindowsIcon.zig` generates a real `.ico` + a small `.rc`

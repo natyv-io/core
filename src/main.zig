@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const Config = @import("Config");
+const WindowStyle = @import("WindowStyle");
 const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const build_options = @import("build_options");
@@ -95,6 +96,11 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
+    // Set before anything else that might trace: a `traceNote` call that
+    // runs before this silently no-ops, which is exactly the bug that hid
+    // the window-background line the first time it was added.
+    timing.trace_enabled = init.environ_map.get("NATYV_STARTUP_TRACE") != null;
+
     // `Args.Iterator.initAllocator`, not raw `argv[i]` indexing --
     // `init.minimal.args.vector` isn't an array of C-string pointers on
     // every target the way it is on POSIX: on Windows it's the single raw
@@ -143,20 +149,44 @@ pub fn main(init: std.process.Init) !void {
     // The window's own clear color (`FrameLoop.drawWindow`), resolved once
     // here rather than per-window so a malformed value fails at startup
     // with one clear message instead of silently painting the default.
-    // `#18181C` is natyv's built-in dark ground -- the literal this
-    // replaced, kept as the default so an app that sets nothing looks
-    // exactly as it did before.
+    //
+    // Precedence, highest first:
+    //   1. the `.ntss` reserved `window` block (WindowStyle.background,
+    //      staged into this repo by `natyv prepare` -- styling wins over
+    //      config, since a stylesheet is where a developer expects colors
+    //      to live)
+    //   2. conf.natyv.json's `ui.background_color` (reachable by an app
+    //      with no `.ntss` file at all)
+    //   3. `#18181C`, natyv's built-in dark ground -- the literal this
+    //      replaced, kept as the default so an app that sets neither looks
+    //      exactly as it did before.
     const default_background: c.SDL_Color = .{ .r = 0x18, .g = 0x18, .b = 0x1C, .a = 255 };
-    const window_background: c.SDL_Color = if (config.value.ui.background_color) |hex| blk: {
+    const window_background: c.SDL_Color = if (WindowStyle.background) |rgba|
+        .{ .r = rgba[0], .g = rgba[1], .b = rgba[2], .a = rgba[3] }
+    else if (config.value.ui.background_color) |hex| blk: {
         const rgba = Config.parseHexRgba(hex) orelse {
             std.debug.print("[main] ui.background_color: '{s}' is not a real hex color (expected #RRGGBB or #RRGGBBAA)\n", .{hex});
             return error.InvalidBackgroundColor;
         };
         break :blk .{ .r = rgba.r, .g = rgba.g, .b = rgba.b, .a = rgba.a };
     } else default_background;
+    // Which of the three sources won, reported under NATYV_STARTUP_TRACE.
+    // "why is my background not applying" is otherwise only answerable by
+    // reading this file, and the precedence is the whole point.
+    timing.traceNote("{s:<38}: #{X:0>2}{X:0>2}{X:0>2}{X:0>2} (from {s})\n", .{
+        "window background",
+        window_background.r,
+        window_background.g,
+        window_background.b,
+        window_background.a,
+        if (WindowStyle.background != null)
+            ".ntss window block"
+        else if (config.value.ui.background_color != null)
+            "ui.background_color"
+        else
+            "built-in default",
+    });
 
-    // Startup tracing is opt-in via NATYV_STARTUP_TRACE (see timing.zig).
-    timing.trace_enabled = init.environ_map.get("NATYV_STARTUP_TRACE") != null;
     const t_total = timing.traceStart();
     const t_sdl = timing.traceStart();
 
