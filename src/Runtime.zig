@@ -185,6 +185,8 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
     };
     defer self.allocator.free(manifest_json);
 
+    const t_compile = timing.traceStart();
+
     var errmsg: [*c]u8 = null;
     self.compiled = c.extism_compiled_plugin_new(manifest_json.ptr, manifest_json.len, &funcs[0], n, true, &errmsg);
     if (self.compiled == null) {
@@ -192,7 +194,15 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
         return error.PluginLoadFailed;
     }
     c.extism_plugin_new_error_free(errmsg);
+    // Cranelift JIT-compiles the whole module here, so this scales with
+    // guest wasm size -- measured 13-22ms across real apps, not the
+    // dominant startup cost it is sometimes assumed to be.
+    timing.tracePhase("  compile (extism_compiled_plugin_new)", t_compile);
 
+    // Instantiation also runs the guest's `_initialize`, i.e. every
+    // TinyGo package-level init -- a cost distinct from both the compile
+    // above and the natyv_init call later, and measured small (~3ms).
+    const t_instantiate = timing.traceStart();
     errmsg = null;
     self.plugin = c.extism_plugin_new_from_compiled(self.compiled, &errmsg);
     if (self.plugin == null) {
@@ -200,6 +210,7 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
         return error.PluginLoadFailed;
     }
     c.extism_plugin_new_error_free(errmsg);
+    timing.tracePhase("  instantiate (+ guest _initialize)", t_instantiate);
 
     self.can_recycle = c.extism_plugin_function_exists(self.plugin, "natyv_checkpoint") and
         c.extism_plugin_function_exists(self.plugin, "natyv_resume");

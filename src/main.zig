@@ -140,11 +140,18 @@ pub fn main(init: std.process.Init) !void {
     const app_name_z = try allocator.dupeZ(u8, config.value.name);
     defer allocator.free(app_name_z);
 
+    // Startup tracing is opt-in via NATYV_STARTUP_TRACE (see timing.zig).
+    timing.trace_enabled = init.environ_map.get("NATYV_STARTUP_TRACE") != null;
+    const t_total = timing.traceStart();
+    const t_sdl = timing.traceStart();
+
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlInitFailed;
     }
     defer c.SDL_Quit();
+    timing.traceNote("=== startup phase breakdown ===\n", .{});
+    timing.tracePhase("SDL_Init", t_sdl);
 
     // A real, dedicated SDL event type Dispatch.run (the worker thread)
     // pushes after every natyv_dispatch call returns, so the main loop's
@@ -160,8 +167,10 @@ pub fn main(init: std.process.Init) !void {
     // conf.natyv.json, since every app gets it regardless (see the
     // font-rendering plan). Not consumed yet -- that's F3, which swaps
     // every SDL_RenderDebugText call site over to real glyph rendering.
+    const t_font = timing.traceStart();
     var default_font = try Font.init();
     defer default_font.deinit();
+    timing.tracePhase("Font.init", t_font);
 
     var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var db_path: ?[:0]const u8 = null;
@@ -178,8 +187,10 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
+    const t_log = timing.traceStart();
     try Logging.init(io, config.value.logging, app_name_z);
     defer Logging.deinit();
+    timing.tracePhase("Logging.init", t_log);
 
     // `.ntx` tooling Stage 7's bundling step: a binary built via
     // `zig build -Dembed-app-wasm=true` (only ever `natyv build` itself)
@@ -203,8 +214,10 @@ pub fn main(init: std.process.Init) !void {
         break :blk w;
     };
 
+    const t_rt = timing.traceStart();
     var runtime = try Runtime.init(allocator, db_path);
     defer runtime.deinit();
+    timing.tracePhase("Runtime.init", t_rt);
     if (config.value.network.enabled) runtime.enableNetwork(config.value.network.tcp.allowed_sockets);
     // Real OS sockets need a real `Io` to close gracefully (see
     // TcpRegistry.closeAll's own doc comment for why Runtime.deinit alone
@@ -214,8 +227,18 @@ pub fn main(init: std.process.Init) !void {
 
     const manifest: Manifest = .{ .allowed_hosts = if (config.value.network.enabled) config.value.network.http.allowed_hosts else &.{} };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
+    // loadPlugin traces its own compile/instantiate split internally.
+    const t_load = timing.traceStart();
     try runtime.loadPlugin(wasm, manifest, clay_enabled);
+    timing.tracePhase("loadPlugin TOTAL", t_load);
+
+    // The guest's own natyv_init. Whatever an app does on startup lands
+    // here, including any network it opens -- see this phase's own numbers
+    // before attributing a slow launch to natyv itself.
+    const t_init = timing.traceStart();
     runtime.initGuest(io);
+    timing.tracePhase("initGuest (natyv_init)", t_init);
+    timing.traceNote("{s:<38}: {d} bytes\n", .{ "guest wasm size", wasm.len });
 
     var queue = EventQueue.init(allocator);
     defer queue.deinit();
@@ -240,7 +263,12 @@ pub fn main(init: std.process.Init) !void {
     const windows = try allocator.alloc(WindowManager.WindowContext, WindowManager.max_open_windows);
     defer allocator.free(windows);
     var window_count: usize = 0;
+    const t_win = timing.traceStart();
     windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, null);
+    timing.tracePhase("createWindowContext", t_win);
+    timing.traceNote("---------------------------------------\n", .{});
+    timing.tracePhase("TOTAL to first window", t_total);
+    timing.traceNote("\n", .{});
     window_count += 1;
 
     const arrow_cursor = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT);
