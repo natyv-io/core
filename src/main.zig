@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const Config = @import("Config");
 const WindowStyle = @import("WindowStyle");
+const AppFont = @import("AppFont");
 const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const build_options = @import("build_options");
@@ -241,7 +242,16 @@ pub fn main(init: std.process.Init) !void {
     // font-rendering plan). Not consumed yet -- that's F3, which swaps
     // every SDL_RenderDebugText call site over to real glyph rendering.
     const t_font = timing.traceStart();
-    var default_font = try Font.init();
+    var default_font = try Font.init(AppFont.data, AppFont.point_size);
+    // Byte length, not just "custom": it is the one value that proves a
+    // different file actually loaded, which is what "is my font even
+    // being picked up?" is really asking.
+    timing.traceNote("{s:<38}: {s} ({d} bytes) at {d:.1}pt\n", .{
+        "app font",
+        if (AppFont.data != null) "app-supplied" else "bundled Inter",
+        if (AppFont.data) |d| d.len else Font.bundledByteLen(),
+        AppFont.point_size orelse Font.default_point_size,
+    });
     defer default_font.deinit();
     timing.tracePhase("Font.init", t_font);
 

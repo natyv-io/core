@@ -263,6 +263,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // App-wide custom font: same file-swap choreography again. `natyv
+    // prepare` stages the real font bytes into src/assets/fonts/ and
+    // writes AppFontGenerated.zig whenever an app configured a font or a
+    // point size, via the `.ntss` `font` block or conf.natyv.json.
+    const app_font = b.option(bool, "app-font", "Use src/assets/AppFontGenerated.zig (written by `natyv prepare`) instead of the empty AppFontAbsent.zig stub (set by `natyv build`, never by hand)") orelse false;
+    const app_font_mod = b.createModule(.{
+        .root_source_file = b.path(if (app_font) "src/assets/AppFontGenerated.zig" else "src/assets/AppFontAbsent.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Binding generator: the identical file-swap choreography as
     // `-Dembed-app-wasm` above, just for a real Zig *source* file. `natyv
     // build` (natyv-io/cli) writes a real `src/BindingsGenerated.zig`
@@ -357,6 +368,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("Bindings", bindings_mod);
     exe.root_module.addImport("TextureAssets", texture_assets_mod);
     exe.root_module.addImport("WindowStyle", window_style_mod);
+    exe.root_module.addImport("AppFont", app_font_mod);
 
     // Windows icon embedding (`Config.icon`): natyv-io/cli's
     // `WindowsIcon.zig` generates a real `.ico` + a small `.rc`

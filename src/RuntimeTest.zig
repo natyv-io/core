@@ -368,7 +368,7 @@ test "F1: FreeType + SDL_ttf toolchain loads the real embedded Inter font and me
 }
 
 test "F2: the persistent default-font capability loads Inter and reports real font metrics" {
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     const height = c.TTF_GetFontHeight(font_cap.font);
@@ -590,7 +590,7 @@ test "L4: dirty-flag caching skips Clay recompute on an unchanged frame, real ge
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     var clay_layout = try ClayLayout.init(allocator, 300, 100, font_cap.font);
@@ -661,7 +661,7 @@ test "2026-09-02 real window resizing: a window-size-only change (no content/scr
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 300, 100, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -716,7 +716,7 @@ test "layoutIfNeeded returns null (not 0) when it skips, distinct from a real re
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 300, 100, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -752,7 +752,7 @@ test "W16: a floating widget that would overflow the bottom of the window flips 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -807,7 +807,7 @@ test "W16: a floating widget that already fits below its trigger is not flipped"
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -858,7 +858,7 @@ test "W16: a floating widget that would overflow the right edge of the window fl
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -913,7 +913,7 @@ test "W18 follow-up: a floating widget anchored inside a scrolling ancestor flip
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -983,7 +983,7 @@ test "W18 follow-up: a floating widget too wide to clear a scrolling ancestor's 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -1040,7 +1040,7 @@ test "W18 follow-up (round 2): clamping a floating widget also moves its own chi
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -1244,7 +1244,7 @@ test "W2: a nonzero scroll delta forces a real Clay recompute even when content 
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
@@ -1337,7 +1337,7 @@ test "W2: scroll position survives an intervening frame where nothing else chang
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
@@ -1412,7 +1412,7 @@ test "F3: syncTextObjects skips re-syncing a widget's TTF_Text on an unchanged f
     const engine = c.TTF_CreateRendererTextEngine(renderer) orelse return error.TextEngineFailed;
     defer c.TTF_DestroyRendererTextEngine(engine);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
@@ -1510,7 +1510,7 @@ test "F3 regression: destroying a widget's TTF_Text from the real worker thread 
     const engine = c.TTF_CreateRendererTextEngine(renderer) orelse return error.TextEngineFailed;
     defer c.TTF_DestroyRendererTextEngine(engine);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     const wasm = try std.Io.Dir.cwd().readFileAlloc(io, "examples/clay-fixture/guest/clay-fixture.wasm", allocator, .unlimited);
@@ -1961,7 +1961,7 @@ test "W29: a spinner exists, is not focusable, gets real Clay-computed geometry,
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -2284,7 +2284,7 @@ test "W5: a modal round-trips modal/background into ClayStyle/Container, centers
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     // Unlike the W4 dropdown test above (which never actually runs a real
@@ -2660,7 +2660,7 @@ test "Menu (productized): a real click opens the dropdown, key_nav highlights th
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -2778,7 +2778,7 @@ test "Menu (productized) submenu: opening a submenu-triggering item's own dropdo
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -2938,7 +2938,7 @@ test "Menu (productized) migration repro: many rapid key_nav presses, with a rea
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -3017,7 +3017,7 @@ test "Menu bar: a real click on a second bar item closes whichever one was alrea
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -3182,7 +3182,7 @@ test "W11: a divider exists, is not focusable, and gets real Clay-computed geome
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -3287,7 +3287,7 @@ test "W14: three badges exist with their real tones/labels, are not focusable, a
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -3779,7 +3779,7 @@ test "W19: switching a Tabs widget's active tab removes the inactive panel from 
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -3863,7 +3863,7 @@ test "W19: natyv_clay_create_tabs/_tab_panel round-trip through a real compiled 
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -4009,7 +4009,7 @@ test "Accordion: a Container hidden via setVisible is dropped from Clay's layout
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -4204,7 +4204,7 @@ test "Scroll-into-view: ClayLayout.applyScrollIntoView scrolls an off-screen chi
     var runtime = try Runtime.init(allocator, null);
     defer runtime.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -4280,7 +4280,7 @@ test "Scroll-into-view: natyv_get_scroll_position's Slot.scroll_data mirror matc
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 600, 200, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -4343,7 +4343,7 @@ test "Scroll-into-view: clicking an off-screen Accordion header through a real c
     try runtime.loadPlugin(wasm, .{}, true);
     runtime.initGuest(io);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);
     defer clay_layout.deinit(allocator);
@@ -4787,7 +4787,7 @@ test "Multi-window Stage 2: two ClayLayout instances alive at once don't clobber
     var runtime_b = try Runtime.init(allocator, null);
     defer runtime_b.deinit();
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     // Different widths (300 vs 600) so a real mixup between the two
@@ -5018,7 +5018,7 @@ test "Menu: a nested submenu selection destroys both panel levels and still deli
     const engine = c.TTF_CreateRendererTextEngine(renderer) orelse return error.TextEngineFailed;
     defer c.TTF_DestroyRendererTextEngine(engine);
 
-    var font_cap = try Font.init();
+    var font_cap = try Font.init(null, null);
     defer font_cap.deinit();
 
     var clay_layout = try ClayLayout.init(allocator, 900, 700, font_cap.font);

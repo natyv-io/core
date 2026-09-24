@@ -18,3 +18,5 @@ src/assets/textures/
 # this repo's own checkout (local dev) or a packaged copy of it.
 src/BindingsGenerated.zig
 src/assets/WindowStyleGenerated.zig
+src/assets/AppFontGenerated.zig
+src/assets/fonts/
