@@ -274,6 +274,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // System tray icon: the same file-swap choreography once more. `natyv
+    // prepare` stages `conf.natyv.json`'s own `icon` PNG -- the one the
+    // packaging step already turns into .icns/.ico/an AppImage icon -- into
+    // src/assets/tray/ and writes TrayIconGenerated.zig. Reusing that field
+    // rather than adding a tray-specific one is deliberate: an app that
+    // ships a tray already ships an app icon, and SDL takes a plain decoded
+    // surface either way.
+    const tray_icon = b.option(bool, "tray-icon", "Use src/assets/TrayIconGenerated.zig (written by `natyv prepare`) instead of the empty TrayIconAbsent.zig stub (set by `natyv build`, never by hand)") orelse false;
+    const tray_icon_mod = b.createModule(.{
+        .root_source_file = b.path(if (tray_icon) "src/assets/TrayIconGenerated.zig" else "src/assets/TrayIconAbsent.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Binding generator: the identical file-swap choreography as
     // `-Dembed-app-wasm` above, just for a real Zig *source* file. `natyv
     // build` (natyv-io/cli) writes a real `src/BindingsGenerated.zig`
@@ -369,6 +383,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("TextureAssets", texture_assets_mod);
     exe.root_module.addImport("WindowStyle", window_style_mod);
     exe.root_module.addImport("AppFont", app_font_mod);
+    exe.root_module.addImport("TrayIcon", tray_icon_mod);
 
     // Windows icon embedding (`Config.icon`): natyv-io/cli's
     // `WindowsIcon.zig` generates a real `.ico` + a small `.rc`
@@ -423,6 +438,16 @@ pub fn build(b: *std.Build) void {
     });
     linkNatyvDeps(b, windowmanager_tests.root_module, extism_prefix, sqlite_enabled);
     const run_windowmanager_tests = b.addRunArtifact(windowmanager_tests);
+
+    const tray_registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/TrayRegistry.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkNatyvDeps(b, tray_registry_tests.root_module, extism_prefix, sqlite_enabled);
+    const run_tray_registry_tests = b.addRunArtifact(tray_registry_tests);
 
     const runtime_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -597,6 +622,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_tests.step);
     test_step.dependOn(&run_private_ranges_tests.step);
     test_step.dependOn(&run_tcp_registry_tests.step);
+    test_step.dependOn(&run_tray_registry_tests.step);
     test_step.dependOn(&run_mbedtls_smoke_tests.step);
     test_step.dependOn(&run_tcp_tests.step);
     test_step.dependOn(&run_tls_tests.step);

@@ -238,7 +238,13 @@ pub const max_widgets = 2048;
 // primitive: same as natyv_destroy_children, but spares one named child's
 // own subtree too, so a freshly-built replacement can be revealed before
 // the previous content is torn down instead of after.
-pub const host_function_count = 30;
+// + natyv_set_window_visible/natyv_set_quit_on_last_window_close (2) --
+// app lifecycle, generic and unrelated to any WidgetKind (they act on real
+// OS windows and on whether closing the last one ends the process), same
+// "always registered" reasoning as the file dialogs above. Added for the
+// system tray, whose whole point is usually an app that keeps running with
+// no window on screen, but neither is tray-specific.
+pub const host_function_count = 32;
 
 pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner };
 pub const Widget = union(WidgetKind) {
@@ -879,12 +885,52 @@ pending_window_request_count: usize = 0,
 pending_window_teardowns: [max_pending_window_requests]?u32 = [_]?u32{null} ** max_pending_window_requests,
 pending_window_teardown_count: usize = 0,
 
+/// Same cross-thread hand-off shape as the two queues above:
+/// `SDL_ShowWindow`/`SDL_HideWindow` are main-thread work, and
+/// `natyv_set_window_visible` runs on the worker. A bounded array rather
+/// than a single slot for the same reason window creation needs one -- a
+/// guest can hide one window and show another inside a single dispatch.
+pending_window_visibility: [max_pending_window_requests]?PendingWindowVisibility = [_]?PendingWindowVisibility{null} ** max_pending_window_requests,
+pending_window_visibility_count: usize = 0,
+
+/// Whether closing the startup window ends the process. True is the
+/// long-standing behaviour and stays the default, so no existing app
+/// changes; a guest turns it off with `natyv_set_quit_on_last_window_close`
+/// when it means to keep running with no window on screen -- which is what
+/// a system tray is usually for.
+///
+/// Every *other* window already has a vetoable close: its own
+/// `.window_close_requested` event, which the host never acts on by itself.
+/// The startup window could not participate because it has no
+/// `root_widget_id` to address (see `WindowManager.WindowContext`), so
+/// there was nobody to notify and quitting was the only option.
+quit_on_last_window_close: bool = true,
+
+/// Who receives the startup window's `.window_close_requested` when
+/// `quit_on_last_window_close` is false. Supplied by the guest, which
+/// passes a widget id it already owns -- deliberately *not* a reserved
+/// sentinel like 0, because `Dispatch` already pushes synthetic events to
+/// id 0 on the documented assumption that no real app registers a handler
+/// for it. Honouring an id of 0 here would quietly break that assumption
+/// and deliver those synthetic pings to a guest's close handler.
+window_close_notify_id: u32 = 0,
+
 /// `allow_many` is ignored for `.save` -- `SDL_ShowSaveFileDialog` has no
 /// such parameter, only `SDL_ShowOpenFileDialog` does.
 pub const PendingFileDialogRequest = struct {
     kind: enum { open, save },
     widget_id: u32,
     allow_many: bool,
+};
+
+/// `window_id` is a window's own `window_root` widget id, or 0 for the
+/// startup window -- which genuinely has no root widget id of its own, so 0
+/// is the only way to name it. Unambiguous here in a way it would not be as
+/// an *event* target: this only ever travels guest -> host and is never
+/// routed to a handler.
+pub const PendingWindowVisibility = struct {
+    window_id: u32,
+    visible: bool,
 };
 
 /// Multi-window Stage 4: small fixed cap on in-flight window creation/
@@ -955,6 +1001,49 @@ pub fn takePendingWindowTeardowns(self: *Self, call_io: Io, out: []u32) usize {
     for (0..n) |i| out[i] = self.pending_window_teardowns[i].?;
     self.pending_window_teardown_count = 0;
     return n;
+}
+
+/// Worker-thread side of `pending_window_visibility`. Overflow drops the
+/// request rather than blocking -- same bounded-queue behaviour
+/// `queueWindowTeardown` already has, and a guest hiding more than
+/// `max_pending_window_requests` windows between two frames is not a real
+/// scenario.
+pub fn queueWindowVisibility(self: *Self, call_io: Io, window_id: u32, visible: bool) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.pending_window_visibility_count >= self.pending_window_visibility.len) return;
+    self.pending_window_visibility[self.pending_window_visibility_count] = .{ .window_id = window_id, .visible = visible };
+    self.pending_window_visibility_count += 1;
+}
+
+/// Main-thread side -- same drain-in-full shape as `takePendingWindowTeardowns`.
+pub fn takePendingWindowVisibility(self: *Self, call_io: Io, out: []PendingWindowVisibility) usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const n = @min(self.pending_window_visibility_count, out.len);
+    for (0..n) |i| out[i] = self.pending_window_visibility[i].?;
+    self.pending_window_visibility_count = 0;
+    return n;
+}
+
+/// Sets whether the startup window closing ends the process, and who to
+/// notify when it does not. See the fields' own doc comments.
+pub fn setQuitOnLastWindowClose(self: *Self, call_io: Io, quit: bool, notify_widget_id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    self.quit_on_last_window_close = quit;
+    self.window_close_notify_id = notify_widget_id;
+}
+
+pub const CloseBehavior = struct { quit: bool, notify_widget_id: u32 };
+
+/// Main-thread side: what should happen when the startup window's close
+/// button is pressed. Read fresh each time rather than cached, since a
+/// guest can flip it at any point in its life.
+pub fn closeBehavior(self: *Self, call_io: Io) CloseBehavior {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    return .{ .quit = self.quit_on_last_window_close, .notify_widget_id = self.window_close_notify_id };
 }
 
 /// Registers every widget kind's create-function unconditionally -- widgets
@@ -1057,6 +1146,13 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_range", &in_types[0], 1, &out_types[0], 1, HostFunctions.getRangeHostFn, self, null);
     n += 1;
+    // App lifecycle: neither acts on a widget, but both belong to the same
+    // family as natyv_clay_create_window/natyv_destroy_window, which
+    // already live here.
+    funcs_out[n] = c.extism_function_new("natyv_set_window_visible", &in_types[0], 1, &out_types[0], 1, HostFunctions.setWindowVisibleHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_set_quit_on_last_window_close", &in_types[0], 1, &out_types[0], 1, HostFunctions.setQuitOnLastWindowCloseHostFn, self, null);
+    n += 1;
     return n;
 }
 
@@ -1119,6 +1215,27 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
 /// file's own doc comment for why it's a separate file at all.
 pub fn io(self: *Self) Io {
     return self.current_io orelse unreachable; // see file doc comment: invariant enforced by Runtime.call
+}
+
+/// Hands out an id from the same monotonic space every widget uses, without
+/// creating a widget for it. For host-side objects that are not widgets but
+/// still have to be addressable by the guest and still deliver events
+/// through the ordinary `EventQueue` -> `Dispatch` path, which is keyed on
+/// `widget_id` -- system tray entries are the first (`TrayRegistry`).
+///
+/// Sharing this counter is the point. `Dispatch` never validates an id
+/// against this registry, so a separate counter would hand a tray entry the
+/// same number as a real widget and silently route one's events to the
+/// other's handler. Drawing from here makes that collision structurally
+/// impossible instead of merely unlikely, at the cost of some ids never
+/// belonging to a slot -- which nothing here assumes, since ids are already
+/// monotonic and never reused after a destroy.
+pub fn reserveId(self: *Self, call_io: Io) u32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const id = self.next_id;
+    self.next_id += 1;
+    return id;
 }
 
 /// `pub` -- see `io`'s doc comment above.

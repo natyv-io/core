@@ -1474,3 +1474,50 @@ pub fn destroyWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     self.queueWindowTeardown(call_io, req.widget_id);
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
+
+// -- App lifecycle --
+//
+// Neither of these touches a widget. They live here because they are the
+// same family as `natyv_clay_create_window`/`natyv_destroy_window`, which
+// already do. Both were added for the system tray -- an app with a tray
+// usually wants to keep running with its window hidden rather than quit --
+// but neither is tray-specific, and an app with no tray can use both.
+
+const SetWindowVisibleRequest = struct { window_id: u32, visible: bool };
+
+/// `window_id` is a window's own `window_root` widget id, or 0 for the
+/// startup window, which has no root widget id of its own. Queued rather
+/// than applied: `SDL_ShowWindow`/`SDL_HideWindow` are main-thread calls and
+/// this runs on the worker, same hand-off every other real OS-window
+/// operation here already makes.
+pub fn setWindowVisibleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetWindowVisibleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+
+    self.queueWindowVisibility(self.io(), parsed.value.window_id, parsed.value.visible);
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+const SetQuitOnLastWindowCloseRequest = struct { quit: bool, notify_widget_id: u32 = 0 };
+
+/// Turning `quit` off without a real `notify_widget_id` would make the
+/// startup window's close button do nothing at all, with no way for the app
+/// to react and no way for the user to quit -- so that combination is
+/// rejected rather than accepted into an unclosable state.
+pub fn setQuitOnLastWindowCloseHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetQuitOnLastWindowCloseRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+
+    if (!parsed.value.quit and parsed.value.notify_widget_id == 0) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "natyv_set_quit_on_last_window_close: quit=false needs a real notify_widget_id, or the window's close button would do nothing", .{});
+        return;
+    }
+    self.setQuitOnLastWindowClose(self.io(), parsed.value.quit, parsed.value.notify_widget_id);
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}

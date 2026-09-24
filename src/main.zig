@@ -16,6 +16,7 @@ const Dispatch = @import("Dispatch.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
 const WindowManager = @import("WindowManager.zig");
 const FrameLoop = @import("FrameLoop.zig");
+const TrayDrain = @import("TrayDrain.zig");
 const Logging = @import("Logging.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
@@ -326,6 +327,13 @@ pub fn main(init: std.process.Init) !void {
     var queue = EventQueue.init(allocator);
     defer queue.deinit();
 
+    // Arms the system tray's callback environment before any tray can
+    // exist. `natyv_init` above may already have queued a tray; nothing is
+    // materialized until this frame loop's own drain below, so the ordering
+    // that matters is "before the first drain", not "before natyv_init".
+    TrayDrain.init(io, &queue);
+    defer TrayDrain.deinit();
+
     const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue, wake_event_type, config.value.memory.recycle_threshold_mb });
 
     // Multi-window: every open window's own real OS resources + per-window
@@ -443,6 +451,13 @@ pub fn main(init: std.process.Init) !void {
         // inspection.
         runtime.widgets.flushPendingTextDestroys(io);
 
+        // Materialize whatever the guest asked of the system tray since
+        // last frame. Kept next to the window drain below for the same
+        // reason: both turn a worker-thread request into a real,
+        // main-thread-only OS call. A no-op on almost every frame -- an app
+        // typically builds its whole tray once, inside `natyv_init`.
+        TrayDrain.drain(&runtime.tray_registry, io);
+
         // Multi-window Stage 4: settle this frame's open-window set --
         // drain any guest-requested teardown, then any guest-requested
         // creation -- before anything else this frame touches `windows[]`,
@@ -455,6 +470,25 @@ pub fn main(init: std.process.Init) !void {
                 if (findWindowIndexByRoot(windows[0..window_count], wid)) |idx| {
                     WindowManager.destroyWindowContext(&windows[idx], allocator);
                     removeWindow(windows, &window_count, idx);
+                }
+            }
+
+            var visibility: [WidgetHost.max_pending_window_requests]WidgetHost.PendingWindowVisibility = undefined;
+            const visibility_n = runtime.widgets.takePendingWindowVisibility(io, &visibility);
+            for (visibility[0..visibility_n]) |req| {
+                // 0 names the startup window, which has no root widget id
+                // of its own -- see PendingWindowVisibility's doc comment.
+                const idx = if (req.window_id == 0)
+                    @as(?usize, if (window_count > 0) 0 else null)
+                else
+                    findWindowIndexByRoot(windows[0..window_count], req.window_id);
+                if (idx) |i| {
+                    if (req.visible) {
+                        _ = c.SDL_ShowWindow(windows[i].window);
+                        _ = c.SDL_RaiseWindow(windows[i].window);
+                    } else {
+                        _ = c.SDL_HideWindow(windows[i].window);
+                    }
                 }
             }
 
@@ -567,7 +601,15 @@ pub fn main(init: std.process.Init) !void {
         const had_real_event = have_event;
         while (have_event) {
             switch (event.type) {
-                c.SDL_EVENT_QUIT => running = false,
+                c.SDL_EVENT_QUIT => {
+                    // Traced because "who ended the process" is genuinely
+                    // ambiguous once an app can outlive its own window: a
+                    // guest-vetoed close, SDL's own quit-on-last-window-
+                    // close, and a real Cmd+Q all look identical from
+                    // outside. Gated, so it costs nothing normally.
+                    timing.traceNote("{s:<38}: SDL_EVENT_QUIT\n", .{"quit"});
+                    running = false;
+                },
                 c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                     if (findWindowIndex(windows[0..window_count], event.window.windowID)) |idx| {
                         // The original startup window closing always quits,
@@ -586,7 +628,28 @@ pub fn main(init: std.process.Init) !void {
                             const snap = widget_snapshot[0..widget_count];
                             queue.push(io, root_id, .window_close_requested, "", FloatingOrder.surfaceIdFor(snap, WidgetHost.SnapshotIndex.build(snap), root_id));
                         } else {
-                            running = false;
+                            // The startup window. It quits the app by
+                            // default, and still does unless the guest
+                            // explicitly asked otherwise via
+                            // `natyv_set_quit_on_last_window_close` -- which
+                            // is how an app with a system tray keeps running
+                            // with nothing on screen. When it has, the close
+                            // becomes an ordinary vetoable
+                            // `.window_close_requested` like every other
+                            // window's, addressed to a widget id the guest
+                            // nominated (it has no root widget id of its own
+                            // to use). The host still destroys nothing: a
+                            // guest that ignores the event just leaves the
+                            // window open, same contract as every other
+                            // window.
+                            const behavior = runtime.widgets.closeBehavior(io);
+                            timing.traceNote("{s:<38}: quit={} notify={d}\n", .{ "startup window close", behavior.quit, behavior.notify_widget_id });
+                            if (behavior.quit) {
+                                running = false;
+                            } else {
+                                const snap = widget_snapshot[0..widget_count];
+                                queue.push(io, behavior.notify_widget_id, .window_close_requested, "", FloatingOrder.surfaceIdFor(snap, WidgetHost.SnapshotIndex.build(snap), behavior.notify_widget_id));
+                            }
                         }
                     }
                 },

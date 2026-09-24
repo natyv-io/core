@@ -4,9 +4,22 @@
     .fingerprint = 0x1ba72f55ba89d0d7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // natyv-io's fork of allyourcodebase/SDL -- upstream's own Zig
+        // packaging of SDL, forked for one two-line fix. Upstream lists the
+        // *unguarded* tray/unix/SDL_tray.c in its shared `unix` source group,
+        // which macOS also compiles, and never lists the guarded
+        // tray/cocoa/SDL_tray.m at all -- so SDL_CreateTray on macOS ran the
+        // Linux AppIndicator backend and always failed. Submitted upstream as
+        // allyourcodebase/SDL#34; drop the fork for a plain release tag once
+        // that merges.
+        //
+        // Pinned to the fork's `main`, which also carries upstream's own #32
+        // (the identical bug for file dialogs, unreleased as of this pin).
+        // Nothing keeps the fork current automatically -- merge upstream
+        // `main` into it periodically.
         .sdl = .{
-            .url = "https://github.com/allyourcodebase/SDL3/archive/refs/tags/1.0.1+3.4.14.tar.gz",
-            .hash = "sdl-1.0.1+3.4.14-i4QD0ViwqQAThHDlng1K46lINQ5PioLIz9bDKpGJTuzs",
+            .url = "git+https://github.com/natyv-io/SDL#360485faf2447f01f176777cd5829087b3c0c5f8",
+            .hash = "sdl-1.0.3+3.4.16-i4QD0Z-wqQAn6zJk8TXx5gnUU1NJ5xA2ijjA83Eeg4fX",
         },
         .extism_aarch64_macos = .{
             .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-aarch64-apple-darwin-v1.30.0.tar.gz",

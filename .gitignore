@@ -20,3 +20,5 @@ src/BindingsGenerated.zig
 src/assets/WindowStyleGenerated.zig
 src/assets/AppFontGenerated.zig
 src/assets/fonts/
+src/assets/TrayIconGenerated.zig
+src/assets/tray/
