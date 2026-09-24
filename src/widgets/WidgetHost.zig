@@ -260,6 +260,27 @@ pub const Widget = union(WidgetKind) {
     tabs: Tabs,
     spinner: Spinner,
 
+    /// Real, font-driven size of whatever text this widget draws, or null
+    /// for a kind that draws none (or hasn't synced once yet). Same
+    /// kind-agnostic dispatch shape as `rectPtr` below.
+    ///
+    /// Only kinds whose size genuinely *is* their text are listed. A
+    /// TextArea is deliberately absent: it is a multi-line input whose
+    /// authored box is the point, and sizing it to its content would make
+    /// it grow as the user types. Slider and Tabs likewise own their
+    /// geometry for reasons unrelated to any text they happen to draw.
+    pub const MeasuredText = struct { w: f32, h: f32 };
+
+    pub fn measuredText(self: Widget) ?MeasuredText {
+        const m: MeasuredText = switch (self) {
+            .label => |l| .{ .w = l.measured_width, .h = l.measured_height },
+            .button => |b| .{ .w = b.measured_width, .h = b.measured_height },
+            else => return null,
+        };
+        if (m.w <= 0 and m.h <= 0) return null;
+        return m;
+    }
+
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
     /// to write Clay's computed geometry back into the registry each frame
@@ -1260,32 +1281,49 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
         if (slot.*) |*s| {
             if (std.mem.indexOfScalar(u32, allowed_ids, s.id) == null) continue;
             switch (s.widget) {
-                .button => |*b| {
-                    // Real button auto-width (2026-09-02): a `width: fit`
-                    // button's own real size depends on `b.measured_width`,
-                    // which only changes right here, on a real resync
-                    // (`sync_count` bump) -- but text syncing has always
-                    // been orthogonal to `layout_generation` (Clay has no
-                    // idea text exists at all, see ClayLayout.zig's own
-                    // header comment), so without this, a *second* real
-                    // relayout picking up the corrected width would simply
-                    // never happen: the first-ever layout pass for a new
-                    // Fit-width button runs *before* its first text sync
-                    // (see main.zig's own frame ordering), so it always
-                    // measures 0 and nothing would ever ask Clay to try
-                    // again. Scoped to Fit-width buttons specifically --
-                    // a Fixed/Grow button's own width never depends on
-                    // measured_width, so its own text changes have nothing
-                    // new to relayout for.
-                    const before = b.sync_count;
-                    b.syncText(engine, font);
-                    if (b.sync_count != before and s.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT) {
+                // A Fit-sized widget whose size comes from its own text
+                // has a real ordering problem: the first layout pass for a
+                // newly created widget runs *before* its first text sync
+                // (see main.zig's frame ordering), so it measures 0, and
+                // text syncing is otherwise orthogonal to
+                // `layout_generation` -- Clay has no idea text exists at
+                // all, see ClayLayout.zig's header comment. Without a bump
+                // here, the corrected size is measured but nothing ever
+                // asks Clay to lay out again, and the widget stays at 0
+                // forever.
+                //
+                // Generalized from the Button-width-only version: it now
+                // covers height too, and Label as well as Button. Height
+                // matters for a second reason beyond first-sync ordering --
+                // a Label's wrap width tracks its rect, so a resize changes
+                // the line count and therefore the measured height with no
+                // text change at all.
+                //
+                // Compares the measurement itself rather than a sync
+                // counter, so a resync that produced an identical size
+                // costs no relayout. Scoped to axes actually sized Fit: a
+                // Fixed or Grow axis never depends on the measurement, so
+                // its text changes have nothing to relayout for.
+                .button, .label => {
+                    const before = s.widget.measuredText();
+                    switch (s.widget) {
+                        .button => |*b| b.syncText(engine, font),
+                        .label => |*l| l.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
+                        else => unreachable,
+                    }
+                    const after = s.widget.measuredText();
+                    const w_changed = (before == null) != (after == null) or
+                        (before != null and after != null and before.?.w != after.?.w);
+                    const h_changed = (before == null) != (after == null) or
+                        (before != null and after != null and before.?.h != after.?.h);
+                    const fit_w = s.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT;
+                    const fit_h = s.clay_style.sizing.height.type == c.CLAY__SIZING_TYPE_FIT;
+                    if ((w_changed and fit_w) or (h_changed and fit_h)) {
                         self.layout_generation +%= 1;
                     }
                 },
                 .textfield => |*t| t.syncText(engine, font),
                 .textarea => |*ta| ta.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
-                .label => |*l| l.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
                 .checkbox => |*cb| cb.syncText(engine, font),
                 .toggle => |*tg| tg.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),

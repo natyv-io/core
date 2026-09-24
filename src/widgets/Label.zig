@@ -31,6 +31,23 @@ text_generation: u32 = 0,
 text_obj_generation: u32 = 0,
 // W15 follow-up: see TextArea.zig's field of the same name/purpose.
 wrapped_width: i32 = -1,
+/// Real, font-driven size of this label's own text, cached by `syncText`
+/// from the same `TTF_Text` object `drawDecorations` draws -- so it is
+/// pixel-consistent with what actually renders, and costs no cross-thread
+/// TTF call (host functions run on the worker thread, which has no safe
+/// access to the font -- see Button.measured_width's doc comment).
+///
+/// Height is the measured height of the *wrapped* block, every line
+/// included, because `TTF_GetTextSize` reports the whole laid-out text
+/// rather than one line. That is exactly what a Fit-sized Label needs:
+/// wrap width comes from the rect Clay computed, and the height follows
+/// from however many lines that wrap produced.
+///
+/// 0 until the first real sync, which `openChildren` treats as "no
+/// measurement yet, leave Clay's own sizing alone" rather than forcing a
+/// real zero-sized widget.
+measured_width: f32 = 0,
+measured_height: f32 = 0,
 
 pub fn init(rect: c.SDL_FRect, initial_text: []const u8) Self {
     var self: Self = .{ .rect = rect };
@@ -113,6 +130,20 @@ pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, paddi
     }
 
     if (wrap_changed) self.wrapped_width = target_wrap;
+
+    // Re-measured every sync rather than only on change: the wrap width
+    // tracks `rect.w`, so a resize alters the line count (and therefore
+    // the height) without the text itself ever changing.
+    if (self.text_obj) |obj| {
+        var w: c_int = 0;
+        var h: c_int = 0;
+        _ = c.TTF_GetTextSize(obj, &w, &h);
+        self.measured_width = @floatFromInt(w);
+        self.measured_height = @floatFromInt(h);
+    } else {
+        self.measured_width = 0;
+        self.measured_height = 0;
+    }
 }
 
 /// Must be called before this widget is dropped from the registry -- see

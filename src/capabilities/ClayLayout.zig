@@ -363,10 +363,34 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
         // here to override Fit's min/max to the button's own real content
         // width instead. 0 (not yet synced even once) leaves Clay's own
         // sizing alone rather than forcing a real 0-width button.
-        if (slot.widget == .button and slot.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT and slot.widget.button.measured_width > 0) {
+        // Generalized from the Button-width-only version (2026-09-02) that
+        // this replaces: any widget whose size genuinely is its text now
+        // drives its own Fit sizing from a real font measurement, on both
+        // axes. Without this a FIT-sized leaf collapses to Fit's wire
+        // default (min=max=0), since natyv draws text via SDL_ttf outside
+        // Clay entirely and Clay therefore never sees any text content --
+        // see this file's own `measureText` note.
+        //
+        // Height matters as much as width once a custom font exists: the
+        // hardcoded Fixed heights every text widget used were tuned for
+        // the bundled Inter at 16pt, so a larger font clipped its own
+        // descenders. For a wrapped Label the measured height is the whole
+        // wrapped block, so the line count the rect's wrap width produced
+        // is what the height follows.
+        //
+        // No measurement yet (never synced) leaves Clay's own sizing
+        // alone rather than forcing a real zero-sized widget; the next
+        // frame picks it up.
+        if (slot.widget.measuredText()) |measured| {
             const text_padding = WidgetHost.effectiveTextPadding(slot.clay_style.padding);
-            const total_width = slot.widget.button.measured_width + @as(f32, @floatFromInt(text_padding.left + text_padding.right));
-            decl.layout.sizing.width.size.minMax = .{ .min = total_width, .max = total_width };
+            if (slot.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT and measured.w > 0) {
+                const total = measured.w + @as(f32, @floatFromInt(text_padding.left + text_padding.right));
+                decl.layout.sizing.width.size.minMax = .{ .min = total, .max = total };
+            }
+            if (slot.clay_style.sizing.height.type == c.CLAY__SIZING_TYPE_FIT and measured.h > 0) {
+                const total = measured.h + @as(f32, @floatFromInt(text_padding.top + text_padding.bottom));
+                decl.layout.sizing.height.size.minMax = .{ .min = total, .max = total };
+            }
         }
         decl.layout.padding = slot.clay_style.padding;
         decl.layout.childGap = slot.clay_style.child_gap;
