@@ -92,8 +92,11 @@ OOB stack write in ReleaseSmall).
 - **Do not add another `[max_widgets]` buffer** without bounds-checking the write.
 - `DrawBatcher.zig:61` is the correct pattern (`if (self.counts[i] < max_widgets)`).
 
-**`sqlite_exec`/`sqlite_query` accept arbitrary guest SQL with no `sqlite3_set_authorizer`**, so a guest
-can `ATTACH` any path — full filesystem read/write at host privilege, bypassing the WASM sandbox.
+**Guest SQL may not name files.** `Sqlite.open` installs an authorizer: `ATTACH` only with an empty
+filename (plain `VACUUM` attaches `''` internally — a blanket deny breaks it), `DETACH` and the
+`temp_store_directory`/`data_store_directory` pragmas denied. This blocks `ATTACH '<path>'` and
+`VACUUM INTO '<path>'`, which read/write anywhere at host privilege. Everything inside the host-opened
+database stays allowed. Widen only on real need, and host-mediated (guest names, host picks paths).
 
 **Rule going forward: any host function that exposes a resource must bound it and reject past the
 bound.** `Tcp.zig` and `TrayRegistry.zig` are the reference implementations (`orelse return Error`,
