@@ -752,11 +752,10 @@ mutex: Io.Mutex = .init,
 /// alone. Making `slots` itself heap-backed fixes this at the root:
 /// `WidgetHost`'s own size (and therefore `Runtime`'s) no longer depends
 /// on `max_widgets` at all, regardless of how many places embed either by
-/// value. `max_widgets` itself is unchanged as a named constant (still
-/// used as a scratch-buffer size in tests, and as an initial-growth
-/// reference) but is no longer a hard ceiling `slots` can hit -- growth is
-/// governed entirely by `insertLockedWithLayout`'s own free-slot-scan-then-
-/// append logic below.
+/// value. `max_widgets` is still the hard ceiling on `slots.items.len`,
+/// enforced by `insertLockedWithLayout`'s own append path below -- every
+/// snapshot/collect scratch buffer in the runtime is sized to it, so the
+/// heap backing only moves the storage, it doesn't lift the cap.
 slots: std.ArrayListUnmanaged(?Slot) = .empty,
 next_id: u32 = 1,
 /// id -> index into `slots`, kept in sync at every real site a slot ever
@@ -1258,10 +1257,14 @@ fn insertLockedWithLayout(self: *Self, widget: Widget, parent_id: ?u32, clay_sty
         }
     }
     // No existing (destroyed-and-freed) slot to reuse -- grow the registry
-    // by one instead of failing. `slots` has no fixed ceiling of its own
-    // (see its own doc comment); this only returns null on a genuine
-    // allocation failure, matching the existing `id_to_index.put` failure
-    // convention just above.
+    // by one, up to `max_widgets`. `slots` itself is growable (see its own
+    // doc comment), but every snapshot/collect buffer in the runtime is
+    // sized to `max_widgets`, so growing past it would let a guest drive
+    // those buffers out of bounds -- a silent OOB write in ReleaseSmall.
+    // Refusing here surfaces as `error.RegistryFull` to the guest; null is
+    // otherwise only returned on a genuine allocation failure, matching the
+    // existing `id_to_index.put` failure convention just above.
+    if (self.slots.items.len >= max_widgets) return null;
     const idx = self.slots.items.len;
     self.slots.append(self.allocator, null) catch return null;
     const id = self.next_id;
@@ -1508,6 +1511,7 @@ pub fn destroyExpiredWidgets(self: *Self, call_io: Io, now_ms: i64) void {
         if (maybe_slot) |s| {
             if (s.expires_at_ms) |exp| {
                 if (now_ms >= exp) {
+                    if (expired_count >= expired_roots.len) break;
                     expired_roots[expired_count] = s.id;
                     expired_count += 1;
                 }
@@ -1544,11 +1548,12 @@ pub fn hasPendingExpiry(self: *Self, call_io: Io) bool {
 /// shared by `destroySubtreeLocked` (root + descendants) and
 /// `destroyDescendantsLocked` (descendants only, root kept alive), so
 /// both stay in sync with exactly one real traversal implementation.
-fn collectDescendantsLocked(self: *Self, root_id: u32, out: *[max_widgets]u32) usize {
+fn collectDescendantsLocked(self: *Self, root_id: u32, out: []u32) usize {
     var count: usize = 0;
     for (self.slots.items) |maybe_slot| {
         if (maybe_slot) |s| {
             if (s.id != root_id and self.isDescendantLocked(s.id, root_id)) {
+                if (count >= out.len) break;
                 out[count] = s.id;
                 count += 1;
             }
@@ -1605,7 +1610,10 @@ fn destroyIdsLocked(self: *Self, ids: []const u32) void {
 /// descendant behind.
 fn destroySubtreeLocked(self: *Self, root_id: u32) void {
     var to_destroy: [max_widgets]u32 = undefined;
-    var count = self.collectDescendantsLocked(root_id, &to_destroy);
+    // Last entry reserved for `root_id` itself -- with the registry capped
+    // at `max_widgets` live widgets, the root plus its descendants always
+    // fit exactly.
+    var count = self.collectDescendantsLocked(root_id, to_destroy[0 .. to_destroy.len - 1]);
     to_destroy[count] = root_id;
     count += 1;
     self.destroyIdsLocked(to_destroy[0..count]);
@@ -1644,6 +1652,7 @@ fn destroyDescendantsExceptLocked(self: *Self, root_id: u32, except_id: u32) voi
                 self.isDescendantLocked(s.id, root_id) and
                 !self.isDescendantLocked(s.id, except_id))
             {
+                if (count >= to_destroy.len) break;
                 to_destroy[count] = s.id;
                 count += 1;
             }
@@ -2599,6 +2608,41 @@ test "setText only bumps layout_generation on a real content change" {
 
     try std.testing.expect(host.setText(test_io, id, "y"));
     try std.testing.expect(host.layout_generation != gen1);
+}
+
+test "registry refuses inserts past max_widgets" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    const root = host.insertWithLayout(test_io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}).?;
+    for (0..max_widgets - 1) |_| {
+        try std.testing.expect(host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, root, .{}) != null);
+    }
+    try std.testing.expect(host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, root, .{}) == null);
+    try std.testing.expectEqual(@as(usize, max_widgets), host.slots.items.len);
+}
+
+test "destroying a parent at the max_widgets cap stays in bounds and frees every slot" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    // Previously 2049 widgets (root + max_widgets children) overran
+    // destroySubtreeLocked's `to_destroy` -- a Debug panic, a silent OOB
+    // write in ReleaseSmall.
+    const root = host.insertWithLayout(test_io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}).?;
+    for (0..max_widgets) |_| {
+        _ = host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, root, .{});
+    }
+
+    host.mutex.lockUncancelable(test_io);
+    host.destroySubtreeLocked(root);
+    host.mutex.unlock(test_io);
+
+    try std.testing.expect(host.findLocked(root) == null);
+    for (host.slots.items) |slot| try std.testing.expect(slot == null);
+    try std.testing.expectEqual(@as(u32, 0), host.id_to_index.count());
 }
 
 test "setText on an unknown widget id returns false" {
