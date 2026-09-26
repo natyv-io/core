@@ -83,7 +83,7 @@ Zig 0.16.0, Extism runtime 1.30.0 (see `build.zig.zon`). Policy: pin to whatever
 
   Full history, including the two earlier wrong hypotheses (macOS's real "double-space for period" system feature — plausible-sounding, and directly ruled out once Quinn confirmed the exact same input had worked before this feature existed; then the boundary-query theory) and every fix in order: `project_natyv_copy_paste_scoping` memory.
 
-## Host-function security invariants (audited 2026-09-24, all findings fixed 2026-09-25)
+## Host-function security invariants (audited 2026-09-24/25, all findings fixed 2026-09-25)
 
 **`WidgetHost.max_widgets` (2048) is the hard cap on `slots`** — enforced in `insertLockedWithLayout`
 (returns null → `error.RegistryFull`). Every `[max_widgets]` scratch buffer relies on it, and each write
@@ -104,6 +104,19 @@ so it must never grow unbounded; past the cap the host fn returns `persist limit
 
 **Truncate text with `text_cursor.truncatedLen(s, max)`, never `@min(s.len, max)`** — a byte cut can
 split a multi-byte sequence and hand SDL/SDL_ttf invalid UTF-8. Every fixed-buffer text copy uses it.
+
+**Guest numbers are validated at the wire, and every use site is safe on its own anyway.** Out-of-range
+`@intFromFloat`, integer overflow, `@mod` by ≤ 0 and `std.math.clamp` with `lo > hi` are a Debug panic
+and silent UB in ReleaseSmall (what ships). `std.json` parses `1e999` as `inf`, so:
+- `WidgetHostFunctions.parseRequest` rejects any request containing a non-finite float (`allFinite`).
+  Every widget host fn must parse through it.
+- Every float→int on a guest-reachable value uses `std.math.lossyCast` (saturates, NaN→0), never
+  `@intFromFloat` — rects, sizes, clip rects, colors, SDL window dims, `ShapeCache` mask dims
+  (`maskInt`, also capped so `dim * aa_level` fits a texture).
+- Integer arithmetic on guest values uses saturating ops (`+|`, `-|`), or widens to `i64` first
+  (`NumericStepper.resolve`'s wrap).
+- `clamp(x, lo, hi)`/`@mod` only where the bounds are known valid: normalize guest pairs first
+  (`NumericStepper.init` orders min/max, `RangeSlider.setRange` clamps the upper bound before using it).
 
 **`zig build test` never compiles host-fn callbacks or `FrameLoop.zig`** — Zig only analyzes what a
 test references, and nothing references the `capabilities/*.zig` callbacks or the `main.zig`-only

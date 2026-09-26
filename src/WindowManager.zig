@@ -199,7 +199,7 @@ pub fn disabledFillFor(background: c.SDL_Color) c.SDL_FColor {
 }
 
 pub fn createWindowContext(allocator: std.mem.Allocator, title: [:0]const u8, width: f32, height: f32, default_font: *c.TTF_Font, clay_enabled: bool, background: c.SDL_Color, root_widget_id: ?u32) !WindowContext {
-    const window = c.SDL_CreateWindow(title.ptr, @intFromFloat(width), @intFromFloat(height), c.SDL_WINDOW_RESIZABLE) orelse {
+    const window = c.SDL_CreateWindow(title.ptr, std.math.lossyCast(c_int, width), std.math.lossyCast(c_int, height), c.SDL_WINDOW_RESIZABLE) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlWindowFailed;
     };

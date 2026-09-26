@@ -407,7 +407,7 @@ fn openChildren(slots: []const WidgetHost.Slot, parent_id: ?u32, flips: FlipSet)
         // (visually colliding with) the header strip Tabs.drawDecorations
         // draws separately -- see Tabs.headerRect's doc comment.
         if (slot.widget == .tabs) {
-            decl.layout.padding.top += @intFromFloat(Tabs.header_height);
+            decl.layout.padding.top +|= @intFromFloat(Tabs.header_height); // saturating: padding.top is guest-supplied
             decl.layout.layoutDirection = c.CLAY_TOP_TO_BOTTOM;
         }
 

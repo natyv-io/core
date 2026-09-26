@@ -72,7 +72,7 @@ pub fn segmentAt(self: Self, x: f32, y: f32) ?usize {
     if (self.count == 0 or !self.containsPoint(x, y)) return null;
     const seg_w = self.rect.w / @as(f32, @floatFromInt(self.count));
     if (seg_w <= 0) return null;
-    const idx: usize = @intFromFloat(@floor((x - self.rect.x) / seg_w));
+    const idx = std.math.lossyCast(usize, @floor((x - self.rect.x) / seg_w));
     return @min(idx, self.count - 1);
 }
 

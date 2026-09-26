@@ -94,7 +94,7 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_P
 /// caller) replaces that hardcoded `- 8` -- wrap width shrinks by the real
 /// left+right padding instead of a fixed magic number.
 pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, padding: c.Clay_Padding) void {
-    const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - @as(i32, padding.left) - @as(i32, padding.right));
+    const target_wrap: i32 = @max(0, std.math.lossyCast(i32, self.rect.w) -| @as(i32, padding.left) -| @as(i32, padding.right));
     const wrap_changed = target_wrap != self.wrapped_width;
 
     // Real bug, found 2026-09-11: a genuinely empty Label (self.len == 0 --

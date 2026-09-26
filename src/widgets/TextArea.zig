@@ -262,10 +262,10 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_P
     const active = if (self.len > 0) self.text_obj else self.placeholder_obj;
     if (active) |obj| {
         const clip = c.SDL_Rect{
-            .x = @intFromFloat(@floor(self.rect.x)),
-            .y = @intFromFloat(@floor(self.rect.y)),
-            .w = @intFromFloat(@ceil(self.rect.w)),
-            .h = @intFromFloat(@ceil(self.rect.h)),
+            .x = std.math.lossyCast(c_int, @floor(self.rect.x)),
+            .y = std.math.lossyCast(c_int, @floor(self.rect.y)),
+            .w = std.math.lossyCast(c_int, @ceil(self.rect.w)),
+            .h = std.math.lossyCast(c_int, @ceil(self.rect.h)),
         };
         _ = c.SDL_SetRenderClipRect(renderer, &clip);
         const text_x = self.rect.x + @as(f32, @floatFromInt(padding.left));
@@ -393,7 +393,7 @@ pub fn drawDecorations(self: Self, renderer: ?*c.SDL_Renderer, padding: c.Clay_P
 /// `WidgetHost.effectiveTextPadding` by the caller) replaces the original
 /// hardcoded `- 12` -- wrap width shrinks by the real left+right padding.
 pub fn syncText(self: *Self, engine: *c.TTF_TextEngine, font: *c.TTF_Font, padding: c.Clay_Padding) void {
-    const target_wrap: i32 = @max(0, @as(i32, @intFromFloat(self.rect.w)) - @as(i32, padding.left) - @as(i32, padding.right));
+    const target_wrap: i32 = @max(0, std.math.lossyCast(i32, self.rect.w) -| @as(i32, padding.left) -| @as(i32, padding.right));
     const wrap_changed = target_wrap != self.wrapped_width;
 
     // Real bug, found 2026-09-11 -- see Label.syncText's own doc comment for

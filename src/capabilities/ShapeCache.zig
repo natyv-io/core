@@ -52,7 +52,21 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 
 pub const aa_level: u32 = 4;
+/// Largest mask edge (and ring/border width), in real pixels. A mask only
+/// picks a resolution -- `SDL_RenderTexture` scales it onto the real rect --
+/// so capping it is safe, and it keeps `dim * aa_level` inside both `i32`
+/// and the 16384 px texture limit most GPUs have (past which
+/// `SDL_CreateTexture` fails and the shape silently doesn't draw). The
+/// sizes come from guest layout values, so without the cap a huge width
+/// overflowed that multiply.
+const max_mask_dim: i32 = @intCast(16384 / aa_level);
 const max_entries = 32;
+
+/// Float -> mask dimension: saturating (NaN -> 0, see `lossyCast`) and
+/// capped at `max_mask_dim`. Callers keep their own rounding.
+fn maskInt(f: f32) i32 {
+    return @min(std.math.lossyCast(i32, f), max_mask_dim);
+}
 const circle_segments = 48;
 // Each of the 4 corners gets an independent quarter-turn arc; the space
 // between one corner's arc and the next is implicitly the straight edge
@@ -231,7 +245,7 @@ fn renderRingMask(renderer: ?*c.SDL_Renderer, size: i32, border_width: i32) ?*c.
 /// Draws a filled circle inscribed in `rect` (uses `min(w, h)` as the
 /// diameter) in `color`, using/populating `cache`.
 pub fn drawCircle(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, color: c.SDL_Color) void {
-    const size: i32 = @intFromFloat(@round(@min(rect.w, rect.h)));
+    const size = maskInt(@round(@min(rect.w, rect.h)));
     if (size <= 0) return;
     const key = MaskKey{ .kind = .circle, .w = size, .h = size };
     const tex = if (cache.find(key)) |t| t else blk: {
@@ -257,9 +271,9 @@ pub fn drawCircle(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, 
 /// Draws a ring (circle outline, `border_width` thick) inscribed in `rect`
 /// in `color`, using/populating `cache`.
 pub fn drawRing(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, border_width: f32, color: c.SDL_Color) void {
-    const size: i32 = @intFromFloat(@round(@min(rect.w, rect.h)));
+    const size = maskInt(@round(@min(rect.w, rect.h)));
     if (size <= 0) return;
-    const bw: i32 = @intFromFloat(@max(border_width, 1));
+    const bw = maskInt(@max(border_width, 1));
     const key = MaskKey{ .kind = .ring, .w = size, .h = size, .border_width = bw };
     const tex = if (cache.find(key)) |t| t else blk: {
         const t = renderRingMask(renderer, size, bw) orelse return;
@@ -287,7 +301,7 @@ fn clampRadii(radii: [4]f32, w: f32, h: f32) [4]f32 {
 
 fn quantizeRadii(radii: [4]f32) [4]i32 {
     var out: [4]i32 = undefined;
-    for (radii, 0..) |r, i| out[i] = @intFromFloat(@round(r));
+    for (radii, 0..) |r, i| out[i] = std.math.lossyCast(i32, @round(r));
     return out;
 }
 
@@ -394,8 +408,8 @@ fn renderRectBorderMask(renderer: ?*c.SDL_Renderer, w: i32, h: i32, radii: [4]f3
 /// be square -- this is the shape Container/Button-style widgets actually
 /// want (e.g. 8px corners on a 200x40 button).
 pub fn drawRoundedRect(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, color: c.SDL_Color) void {
-    const w: i32 = @intFromFloat(@round(rect.w));
-    const h: i32 = @intFromFloat(@round(rect.h));
+    const w = maskInt(@round(rect.w));
+    const h = maskInt(@round(rect.h));
     if (w <= 0 or h <= 0) return;
     const key = MaskKey{ .kind = .rect, .w = w, .h = h, .radii = quantizeRadii(radii) };
     const tex = if (cache.find(key)) |t| t else blk: {
@@ -414,10 +428,10 @@ pub fn drawRoundedRect(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FR
 /// Draws a per-corner-rounded rectangle's border (`border_width` thick,
 /// inset from the outer edge) in `color`, using/populating `cache`.
 pub fn drawRoundedRectBorder(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, border_width: f32, color: c.SDL_Color) void {
-    const w: i32 = @intFromFloat(@round(rect.w));
-    const h: i32 = @intFromFloat(@round(rect.h));
+    const w = maskInt(@round(rect.w));
+    const h = maskInt(@round(rect.h));
     if (w <= 0 or h <= 0) return;
-    const bw: i32 = @intFromFloat(@max(@round(border_width), 1));
+    const bw = maskInt(@max(@round(border_width), 1));
     const key = MaskKey{ .kind = .rect_border, .w = w, .h = h, .radii = quantizeRadii(radii), .border_width = bw };
     const tex = if (cache.find(key)) |t| t else blk: {
         const t = renderRectBorderMask(renderer, w, h, radii, @floatFromInt(bw)) orelse return;
@@ -461,8 +475,8 @@ fn lerpColor(a: c.SDL_FColor, b: c.SDL_FColor, t: f32) c.SDL_FColor {
 /// mechanism `fillConvexPolygon` already relies on for flat colors (just
 /// with a texture bound this time instead of `null`), not a new technique.
 pub fn drawRoundedRectGradient(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, start_uv: [2]f32, start_color: c.SDL_FColor, end_uv: [2]f32, end_color: c.SDL_FColor) void {
-    const w: i32 = @intFromFloat(@round(rect.w));
-    const h: i32 = @intFromFloat(@round(rect.h));
+    const w = maskInt(@round(rect.w));
+    const h = maskInt(@round(rect.h));
     if (w <= 0 or h <= 0) return;
     const key = MaskKey{ .kind = .rect, .w = w, .h = h, .radii = quantizeRadii(radii) };
     const tex = if (cache.find(key)) |t| t else blk: {
@@ -533,8 +547,8 @@ pub fn drawRoundedRectGradient(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: 
 /// pattern, not a further semi-transparent layer on top of the shape's own
 /// mask alpha. Revisit if that need ever surfaces for real.
 pub fn drawRoundedRectTexture(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c.SDL_FRect, radii: [4]f32, image: *c.SDL_Texture) void {
-    const w: i32 = @intFromFloat(@round(rect.w));
-    const h: i32 = @intFromFloat(@round(rect.h));
+    const w = maskInt(@round(rect.w));
+    const h = maskInt(@round(rect.h));
     if (w <= 0 or h <= 0) return;
     const key = MaskKey{ .kind = .rect, .w = w, .h = h, .radii = quantizeRadii(radii) };
     const mask = if (cache.find(key)) |t| t else blk: {
@@ -576,4 +590,13 @@ pub fn drawRoundedRectTexture(cache: *Cache, renderer: ?*c.SDL_Renderer, rect: c
     // See drawCircle's doc comment -- `rect` is the real destination, not a
     // rect rebuilt from the integer w/h used only for the mask/cache key.
     _ = c.SDL_RenderTexture(renderer, scratch, null, &rect);
+}
+
+test "maskInt saturates, maps NaN to 0, and keeps dim * aa_level inside i32" {
+    try std.testing.expectEqual(@as(i32, 120), maskInt(120));
+    try std.testing.expectEqual(max_mask_dim, maskInt(1e30));
+    try std.testing.expectEqual(std.math.minInt(i32), maskInt(-1e30));
+    try std.testing.expectEqual(@as(i32, 0), maskInt(std.math.nan(f32)));
+    // The multiply every render*Mask does must not overflow at the cap.
+    _ = maskInt(3e38) * @as(i32, @intCast(aa_level));
 }

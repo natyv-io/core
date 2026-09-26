@@ -2037,7 +2037,7 @@ fn positionCursorAtTextField(t: *TextField, local_x: f32, local_y: f32, mode: Cu
         if (t.len > 0 and t.text_obj != null) {
             const obj = t.text_obj.?;
             var sub: c.TTF_SubString = undefined;
-            if (c.TTF_GetTextSubStringForPoint(obj, @intFromFloat(local_x), @intFromFloat(local_y), &sub)) {
+            if (c.TTF_GetTextSubStringForPoint(obj, std.math.lossyCast(c_int, local_x), std.math.lossyCast(c_int, local_y), &sub)) {
                 break :blk @intCast(@max(0, sub.offset));
             }
         }
@@ -2066,7 +2066,7 @@ fn positionCursorAtTextArea(ta: *TextArea, local_x: f32, local_y: f32, mode: Cur
         if (ta.len > 0 and ta.text_obj != null) {
             const obj = ta.text_obj.?;
             var sub: c.TTF_SubString = undefined;
-            if (c.TTF_GetTextSubStringForPoint(obj, @intFromFloat(local_x), @intFromFloat(local_y), &sub)) {
+            if (c.TTF_GetTextSubStringForPoint(obj, std.math.lossyCast(c_int, local_x), std.math.lossyCast(c_int, local_y), &sub)) {
                 break :blk @intCast(@max(0, sub.offset));
             }
         }

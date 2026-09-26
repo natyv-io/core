@@ -1273,8 +1273,8 @@ pub fn setValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
         // Slider above -- round-trips through f32 (the wire's only
         // numeric type), fine for the small integer ranges either of
         // these widgets deals in.
-        .numeric_stepper => |*ns| ns.setValue(@intFromFloat(req.value)),
-        .segmented_control => |*sc| sc.select(@intFromFloat(@max(0, req.value))),
+        .numeric_stepper => |*ns| ns.setValue(std.math.lossyCast(i32, req.value)),
+        .segmented_control => |*sc| sc.select(std.math.lossyCast(usize, req.value)),
         else => {},
     }
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -1332,20 +1332,7 @@ pub fn setRangeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     };
-    if (slot.widget == .range_slider) {
-        // Clamp the pair against each other directly (not via setMin/setMax,
-        // whose own clamping is exactly the ordering hazard this function's
-        // doc comment explains) -- min against [0, max_request], max against
-        // [that resolved min, 1], mirroring RangeSlider.init's own "min
-        // resolves first" ordering. Snapped independently afterward (see
-        // RangeSlider.snap's own doc comment for why snapping each side
-        // separately here is still safe -- @round is monotonic, so it can't
-        // invert an already-valid min <= max pair).
-        const clamped_min = std.math.clamp(req.min, 0, req.max);
-        const clamped_max = std.math.clamp(req.max, clamped_min, 1);
-        slot.widget.range_slider.min = slot.widget.range_slider.snap(clamped_min);
-        slot.widget.range_slider.max = slot.widget.range_slider.snap(clamped_max);
-    }
+    if (slot.widget == .range_slider) slot.widget.range_slider.setRange(req.min, req.max);
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
 

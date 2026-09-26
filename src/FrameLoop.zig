@@ -194,12 +194,16 @@ fn updateFocus(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *Wind
     }
 }
 
+/// `lossyCast`, not `@intFromFloat`: laid-out rects derive from guest sizing
+/// values, so they can be huge or (after `inf - inf` in layout) NaN, and
+/// `lossyCast` saturates and maps NaN to 0 instead of hitting illegal
+/// behavior. Same reason every guest-reachable float->int site uses it.
 fn toClipRect(r: c.SDL_FRect) c.SDL_Rect {
     return .{
-        .x = @intFromFloat(@floor(r.x)),
-        .y = @intFromFloat(@floor(r.y)),
-        .w = @intFromFloat(@ceil(r.w)),
-        .h = @intFromFloat(@ceil(r.h)),
+        .x = std.math.lossyCast(c_int, @floor(r.x)),
+        .y = std.math.lossyCast(c_int, @floor(r.y)),
+        .w = std.math.lossyCast(c_int, @ceil(r.w)),
+        .h = std.math.lossyCast(c_int, @ceil(r.h)),
     };
 }
 
@@ -498,11 +502,11 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             const surface_id = FloatingOrder.surfaceIdFor(slots, index, slot.id);
             switch (ns.regionAt(mx, my)) {
                 .minus => {
-                    notifyStepperValue(widgets, io, queue, slot.id, ns.value - ns.step, surface_id);
+                    notifyStepperValue(widgets, io, queue, slot.id, ns.minusStep(), surface_id);
                     return slot.id;
                 },
                 .plus => {
-                    notifyStepperValue(widgets, io, queue, slot.id, ns.value + ns.step, surface_id);
+                    notifyStepperValue(widgets, io, queue, slot.id, ns.plusStep(), surface_id);
                     return slot.id;
                 },
                 .none => if (ns.containsPoint(mx, my)) return slot.id,
@@ -569,10 +573,10 @@ fn containerClickBlockedByDescendant(slots: []const WidgetHost.Slot, index: Widg
 /// result, not to a default color here.
 fn fcolorToColor(fc: c.SDL_FColor) c.SDL_Color {
     return .{
-        .r = @intFromFloat(@round(std.math.clamp(fc.r, 0, 1) * 255)),
-        .g = @intFromFloat(@round(std.math.clamp(fc.g, 0, 1) * 255)),
-        .b = @intFromFloat(@round(std.math.clamp(fc.b, 0, 1) * 255)),
-        .a = @intFromFloat(@round(std.math.clamp(fc.a, 0, 1) * 255)),
+        .r = std.math.lossyCast(u8, @round(std.math.clamp(fc.r, 0, 1) * 255)),
+        .g = std.math.lossyCast(u8, @round(std.math.clamp(fc.g, 0, 1) * 255)),
+        .b = std.math.lossyCast(u8, @round(std.math.clamp(fc.b, 0, 1) * 255)),
+        .a = std.math.lossyCast(u8, @round(std.math.clamp(fc.a, 0, 1) * 255)),
     };
 }
 
@@ -947,7 +951,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                     switch (slot.widget) {
                         .slider => |s| notifySliderValue(widgets, io, queue, id, s.value - Slider.nudge_step, surface_id),
                         .range_slider => |rs| notifyRangeSliderValue(widgets, io, queue, id, rs.active_handle, rs.activeValue() - rs.nudgeAmount(), surface_id),
-                        .numeric_stepper => |ns| notifyStepperValue(widgets, io, queue, id, ns.value - ns.step, surface_id),
+                        .numeric_stepper => |ns| notifyStepperValue(widgets, io, queue, id, ns.minusStep(), surface_id),
                         .segmented_control => |sc| notifySegmentedValue(widgets, io, queue, id, if (sc.selected_index > 0) sc.selected_index - 1 else 0, surface_id),
                         .tabs => |tb| notifyTabsValue(widgets, io, queue, id, if (tb.selected_index > 0) tb.selected_index - 1 else 0, surface_id),
                         .button => queue.push(io, id, .key_nav, "{\"key\":\"left\"}", surface_id),
@@ -963,7 +967,7 @@ pub fn handleEvent(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *
                     switch (slot.widget) {
                         .slider => |s| notifySliderValue(widgets, io, queue, id, s.value + Slider.nudge_step, surface_id),
                         .range_slider => |rs| notifyRangeSliderValue(widgets, io, queue, id, rs.active_handle, rs.activeValue() + rs.nudgeAmount(), surface_id),
-                        .numeric_stepper => |ns| notifyStepperValue(widgets, io, queue, id, ns.value + ns.step, surface_id),
+                        .numeric_stepper => |ns| notifyStepperValue(widgets, io, queue, id, ns.plusStep(), surface_id),
                         .segmented_control => |sc| notifySegmentedValue(widgets, io, queue, id, sc.selected_index + 1, surface_id),
                         .tabs => |tb| notifyTabsValue(widgets, io, queue, id, tb.selected_index + 1, surface_id),
                         .button => queue.push(io, id, .key_nav, "{\"key\":\"right\"}", surface_id),

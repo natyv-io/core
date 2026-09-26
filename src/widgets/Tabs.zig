@@ -94,7 +94,7 @@ pub fn tabAt(self: Self, x: f32, y: f32) ?usize {
     if (x < hr.x or x >= hr.x + hr.w or y < hr.y or y >= hr.y + hr.h) return null;
     const tab_w = hr.w / @as(f32, @floatFromInt(self.count));
     if (tab_w <= 0) return null;
-    const idx: usize = @intFromFloat(@floor((x - hr.x) / tab_w));
+    const idx = std.math.lossyCast(usize, @floor((x - hr.x) / tab_w));
     return @min(idx, self.count - 1);
 }
 
