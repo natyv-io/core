@@ -98,6 +98,14 @@ filename (plain `VACUUM` attaches `''` internally — a blanket deny breaks it),
 `VACUUM INTO '<path>'`, which read/write anywhere at host privilege. Everything inside the host-opened
 database stays allowed. Widen only on real need, and host-mediated (guest names, host picks paths).
 
+**Persisted state is capped** (`PersistStore.max_entries` 4096, `max_total_bytes` 16 MiB, counting both
+the value store and the freed-keys set). It lives outside the guest's wasm memory and survives recycling,
+so it must never grow unbounded; past the cap the host fn returns `persist limit reached`.
+
+**`zig build test` never compiles host-fn callbacks or `FrameLoop.zig`** — Zig only analyzes what a
+test references, and nothing references the `capabilities/*.zig` callbacks or the `main.zig`-only
+`FrameLoop`. Run `zig build` too after touching them (a type error in `Persist.zig` passed all tests).
+
 **Rule going forward: any host function that exposes a resource must bound it and reject past the
 bound.** `Tcp.zig` and `TrayRegistry.zig` are the reference implementations (`orelse return Error`,
 validated ids, `@min`-clamped sizes). Full findings and work order in the `natyv-host-function-audit`
