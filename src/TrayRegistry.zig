@@ -45,6 +45,7 @@
 //! way `Checkbox`'s own widget state is read today.
 
 const std = @import("std");
+const text_cursor = @import("widgets/text_cursor.zig");
 const Io = std.Io;
 const c = @import("c.zig").c;
 
@@ -83,7 +84,7 @@ pub const Label = struct {
 
     pub fn from(s: []const u8) Label {
         var l: Label = .{};
-        l.len = @min(s.len, max_label_len);
+        l.len = text_cursor.truncatedLen(s, max_label_len);
         @memcpy(l.buf[0..l.len], s[0..l.len]);
         return l;
     }
@@ -108,7 +109,7 @@ pub const Tooltip = struct {
 
     pub fn from(s: []const u8) Tooltip {
         var t: Tooltip = .{};
-        t.len = @min(s.len, max_tooltip_len);
+        t.len = text_cursor.truncatedLen(s, max_tooltip_len);
         @memcpy(t.buf[0..t.len], s[0..t.len]);
         return t;
     }
@@ -676,4 +677,16 @@ test "cString NUL-terminates into caller scratch" {
     const z = label.cString(&scratch);
     try testing.expectEqualStrings("Quit", z);
     try testing.expectEqual(@as(u8, 0), z.ptr[z.len]);
+}
+
+test "Label/Tooltip truncation lands on a codepoint boundary" {
+    // "a" then 2-byte "é"s: the one-byte prefix puts every even cap
+    // (both are 96) in the middle of an "é".
+    const long = "a" ++ "\u{e9}" ** max_tooltip_len;
+    const label = Label.from(long);
+    const tooltip = Tooltip.from(long);
+    try std.testing.expect(label.len <= max_label_len);
+    try std.testing.expect(tooltip.len <= max_tooltip_len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(label.slice()));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tooltip.slice()));
 }

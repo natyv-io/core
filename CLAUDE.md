@@ -83,7 +83,7 @@ Zig 0.16.0, Extism runtime 1.30.0 (see `build.zig.zon`). Policy: pin to whatever
 
   Full history, including the two earlier wrong hypotheses (macOS's real "double-space for period" system feature — plausible-sounding, and directly ruled out once Quinn confirmed the exact same input had worked before this feature existed; then the boundary-query theory) and every fix in order: `project_natyv_copy_paste_scoping` memory.
 
-## Known security hazards — OPEN, fix before v0.2.0 (audited 2026-09-24)
+## Host-function security invariants (audited 2026-09-24, all findings fixed 2026-09-25)
 
 **`WidgetHost.max_widgets` (2048) is the hard cap on `slots`** — enforced in `insertLockedWithLayout`
 (returns null → `error.RegistryFull`). Every `[max_widgets]` scratch buffer relies on it, and each write
@@ -102,14 +102,16 @@ database stays allowed. Widen only on real need, and host-mediated (guest names,
 the value store and the freed-keys set). It lives outside the guest's wasm memory and survives recycling,
 so it must never grow unbounded; past the cap the host fn returns `persist limit reached`.
 
+**Truncate text with `text_cursor.truncatedLen(s, max)`, never `@min(s.len, max)`** — a byte cut can
+split a multi-byte sequence and hand SDL/SDL_ttf invalid UTF-8. Every fixed-buffer text copy uses it.
+
 **`zig build test` never compiles host-fn callbacks or `FrameLoop.zig`** — Zig only analyzes what a
 test references, and nothing references the `capabilities/*.zig` callbacks or the `main.zig`-only
 `FrameLoop`. Run `zig build` too after touching them (a type error in `Persist.zig` passed all tests).
 
 **Rule going forward: any host function that exposes a resource must bound it and reject past the
 bound.** `Tcp.zig` and `TrayRegistry.zig` are the reference implementations (`orelse return Error`,
-validated ids, `@min`-clamped sizes). Full findings and work order in the `natyv-host-function-audit`
-memory.
+validated ids, clamped sizes). Full findings in the `natyv-host-function-audit` memory.
 
 ## Project structure conventions
 

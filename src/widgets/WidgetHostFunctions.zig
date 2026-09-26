@@ -24,6 +24,7 @@
 //! here (`zig build`/`zig build test` both pass with this exact cycle).
 
 const std = @import("std");
+const text_cursor = @import("text_cursor.zig");
 const c = @import("../c.zig").c;
 const host_fn_util = @import("../host_fn_util.zig");
 const timing = @import("../timing.zig");
@@ -1393,7 +1394,7 @@ pub fn createClayWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const
     const req = parsed.value;
 
     var title_buf: [64]u8 = undefined;
-    const title_len = @min(req.title.len, title_buf.len);
+    const title_len = text_cursor.truncatedLen(req.title, title_buf.len);
     @memcpy(title_buf[0..title_len], req.title[0..title_len]);
 
     const style: ClayStyle = .{

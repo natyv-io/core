@@ -16,6 +16,17 @@ fn isContinuationByte(b: u8) bool {
     return (b & 0xC0) == 0x80;
 }
 
+/// Length of the longest prefix of `s` that is at most `max` bytes and
+/// ends on a codepoint boundary -- the drop-in for `@min(s.len, max)` when
+/// truncating text into a fixed buffer. A plain byte cut can split a
+/// multi-byte sequence and hand SDL/SDL_ttf invalid UTF-8.
+pub fn truncatedLen(s: []const u8, max: usize) usize {
+    if (s.len <= max) return s.len;
+    var n = max;
+    while (n > 0 and isContinuationByte(s[n])) : (n -= 1) {}
+    return n;
+}
+
 /// Byte offset of the start of the codepoint immediately before `pos`.
 /// `pos` must be 0..=buf.len. Returns 0 if `pos` is already 0. Same
 /// "step back over continuation bytes" loop TextField.backspace originally
@@ -56,4 +67,19 @@ test "stepForward steps over multi-byte codepoints" {
 
 test "stepForward at end returns len" {
     try std.testing.expectEqual(@as(usize, 3), stepForward("abc", 3, 3));
+}
+
+test "truncatedLen never splits a multi-byte sequence" {
+    // "aé€😀" = 1 + 2 + 3 + 4 bytes.
+    const s = "a\u{e9}\u{20ac}\u{1f600}";
+    try std.testing.expectEqual(@as(usize, 10), truncatedLen(s, 64));
+    try std.testing.expectEqual(@as(usize, 10), truncatedLen(s, 10));
+    try std.testing.expectEqual(@as(usize, 6), truncatedLen(s, 9));
+    try std.testing.expectEqual(@as(usize, 6), truncatedLen(s, 7));
+    try std.testing.expectEqual(@as(usize, 3), truncatedLen(s, 5));
+    try std.testing.expectEqual(@as(usize, 1), truncatedLen(s, 2));
+    try std.testing.expectEqual(@as(usize, 0), truncatedLen(s, 0));
+    for (0..s.len + 1) |max| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(s[0..truncatedLen(s, max)]));
+    }
 }

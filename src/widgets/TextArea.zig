@@ -81,7 +81,7 @@ pub fn init(rect: c.SDL_FRect, initial_placeholder: []const u8) Self {
 }
 
 pub fn setPlaceholder(self: *Self, s: []const u8) void {
-    const n = @min(s.len, max_placeholder_len);
+    const n = text_cursor.truncatedLen(s, max_placeholder_len);
     @memcpy(self.placeholder_buf[0..n], s[0..n]);
     self.placeholder_buf[n] = 0;
     self.placeholder_len = n;
@@ -98,7 +98,7 @@ pub fn text(self: *const Self) []const u8 {
 /// See TextField.setText's doc comment -- same "reset to end, clear
 /// selection" reasoning for a programmatic replace.
 pub fn setText(self: *Self, s: []const u8) bool {
-    const n = @min(s.len, max_len);
+    const n = text_cursor.truncatedLen(s, max_len);
     if (self.len == n and std.mem.eql(u8, self.buf[0..n], s[0..n])) return false;
     @memcpy(self.buf[0..n], s[0..n]);
     self.len = n;

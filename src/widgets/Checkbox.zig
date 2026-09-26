@@ -6,6 +6,7 @@
 //! target, same convention `Button` already uses for its full rect.
 
 const std = @import("std");
+const text_cursor = @import("text_cursor.zig");
 const c = @import("../c.zig").c;
 
 const Self = @This();
@@ -33,7 +34,7 @@ pub fn init(rect: c.SDL_FRect, initial_label: []const u8) Self {
 }
 
 pub fn setLabel(self: *Self, s: []const u8) bool {
-    const n = @min(s.len, max_label_len);
+    const n = text_cursor.truncatedLen(s, max_label_len);
     if (self.label_len == n and std.mem.eql(u8, self.label_buf[0..n], s[0..n])) return false;
     @memcpy(self.label_buf[0..n], s[0..n]);
     self.label_buf[n] = 0;

@@ -16,6 +16,7 @@
 //! Label starts with a zeroed rect until the first real layout pass runs).
 
 const std = @import("std");
+const text_cursor = @import("text_cursor.zig");
 const c = @import("../c.zig").c;
 
 const Self = @This();
@@ -56,7 +57,7 @@ pub fn init(rect: c.SDL_FRect, initial_text: []const u8) Self {
 }
 
 pub fn setText(self: *Self, s: []const u8) bool {
-    const n = @min(s.len, max_text_len);
+    const n = text_cursor.truncatedLen(s, max_text_len);
     if (self.len == n and std.mem.eql(u8, self.buf[0..n], s[0..n])) return false;
     @memcpy(self.buf[0..n], s[0..n]);
     self.buf[n] = 0;
