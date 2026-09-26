@@ -275,26 +275,36 @@ const FileDialogCallbackContext = struct {
     surface_id: u32,
 };
 
-const max_file_dialog_payload_len = 4096;
-
+/// Built on the heap, not a fixed buffer: a 4096-byte stack buffer used to
+/// drop the *entire* event on overflow (`catch return`), so picking ~60+
+/// files with `allow_many` silently did nothing. The paths come from the
+/// user's own selection in a native dialog, not from the guest, so there is
+/// no guest-controlled size to bound here; everything downstream (the
+/// queue's own copy, `Dispatch`'s JSON) is heap-backed already.
 fn fileDialogCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, filter: c_int) callconv(.c) void {
     _ = filter;
     const ctx: *FileDialogCallbackContext = @ptrCast(@alignCast(userdata.?));
+    const a = ctx.queue.allocator;
 
-    var buf: [max_file_dialog_payload_len]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const a = fba.allocator();
     var out: std.ArrayList(u8) = .empty;
-    out.appendSlice(a, "{\"paths\":[") catch return;
+    defer out.deinit(a);
+    buildFileDialogPayload(&out, a, filelist) catch |err| {
+        std.debug.print("[file-dialog] DROPPED selection, alloc failed: {}\n", .{err});
+        return;
+    };
+    ctx.queue.push(ctx.io, ctx.widget_id, .file_selected, out.items, ctx.surface_id);
+}
+
+fn buildFileDialogPayload(out: *std.ArrayList(u8), a: std.mem.Allocator, filelist: [*c]const [*c]const u8) !void {
+    try out.appendSlice(a, "{\"paths\":[");
     if (filelist) |list| {
         var i: usize = 0;
         while (list[i]) |path_ptr| : (i += 1) {
-            if (i != 0) out.append(a, ',') catch return;
-            json_util.writeString(&out, a, std.mem.span(path_ptr)) catch return;
+            if (i != 0) try out.append(a, ',');
+            try json_util.writeString(out, a, std.mem.span(path_ptr));
         }
     }
-    out.appendSlice(a, "]}") catch return;
-    ctx.queue.push(ctx.io, ctx.widget_id, .file_selected, out.items, ctx.surface_id);
+    try out.appendSlice(a, "]}");
 }
 
 /// Reused across every dialog request, address stable for main()'s whole
