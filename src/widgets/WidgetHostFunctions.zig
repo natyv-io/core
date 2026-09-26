@@ -321,10 +321,76 @@ fn parseRequest(comptime T: type, self: *Self, plugin: ?*c.ExtismCurrentPlugin, 
     };
     defer self.allocator.free(input_bytes);
 
-    return std.json.parseFromSlice(T, self.allocator, input_bytes, .{ .allocate = .alloc_always }) catch |err| {
+    const parsed = std.json.parseFromSlice(T, self.allocator, input_bytes, .{ .allocate = .alloc_always }) catch |err| {
         host_fn_util.writeErrorJson(plugin, out_val, "bad request: {}", .{err});
         return null;
     };
+    if (!allFinite(parsed.value)) {
+        parsed.deinit();
+        host_fn_util.writeErrorJson(plugin, out_val, "bad request: numbers must be finite", .{});
+        return null;
+    }
+    return parsed;
+}
+
+/// `std.json` parses an out-of-range literal like `1e999` as `inf` (it only
+/// rejects a bare `NaN`), and `inf` -- or the NaN that `inf * 0` makes of it
+/// downstream -- is illegal behavior once it reaches `@intFromFloat`. So
+/// every request is walked once here and any non-finite float rejects the
+/// whole call, the same way a malformed request does.
+pub fn allFinite(value: anytype) bool {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .float => return std.math.isFinite(value),
+        .@"struct" => |s| {
+            inline for (s.fields) |f| {
+                if (!allFinite(@field(value, f.name))) return false;
+            }
+            return true;
+        },
+        .optional => return if (value) |v| allFinite(v) else true,
+        .array => {
+            for (value) |v| if (!allFinite(v)) return false;
+            return true;
+        },
+        .pointer => |p| {
+            if (p.size != .slice or comptime !containsFloat(p.child)) return true;
+            for (value) |v| if (!allFinite(v)) return false;
+            return true;
+        },
+        else => return true,
+    }
+}
+
+fn containsFloat(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .float => true,
+        .@"struct" => |s| blk: {
+            for (s.fields) |f| if (containsFloat(f.type)) break :blk true;
+            break :blk false;
+        },
+        .optional => |o| containsFloat(o.child),
+        .array => |a| containsFloat(a.child),
+        .pointer => |p| p.size == .slice and containsFloat(p.child),
+        else => false,
+    };
+}
+
+test "allFinite rejects inf anywhere in a request, including nested and optional fields" {
+    try std.testing.expect(allFinite(ClayContainerRequest{}));
+    try std.testing.expect(allFinite(SetStyleRequest{ .widget_id = 1, .corner_radius = .{ 1, 2, 3, 4 } }));
+
+    const inf = std.math.inf(f32);
+    try std.testing.expect(!allFinite(SetValueRequest{ .widget_id = 1, .value = inf }));
+    try std.testing.expect(!allFinite(ClayContainerRequest{ .layout = .{ .sizing = .{ .width = .{ .min = inf } } } }));
+    try std.testing.expect(!allFinite(SetStyleRequest{ .widget_id = 1, .corner_radius = .{ 0, 0, -inf, 0 } }));
+    try std.testing.expect(!allFinite(SetStyleRequest{ .widget_id = 1, .gradient = .{ .start_pos = .{ 0, 0 }, .start_color = .{ .r = 0, .g = 0, .b = 0 }, .end_pos = .{ 1, 1 }, .end_color = .{ .r = inf, .g = 0, .b = 0 } } }));
+    try std.testing.expect(!allFinite(ClayWindowRequest{ .width = std.math.nan(f32) }));
+
+    // The real wire path: `1e999` is how a guest actually produces inf.
+    const parsed = try std.json.parseFromSlice(SetValueRequest, std.testing.allocator, "{\"widget_id\":1,\"value\":1e999}", .{});
+    defer parsed.deinit();
+    try std.testing.expect(!allFinite(parsed.value));
 }
 
 pub fn createButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {

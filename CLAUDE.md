@@ -108,6 +108,9 @@ split a multi-byte sequence and hand SDL/SDL_ttf invalid UTF-8. Every fixed-buff
 **`zig build test` never compiles host-fn callbacks or `FrameLoop.zig`** — Zig only analyzes what a
 test references, and nothing references the `capabilities/*.zig` callbacks or the `main.zig`-only
 `FrameLoop`. Run `zig build` too after touching them (a type error in `Persist.zig` passed all tests).
+The same goes for `test` blocks: a file's tests only run if a test root reaches the file.
+`WidgetHost.zig` pulls in `WidgetHostFunctions.zig`'s with `test { _ = HostFunctions; }`, and
+`RuntimeTest.zig` is not in the test step at all. Break a new test on purpose once to prove it runs.
 
 **Rule going forward: any host function that exposes a resource must bound it and reject past the
 bound.** `Tcp.zig` and `TrayRegistry.zig` are the reference implementations (`orelse return Error`,

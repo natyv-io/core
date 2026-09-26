@@ -2653,6 +2653,12 @@ test "setText on an unknown widget id returns false" {
     try std.testing.expect(!host.setText(test_io, 999, "x"));
 }
 
+// `WidgetHostFunctions.zig` is only reached through registerInto's function
+// table, which no test calls, so its own `test` blocks never ran.
+test {
+    _ = HostFunctions;
+}
+
 /// Real widget-kind dispatch + change-detection lives here (mirrors
 /// `setStyle` above), not in `setTextHostFn` -- lets this be tested with a
 /// plain `WidgetHost` instance, no Extism ABI involved. Returns `false`
