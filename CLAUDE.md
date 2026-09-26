@@ -118,6 +118,13 @@ and silent UB in ReleaseSmall (what ships). `std.json` parses `1e999` as `inf`, 
 - `clamp(x, lo, hi)`/`@mod` only where the bounds are known valid: normalize guest pairs first
   (`NumericStepper.init` orders min/max, `RangeSlider.setRange` clamps the upper bound before using it).
 
+**Windows are capped at `WidgetHost.max_window_roots`** (`WindowManager.max_open_windows - 1`; the
+startup window takes the other). `main.zig` silently drops window requests past its own cap, so
+`insertWindowRoot` refuses first rather than hand the guest an id with no window behind it. Destroy a
+window only through `WidgetHost.destroyWindow` (both `natyv_destroy_window` and `natyv_destroy_widget`
+do): it cancels a still-pending create request instead of queueing a teardown, because `main.zig`
+drains teardowns before requests and would otherwise create an OS window for a dead widget.
+
 **`zig build test` never compiles host-fn callbacks or `FrameLoop.zig`** — Zig only analyzes what a
 test references, and nothing references the `capabilities/*.zig` callbacks or the `main.zig`-only
 `FrameLoop`. Run `zig build` too after touching them (a type error in `Persist.zig` passed all tests).

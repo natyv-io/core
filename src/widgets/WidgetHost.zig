@@ -939,6 +939,20 @@ pub const PendingWindowVisibility = struct {
 /// operations in the time between two frames.
 pub const max_pending_window_requests = 8;
 
+/// Every `window_root` slot becomes a real OS window, and `main.zig` holds at
+/// most `WindowManager.max_open_windows` of those, the startup window
+/// included. Past that it logs and drops the request -- which used to leave
+/// the guest holding a "successful" window id with no window behind it -- so
+/// `insertWindowRoot` refuses here instead. It also bounds teardowns: no
+/// more than this many windows can be live, so no more than this many
+/// teardowns can queue between two frames (a window destroyed before it
+/// materializes cancels its request instead, see `queueWindowTeardownLocked`),
+/// which is what keeps `pending_window_teardowns` from ever dropping one.
+pub const max_window_roots = @import("../WindowManager.zig").max_open_windows - 1;
+comptime {
+    std.debug.assert(max_window_roots <= max_pending_window_requests);
+}
+
 /// A guest's requested window title, copied into this owned fixed buffer at
 /// request time -- guest memory isn't guaranteed to outlive the host call,
 /// same precedent `Button.label_buf` already established for exactly this
@@ -977,19 +991,60 @@ pub fn takePendingWindowRequests(self: *Self, call_io: Io, out: []PendingWindowR
     return n;
 }
 
-/// Worker-thread side of the window-teardown hand-off -- silently drops the
-/// request if the queue is already full this frame (same "tiny, practically
-/// unreachable leak preferable to a panic in a guest-facing host function"
-/// precedent `queuePendingTextDestroy` already establishes); the widget
-/// subtree itself is already gone from the registry by the time this would
-/// be called regardless (see this field's own doc comment), so a dropped
-/// entry here only delays real OS resource cleanup, not a correctness gap.
-pub fn queueWindowTeardown(self: *Self, call_io: Io, widget_id: u32) void {
-    self.mutex.lockUncancelable(call_io);
-    defer self.mutex.unlock(call_io);
+/// Worker-thread side of the window-teardown hand-off. `main.zig` drains
+/// teardowns *before* requests each frame, so a window created and
+/// destroyed between two frames would otherwise have its teardown find
+/// nothing, then its request materialize a real OS window for a widget that
+/// no longer exists -- orphaned for good. Cancelling the still-pending
+/// request instead means nothing is ever created. The full-queue drop at
+/// the end is unreachable now that `max_window_roots` bounds live windows
+/// (see its doc comment) -- kept as a guard rather than a panic in a
+/// guest-facing host function.
+fn queueWindowTeardownLocked(self: *Self, widget_id: u32) void {
+    const pending = self.pending_window_requests[0..self.pending_window_request_count];
+    for (pending, 0..) |req, i| {
+        if (req.?.widget_id != widget_id) continue;
+        std.mem.copyForwards(?PendingWindowRequest, pending[i .. pending.len - 1], pending[i + 1 ..]);
+        pending[pending.len - 1] = null;
+        self.pending_window_request_count -= 1;
+        return;
+    }
     if (self.pending_window_teardown_count >= self.pending_window_teardowns.len) return;
     self.pending_window_teardowns[self.pending_window_teardown_count] = widget_id;
     self.pending_window_teardown_count += 1;
+}
+
+/// Inserts a `window_root` slot, refusing past `max_window_roots` -- see
+/// that constant's doc comment.
+pub fn insertWindowRoot(self: *Self, call_io: Io, style: ClayStyle) error{ TooManyWindows, RegistryFull }!u32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    var live: usize = 0;
+    for (self.slots.items) |slot| {
+        if (slot) |s| {
+            if (s.clay_style.window_root) live += 1;
+        }
+    }
+    if (live >= max_window_roots) return error.TooManyWindows;
+    return self.insertLockedWithLayoutValidated(.{ .container = Container.init(std.mem.zeroes(c.SDL_FRect), false) }, null, style, null) catch |err| switch (err) {
+        error.NoSuchParent => unreachable, // parent_id is null
+        error.RegistryFull => error.RegistryFull,
+    };
+}
+
+/// Destroys a window's widget subtree and queues its OS teardown, in one
+/// locked section. Returns false (doing nothing) if `root_id` isn't a live
+/// `window_root` -- `natyv_destroy_window` reports that as an error, and
+/// `natyv_destroy_widget` falls back to an ordinary subtree destroy, so
+/// destroying a window through either call never orphans its OS window.
+pub fn destroyWindow(self: *Self, call_io: Io, root_id: u32) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(root_id) orelse return false;
+    if (!slot.clay_style.window_root) return false;
+    self.destroySubtreeLocked(root_id);
+    self.queueWindowTeardownLocked(root_id);
+    return true;
 }
 
 /// Main-thread side -- same drain-in-full shape as `takePendingWindowRequests`.
@@ -2657,6 +2712,69 @@ test "setText on an unknown widget id returns false" {
 // table, which no test calls, so its own `test` blocks never ran.
 test {
     _ = HostFunctions;
+}
+
+fn testWindowRequest(widget_id: u32) PendingWindowRequest {
+    return .{ .widget_id = widget_id, .title_buf = undefined, .title_len = 0, .width = 100, .height = 100 };
+}
+
+test "insertWindowRoot refuses past max_window_roots, and destroying one frees a spot" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    var ids: [max_window_roots]u32 = undefined;
+    for (&ids) |*id| id.* = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    try std.testing.expectError(error.TooManyWindows, host.insertWindowRoot(test_io, .{ .window_root = true }));
+
+    // Ordinary widgets don't count against the window cap.
+    try std.testing.expect(host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, ids[0], .{}) != null);
+
+    try std.testing.expect(host.destroyWindow(test_io, ids[0]));
+    _ = try host.insertWindowRoot(test_io, .{ .window_root = true });
+}
+
+test "destroyWindow only accepts a live window_root" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    const plain = host.insertWithLayout(test_io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}).?;
+    try std.testing.expect(!host.destroyWindow(test_io, plain));
+    try std.testing.expect(!host.destroyWindow(test_io, 999));
+    try std.testing.expect(host.findLocked(plain) != null);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_window_teardown_count);
+}
+
+test "destroying a window before its request drains cancels the request instead of orphaning it" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    const a = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    const b = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    const w = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    try std.testing.expect(host.queueWindowRequest(test_io, testWindowRequest(a)));
+    try std.testing.expect(host.queueWindowRequest(test_io, testWindowRequest(b)));
+    try std.testing.expect(host.queueWindowRequest(test_io, testWindowRequest(w)));
+
+    // main.zig drains teardowns before requests, so a queued teardown for b
+    // would find no window yet and b's request would then create one for a
+    // widget that no longer exists.
+    try std.testing.expect(host.destroyWindow(test_io, b));
+    try std.testing.expectEqual(@as(usize, 0), host.pending_window_teardown_count);
+
+    var reqs: [max_pending_window_requests]PendingWindowRequest = undefined;
+    const n = host.takePendingWindowRequests(test_io, &reqs);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(a, reqs[0].widget_id);
+    try std.testing.expectEqual(w, reqs[1].widget_id);
+
+    // Once the request has drained, the OS window exists and needs a real teardown.
+    try std.testing.expect(host.destroyWindow(test_io, a));
+    var teardowns: [max_pending_window_requests]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), host.takePendingWindowTeardowns(test_io, &teardowns));
+    try std.testing.expectEqual(a, teardowns[0]);
 }
 
 /// Real widget-kind dispatch + change-detection lives here (mirrors

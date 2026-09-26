@@ -1377,7 +1377,9 @@ pub fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     defer parsed.deinit();
     const req = parsed.value;
 
-    if (!self.destroyWidgetSubtree(self.io(), req.widget_id)) {
+    // A window root goes through the window path so its OS window is torn
+    // down too, not orphaned -- see `WidgetHost.destroyWindow`.
+    if (!self.destroyWindow(self.io(), req.widget_id) and !self.destroyWidgetSubtree(self.io(), req.widget_id)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }
@@ -1457,16 +1459,11 @@ pub fn createClayWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const
             .height = .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = req.height, .max = req.height } } },
         },
     };
-    const container = Container.init(std.mem.zeroes(c.SDL_FRect), false);
 
     const call_io = self.io();
-    self.mutex.lockUncancelable(call_io);
-    const result = self.insertLockedWithLayoutValidated(.{ .container = container }, null, style, null);
-    self.mutex.unlock(call_io);
-
-    const widget_id = result catch |err| {
+    const widget_id = self.insertWindowRoot(call_io, style) catch |err| {
         switch (err) {
-            error.NoSuchParent => unreachable, // parent_id is always null above
+            error.TooManyWindows => host_fn_util.writeErrorJson(plugin, &outputs[0], "too many windows (max {d})", .{WidgetHost.max_window_roots}),
             error.RegistryFull => host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{}),
         }
         return;
@@ -1513,19 +1510,10 @@ pub fn destroyWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     defer parsed.deinit();
     const req = parsed.value;
 
-    const call_io = self.io();
-    self.mutex.lockUncancelable(call_io);
-    const slot = self.findLocked(req.widget_id);
-    const is_window = if (slot) |s| s.clay_style.window_root else false;
-    self.mutex.unlock(call_io);
-
-    if (!is_window) {
+    if (!self.destroyWindow(self.io(), req.widget_id)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "widget {d} is not a window", .{req.widget_id});
         return;
     }
-
-    self.destroyWindowSubtree(call_io, req.widget_id);
-    self.queueWindowTeardown(call_io, req.widget_id);
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
 
