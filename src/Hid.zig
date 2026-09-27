@@ -198,6 +198,25 @@ pub const permission_hint = switch (builtin.os.tag) {
     else => "the operating system refused access to the device",
 };
 
+/// SDL's last error, made safe to drop into `host_fn_util.writeErrorJson`
+/// (which doesn't escape): `"`, `\` and control characters become spaces,
+/// and it's cut to fit `buf`. hidapi's own reason for a failed open/write
+/// (e.g. IOKit's "unsupported function" for a wrong report id) is the only
+/// clue a guest gets, so it's worth passing through. Callers should
+/// `SDL_ClearError` before the failing call so a stale message isn't blamed.
+pub fn sdlErrorDetail(buf: []u8) []const u8 {
+    const detail = jsonSafe(std.mem.span(c.SDL_GetError()), buf);
+    return if (detail.len == 0) "no detail from SDL" else detail;
+}
+
+fn jsonSafe(src: []const u8, buf: []u8) []const u8 {
+    const n = @min(src.len, buf.len);
+    for (src[0..n], buf[0..n]) |ch, *out| {
+        out.* = if (ch == '"' or ch == '\\' or ch < 0x20 or ch == 0x7f) ' ' else ch;
+    }
+    return buf[0..n];
+}
+
 // IOKit/hidsystem/IOHIDLib.h (macOS 10.15+). IOKit is already linked for
 // SDL's own hidapi backend, so this adds no new dependency.
 extern "c" fn IOHIDCheckAccess(request_type: u32) u32;
@@ -369,4 +388,12 @@ test "writeDevicesJson: no devices is an empty list" {
     defer out.deinit(allocator);
     try writeDevicesJson(&out, allocator, &.{});
     try std.testing.expectEqualStrings("{\"devices\":[]}", out.items);
+}
+
+test "jsonSafe: quotes, backslashes and control characters become spaces; truncates" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("a b c d e", jsonSafe("a\"b\\c\nd\x7fe", &buf));
+    var small: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("(0xE", jsonSafe("(0xE00002C7) unsupported", &small));
+    try std.testing.expectEqualStrings("", jsonSafe("", &buf));
 }

@@ -134,11 +134,13 @@ fn openHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_
         return;
     }
 
+    _ = c.SDL_ClearError();
     const dev = Hid.openAllowed(self.allowed, path) catch |err| {
+        var detail_buf: [160]u8 = undefined;
         switch (err) {
             error.NotAllowed => host_fn_util.writeErrorJson(plugin, &outputs[0], "not an allowed, connected device", .{}),
             error.PermissionDenied => host_fn_util.writeErrorJson(plugin, &outputs[0], "permission denied: {s}", .{Hid.permission_hint}),
-            error.OpenFailed => host_fn_util.writeErrorJson(plugin, &outputs[0], "open failed", .{}),
+            error.OpenFailed => host_fn_util.writeErrorJson(plugin, &outputs[0], "open failed: {s}", .{Hid.sdlErrorDetail(&detail_buf)}),
         }
         return;
     };
@@ -178,11 +180,13 @@ fn writeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n
         return;
     };
 
+    _ = c.SDL_ClearError();
     self.registry.write(req.handle, buf[0..decoded_len]) catch |err| {
+        var detail_buf: [160]u8 = undefined;
         switch (err) {
             error.NoSuchDevice => host_fn_util.writeErrorJson(plugin, &outputs[0], "unknown handle {d}", .{req.handle}),
             error.Disconnected => host_fn_util.writeErrorJson(plugin, &outputs[0], "device disconnected", .{}),
-            error.WriteFailed => host_fn_util.writeErrorJson(plugin, &outputs[0], "write failed", .{}),
+            error.WriteFailed => host_fn_util.writeErrorJson(plugin, &outputs[0], "write failed: {s}", .{Hid.sdlErrorDetail(&detail_buf)}),
         }
         return;
     };
