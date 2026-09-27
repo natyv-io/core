@@ -449,6 +449,28 @@ pub fn build(b: *std.Build) void {
     linkNatyvDeps(b, tray_registry_tests.root_module, extism_prefix, sqlite_enabled);
     const run_tray_registry_tests = b.addRunArtifact(tray_registry_tests);
 
+    const hid_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Hid.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkNatyvDeps(b, hid_tests.root_module, extism_prefix, sqlite_enabled);
+    hid_tests.root_module.addImport("Config", config_mod);
+    const run_hid_tests = b.addRunArtifact(hid_tests);
+
+    const hid_registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/HidRegistry.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkNatyvDeps(b, hid_registry_tests.root_module, extism_prefix, sqlite_enabled);
+    hid_registry_tests.root_module.addImport("Config", config_mod);
+    const run_hid_registry_tests = b.addRunArtifact(hid_registry_tests);
+
     const runtime_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/Runtime.zig"),
@@ -623,6 +645,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_private_ranges_tests.step);
     test_step.dependOn(&run_tcp_registry_tests.step);
     test_step.dependOn(&run_tray_registry_tests.step);
+    test_step.dependOn(&run_hid_tests.step);
+    test_step.dependOn(&run_hid_registry_tests.step);
     test_step.dependOn(&run_mbedtls_smoke_tests.step);
     test_step.dependOn(&run_tcp_tests.step);
     test_step.dependOn(&run_tls_tests.step);

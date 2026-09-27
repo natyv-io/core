@@ -26,6 +26,7 @@ const Manifest = @import("Manifest.zig");
 const Config = @import("Config");
 const SqliteCapability = @import("capabilities/Sqlite.zig");
 const TcpCapability = @import("capabilities/Tcp.zig");
+const HidCapability = @import("capabilities/Hid.zig");
 const PersistCapability = @import("capabilities/Persist.zig");
 const TrayCapability = @import("capabilities/Tray.zig");
 const TrayRegistry = @import("TrayRegistry.zig");
@@ -66,7 +67,7 @@ const Bindings = @import("Bindings");
 
 const Self = @This();
 
-const max_host_functions = SqliteCapability.host_function_count + TcpCapability.host_function_count + PersistCapability.host_function_count + TrayCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
+const max_host_functions = SqliteCapability.host_function_count + TcpCapability.host_function_count + HidCapability.host_function_count + PersistCapability.host_function_count + TrayCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
 
 allocator: std.mem.Allocator,
 /// `null` when conf.natyv.json's `sqlite.enabled` is false -- no connection
@@ -81,6 +82,10 @@ sqlite: ?SqliteCapability,
 /// `init`'s ~60 existing call sites across `RuntimeTest.zig` would
 /// otherwise need updating for a capability none of them actually test.
 tcp: ?TcpCapability = null,
+/// `null` until `enableHid` is called -- same gating and same reason for a
+/// separate method as `tcp`. Its open devices, unlike `tcp`'s connections,
+/// survive a recycle: see `recycle`.
+hid: ?HidCapability = null,
 /// Host-owned persisted state backing the Go SDK's `natyv.Persisted[T]` --
 /// always on, like `widgets`, not gated behind a config flag the way
 /// `sqlite`/`tcp` are: this is core SDK machinery every app can reach for,
@@ -154,6 +159,16 @@ pub fn enableNetwork(self: *Self, allowed_sockets: []const Config.AllowedSocket)
     self.tcp = TcpCapability.init(self.allocator, allowed_sockets);
 }
 
+/// Sets up the `hid` capability -- called by `main.zig` when
+/// `conf.natyv.json`'s `hid.enabled` is true, between `Runtime.init` and
+/// `loadPlugin`, like `enableNetwork`. `queue` is where device reader
+/// threads push `.hid_report`/`.hid_disconnected`, so it must outlive every
+/// open device: `main.zig` creates it before `Runtime.init` and closes the
+/// devices (`hid.registry.closeAll`) before either is torn down.
+pub fn enableHid(self: *Self, allowed_devices: []const Config.AllowedDevice, queue: *EventQueue) void {
+    self.hid = HidCapability.init(self.allocator, allowed_devices, queue);
+}
+
 pub fn deinit(self: *Self) void {
     if (self.plugin) |p| c.extism_plugin_free(p);
     if (self.compiled) |cp| c.extism_compiled_plugin_free(cp);
@@ -188,6 +203,10 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
         if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
     }
     if (self.tcp) |*tcp| n += tcp.registerInto(funcs[n..]);
+    if (self.hid) |*hid| {
+        hid.widgets = &self.widgets;
+        n += hid.registerInto(funcs[n..]);
+    }
     n += self.persist.registerInto(funcs[n..]);
     // `self` is finally at its permanent address here, so this is the first
     // point at which the tray capability can hold real pointers into it.
@@ -331,10 +350,17 @@ pub fn recycle(self: *Self, io: Io) bool {
     }
     c.extism_plugin_new_error_free(errmsg);
 
+    // Every open HID device has to be reclaimed by the resumed guest
+    // (`hid_open` on its path, which hands back the same handle) or it's
+    // closed below -- the checkpoint is the guest's, so only the guest
+    // knows which devices it still wants.
+    if (self.hid) |*hid| hid.registry.markAllUnclaimed();
     const resume_result = self.callOn(io, new_plugin, "natyv_resume", checkpoint);
     if (resume_result == null) {
         std.debug.print("[runtime] recycle: natyv_resume failed on new instance, discarding it\n", .{});
         c.extism_plugin_free(new_plugin);
+        // The old instance carries on and still owns everything it had.
+        if (self.hid) |*hid| hid.registry.markAllClaimed();
         return false;
     }
 
@@ -345,6 +371,7 @@ pub fn recycle(self: *Self, io: Io) bool {
     self.plugin = new_plugin;
     if (old_plugin) |p| c.extism_plugin_free(p);
     if (self.tcp) |*tcp| tcp.registry.closeAll(io);
+    if (self.hid) |*hid| hid.registry.closeUnclaimed(io);
 
     std.debug.print("[runtime] recycle: swapped to a fresh guest instance, t={d}ms\n", .{c.SDL_GetTicks()});
     return true;

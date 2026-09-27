@@ -228,6 +228,23 @@ pub fn main(init: std.process.Init) !void {
     timing.traceNote("=== startup phase breakdown ===\n", .{});
     timing.tracePhase("SDL_Init", t_sdl);
 
+    // hidapi is initialized separately from `SDL_Init`'s subsystems. The
+    // hint must be set first: SDL's default of "1" drops every device that
+    // isn't a joystick or gamepad from enumeration (see `Hid.zig`'s header).
+    // Deferred after SDL_Quit's defer, so it runs first -- and after the
+    // registry's own `closeAll` below, which is deferred later still.
+    const hid_enabled = config.value.hid.enabled;
+    if (hid_enabled) {
+        _ = c.SDL_SetHint(c.SDL_HINT_HIDAPI_ENUMERATE_ONLY_CONTROLLERS, "0");
+        if (c.SDL_hid_init() != 0) {
+            std.debug.print("SDL_hid_init failed: {s}\n", .{c.SDL_GetError()});
+            return error.SdlInitFailed;
+        }
+    }
+    defer if (hid_enabled) {
+        _ = c.SDL_hid_exit();
+    };
+
     // A real, dedicated SDL event type Dispatch.run (the worker thread)
     // pushes after every natyv_dispatch call returns, so the main loop's
     // own SDL_WaitEventTimeout below wakes immediately on a worker-thread-
@@ -298,6 +315,12 @@ pub fn main(init: std.process.Init) !void {
         break :blk w;
     };
 
+    // Created before the runtime, not just before the dispatch worker:
+    // HID reader threads push into it from the moment `natyv_init` opens a
+    // device, and it has to outlive them (so it's deferred-deinit first).
+    var queue = EventQueue.init(allocator);
+    defer queue.deinit();
+
     const t_rt = timing.traceStart();
     var runtime = try Runtime.init(allocator, db_path);
     defer runtime.deinit();
@@ -308,6 +331,11 @@ pub fn main(init: std.process.Init) !void {
     // can't do this) -- `io` is still alive here, right before it stops
     // being so, so this is the right place for it.
     defer if (runtime.tcp) |*tcp| tcp.registry.closeAll(io);
+    if (hid_enabled) runtime.enableHid(config.value.hid.allowed_devices, &queue);
+    // Joins every device's reader thread, which is why it can't live in
+    // `Runtime.deinit` (no `Io` there). Runs after the dispatch worker has
+    // been joined, so no host call can race it, and before `SDL_hid_exit`.
+    defer if (runtime.hid) |*hid| hid.registry.closeAll(io);
 
     const manifest: Manifest = .{ .allowed_hosts = if (config.value.network.enabled) config.value.network.http.allowed_hosts else &.{} };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
@@ -323,9 +351,6 @@ pub fn main(init: std.process.Init) !void {
     runtime.initGuest(io);
     timing.tracePhase("initGuest (natyv_init)", t_init);
     timing.traceNote("{s:<38}: {d} bytes\n", .{ "guest wasm size", wasm.len });
-
-    var queue = EventQueue.init(allocator);
-    defer queue.deinit();
 
     // Arms the system tray's callback environment before any tray can
     // exist. `natyv_init` above may already have queued a tray; nothing is

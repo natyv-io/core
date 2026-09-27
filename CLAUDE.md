@@ -136,6 +136,29 @@ The same goes for `test` blocks: a file's tests only run if a test root reaches 
 bound.** `Tcp.zig` and `TrayRegistry.zig` are the reference implementations (`orelse return Error`,
 validated ids, clamped sizes). Full findings in the `natyv-host-function-audit` memory.
 
+## Raw HID capability (2026-09-27)
+
+Wraps SDL3's bundled `SDL_hid_*`. Joystick/Gamepad are out of scope. `conf.natyv.json`'s `hid.enabled` (default false) and `hid.allowed_devices` (an exact vid/pid list; ids can be hex strings like `"0x1234"` or decimals) gate everything. With HID disabled the host fns aren't registered at all. The allowlist is vid/pid, never OS paths: those change on replug and differ per OS. `hid_open(path)` re-enumerates and opens the path only if it currently belongs to an allowed vid/pid. Files:
+- `Hid.zig`: the allowlist, enumeration, opening, and permission detection.
+- `HidRegistry.zig`: open devices and their reader threads.
+- `capabilities/Hid.zig`: JSON glue.
+
+The wire contract is in `capabilities/Hid.zig`'s header.
+- **No `hid_read`.** A guest can't wake itself, so input reports arrive as `.hid_report` events (`{"data":"<b64>"}`) addressed to the handle. An unplug arrives as one `.hid_disconnected`. Handle ids come from `WidgetHost.reserveId`, same reasoning as tray entries.
+- **Every open device gets its own reader thread**, doing a blocking `SDL_hid_read_timeout` of 100ms and checking a stop flag. Queued reports are capped at 64 per handle through `EventQueue.pushBounded`. The reader never blocks: refusals are counted and reported as `"dropped":N` on the next report that gets accepted. At most `max_devices = 8` are open (checked before opening), and a write takes 1 to 1025 bytes.
+- **`HidRegistry` has no mutex, on purpose.** Slots are only mutated on the dispatch thread (host fns, recycle), or on main after Dispatch has stopped. Reader threads only touch their own immutable id/handle, atomics, and the already-locked `EventQueue`. The invariant that matters is **join before close/free**:
+  - Closing a device: set the stop flag, join, `SDL_hid_close`, then `EventQueue.removeAllFor(id)`.
+  - Shutdown: stop Dispatch, then `closeAll`, then `SDL_hid_exit`, then `SDL_Quit`. `main.zig`'s defer order encodes this; the `EventQueue` is declared before `Runtime` so it outlives the readers.
+- **`SDL_HINT_HIDAPI_ENUMERATE_ONLY_CONTROLLERS` must be set to `"0"` before `SDL_hid_init`.** SDL defaults to enumerating only game controllers, so without it a macropad or keyboard never appears.
+- **Permission failures get their own error.** macOS: `IOHIDCheckAccess` (Input Monitoring). Linux: `access()` on the hidraw node (a udev rule is required).
+- **Recycle keeps devices open**, unlike TCP's `closeAll`: HID keeps no session state in guest memory.
+  - `hid_open` on an already-open path returns the existing handle.
+  - `Runtime.recycle` marks every handle unclaimed before `natyv_resume`, then closes whatever resume didn't re-open.
+  - If resume fails, everything is re-marked as claimed.
+  - `.hid_report` and `.hid_disconnected` survive the generation-stale discard (`EventQueue.survivesRecycle`).
+  - A guest must register its handler during resume.
+- The `Backend` vtable (`read`/`write`/`close`) lets `HidRegistry`'s tests drive real reader threads against a fake device. Real hardware is manual-only. The MacBook's built-in keyboard works for that once the binary is granted Input Monitoring.
+
 ## Project structure conventions
 
 Modeled directly on real patterns from Zig's own stdlib and the Extism Zig SDK, not ad hoc:
