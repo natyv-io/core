@@ -561,6 +561,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_persist_tests = b.addRunArtifact(persist_tests);
 
+    const canvas_store_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/CanvasStore.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_canvas_store_tests = b.addRunArtifact(canvas_store_tests);
+
     const drawbatcher_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/DrawBatcher.zig"),
@@ -651,6 +660,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tcp_tests.step);
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_persist_tests.step);
+    test_step.dependOn(&run_canvas_store_tests.step);
     test_step.dependOn(&run_drawbatcher_tests.step);
     test_step.dependOn(&run_scrollclip_tests.step);
     test_step.dependOn(&run_scrollbar_tests.step);

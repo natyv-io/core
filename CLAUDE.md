@@ -159,6 +159,19 @@ The wire contract is in `capabilities/Hid.zig`'s header.
   - A guest must register its handler during resume.
 - The `Backend` vtable (`read`/`write`/`close`) lets `HidRegistry`'s tests drive real reader threads against a fake device. Real hardware is manual-only. The MacBook's built-in keyboard works for that once the binary is granted Input Monitoring.
 
+## Drawing primitives — v0.2.0, in progress (design confirmed 2026-09-27)
+
+Full plan: `~/.claude/plans/natyv-drawing-primitives.md`.
+
+- **Canvas widget with a retained display list** that the guest replaces whole in one host call. No per-frame guest draw callback: guest code runs on the worker thread, and the list must survive recycle host-side.
+- **Vocabulary:** line, polyline, rect, circle, polygon (ear-clipped, non-convex OK), arc/wedge, and text (app font and size only).
+- **Rendering:** render at 2x into a target texture, downsample, cache 1x. Re-render only on list or size change. Takes a pixel-density factor, which is 1.0 until a HiDPI pass lands.
+- **Storage:** display lists live in `CanvasStore.zig` (built; wire format in its header), never inline in the `Widget` union, since that would inflate every slot.
+  - Bounded: commands, points, text bytes, canvas count and size are all capped and rejected past the cap.
+  - Every guest float must be finite and range-checked before int conversion.
+- **Events:** click with canvas-relative `{x,y}`, plus `canvas_resized {w,h}`. Hover and pointer-move are deferred.
+- **`.ntx`:** `<Canvas>` ships with it, which needs shared Codegen changes plus re-pins.
+
 ## Project structure conventions
 
 Modeled directly on real patterns from Zig's own stdlib and the Extism Zig SDK, not ad hoc:
