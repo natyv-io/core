@@ -184,7 +184,10 @@ Full plan: `~/.claude/plans/natyv-drawing-primitives.md`.
 - **`.ntx`:** `<Canvas ref={&c} onResize={...} onClick={...} />`, no children. Defaults to grow width and 240 px height (like Table), since there's nothing for Fit to measure.
   - `"Canvas"` must be in `Codegen.zig`'s `builtin_widget_kinds`, not just have an emit branch: that list is what lets a `<%...%>` block recognise the tag.
   - Handlers and ref go through the generic `on[A-Z]` / `Wrap<Tag>` paths, so recycle rebinds need no Canvas-specific code.
+  - The Go SDK's binding registry keeps **one binding per widget id** (a later `RegisterBinding` replaces the earlier one). Codegen therefore emits one binding per tag, kind `gen_<Composer>_<var>_<attr>[_<attr>...]`, whose rebind function reattaches every handler, and only if every handler is safe to resplice. Hand-written code with several handlers on one widget must do the same. Before shared `9862b5f`, a Canvas kept only onClick across a recycle.
   - ntx-lsp pins shared too and runs its Codegen, so it needs a re-pin for `<Canvas>` not to show as an error. The editor grammars have no tag lists.
+- **Canvas text** goes through `TTF_RenderText_Blended`, unlike Labels. The vendored SDL_ttf carries upstream's NULL glyph-buffer guard in `Render_Line` (core `8397450`); without it, any space in canvas text trips UBSan in Debug.
+- **Fixture:** `natyv-io/canvas-fixture` (untracked, never committed) covers all four chart kinds, the modal and scroll cases, and Max data / Over cap / Grow memory. Its recycle threshold must sit well above startup RSS: guest compilation spikes it (130-200+ MB in Debug), and a recycle compiles a new instance, so a threshold near the startup peak recycles in a loop.
 
 ## Project structure conventions
 
