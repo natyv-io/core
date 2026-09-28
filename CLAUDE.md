@@ -178,6 +178,9 @@ Full plan: `~/.claude/plans/natyv-drawing-primitives.md`.
 - **Events:** click with canvas-relative `{x,y}`, plus `canvas_resized {w,h}`. Hover and pointer-move are deferred.
   - Resize is detected from the snapshot once per frame just before drawing (`FrameLoop.pushCanvasResizeEvents`), not on a layout pass, since layout can run twice a frame. `CanvasStore.noteSize` dedupes; hidden canvases are skipped.
   - `canvas_resized` coalesces like `.scroll`. After a recycle, Dispatch calls `forgetCanvasSizes` *after* `bumpGeneration`, so the resumed guest is re-sent its sizes and those events aren't dropped as stale.
+- **Go SDK:** `widgets.Canvas` in `sdks/go/widgets/canvas.go` (`CreateCanvas`, `Draw(func(*Drawing))`, `OnClick(x, y)`, `OnResize(w, h)`, `WrapCanvas`). The builder, encoding and payload parsing live in `widgets/internal/drawing`, which has native `go test` coverage; `canvas.go` only forwards and calls the host.
+  - The SDK duplicates none of the host's limits. Go zero values mean "host default": a zero `StrokeWidth` and `""` align are omitted, and an empty drawing or point list encodes as `[]`, never `null`.
+  - A canvas click has its own handler table (`canvasClickHandlers`), since every other kind's click takes no args.
 - **`.ntx`:** `<Canvas>` ships with it, which needs shared Codegen changes plus re-pins.
 
 ## Project structure conventions
