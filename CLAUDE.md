@@ -174,7 +174,10 @@ Full plan: `~/.claude/plans/natyv-drawing-primitives.md`.
 - **Storage:** display lists live in `CanvasStore.zig` (wire format in its header), never inline in the `Widget` union, since that would inflate every slot. `destroyIdsLocked` removes a canvas's drawing with its slot.
   - Bounded: commands, points, text bytes, canvas count and size are all capped and rejected past the cap.
   - Every guest float must be finite and range-checked before int conversion.
+- **Wire format (confirmed 2026-09-28):** each command is a single-key object (`{"circle":{...}}`), so `std.json` parses it straight into a tagged union and rejects unknown ops and fields. Arc angles are radians, clockwise from +x. Text `y` is the top of the line box. A zero line/stroke width is rejected, as is a closed shape with neither fill nor stroke. Caps beyond command/point/canvas counts: 256 KiB text per drawing, 4 MiB per request, |coord| <= 100000, stroke width <= 1024, |angle| <= 1024 rad.
 - **Events:** click with canvas-relative `{x,y}`, plus `canvas_resized {w,h}`. Hover and pointer-move are deferred.
+  - Resize is detected from the snapshot once per frame just before drawing (`FrameLoop.pushCanvasResizeEvents`), not on a layout pass, since layout can run twice a frame. `CanvasStore.noteSize` dedupes; hidden canvases are skipped.
+  - `canvas_resized` coalesces like `.scroll`. After a recycle, Dispatch calls `forgetCanvasSizes` *after* `bumpGeneration`, so the resumed guest is re-sent its sizes and those events aren't dropped as stale.
 - **`.ntx`:** `<Canvas>` ships with it, which needs shared Codegen changes plus re-pins.
 
 ## Project structure conventions

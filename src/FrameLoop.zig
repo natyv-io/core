@@ -398,6 +398,29 @@ pub fn pushScrollEvents(queue: *EventQueue, io: std.Io, wctx: *WindowManager.Win
     }
 }
 
+/// Pushes a `.canvas_resized` event for each visible canvas whose laid-out
+/// size differs from the last one it reported (see `CanvasStore.noteSize`),
+/// including its first layout -- a guest needs the size to draw at all.
+/// Called once per frame, just before drawing, against the freshest
+/// snapshot: layout can run twice a frame (before and after input), and a
+/// hook on only one pass would miss the other's changes. Hidden canvases
+/// are skipped so a guest isn't told about a size nothing shows.
+pub fn pushCanvasResizeEvents(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, full_snapshot: []const WidgetHost.Slot) void {
+    var index: ?WidgetHost.SnapshotIndex = null;
+    for (full_snapshot) |slot| {
+        const cv = switch (slot.widget) {
+            .canvas => |cv| cv,
+            else => continue,
+        };
+        if (index == null) index = WidgetHost.SnapshotIndex.build(full_snapshot);
+        if (!WidgetHost.isEffectivelyVisible(full_snapshot, index.?, slot)) continue;
+        if (!widgets.noteCanvasSize(io, slot.id, cv.rect.w, cv.rect.h)) continue;
+        var buf: [64]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"w\":{d},\"h\":{d}}}", .{ cv.rect.w, cv.rect.h }) catch "{}";
+        queue.push(io, slot.id, .canvas_resized, json, FloatingOrder.surfaceIdFor(full_snapshot, index.?, slot.id));
+    }
+}
+
 /// True unless clip excludes (x, y) -- a null clip (no scroll ancestor at
 /// all, see ScrollClip.computeClipRects) always allows. Real bug this
 /// fixes (found live 2026-09-09, via mail-natyv's own real click-through):
@@ -429,7 +452,8 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .numeric_stepper => |ns| ns.containsPoint(mx, my),
         .segmented_control => |sc| sc.containsPoint(mx, my),
         .tabs => |tb| tb.containsPoint(mx, my),
-        .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => false,
+        .canvas => |cv| cv.containsPoint(mx, my),
+        .label, .container, .progress_bar, .divider, .badge, .spinner => false,
     };
 }
 
@@ -534,7 +558,16 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             activateWidget(widgets, io, queue, slot.id, .container, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
-        .label, .progress_bar, .divider, .badge, .spinner, .canvas => {},
+        // Not through `activateWidget`: the click carries the point,
+        // relative to the canvas, so a guest can tell which bar or node
+        // was hit.
+        .canvas => |cv| if (cv.containsPoint(mx, my)) {
+            var buf: [64]u8 = undefined;
+            const json = std.fmt.bufPrint(&buf, "{{\"x\":{d},\"y\":{d}}}", .{ mx - cv.rect.x, my - cv.rect.y }) catch "{}";
+            queue.push(io, slot.id, .click, json, FloatingOrder.surfaceIdFor(slots, index, slot.id));
+            return slot.id;
+        },
+        .label, .progress_bar, .divider, .badge, .spinner => {},
     }
     return null;
 }
@@ -543,15 +576,15 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
 /// also contains this exact click point -- see the `.container` arm
 /// above for why this must suppress a wrapping Container's own click
 /// rather than let both fire for the same real mouse click. Only checks
-/// kinds with their own real `activateWidget`-driven click (Button/
-/// Checkbox/Toggle/RadioButton) -- TextField/TextArea's own hit is a
+/// kinds with their own real click (Button/Checkbox/Toggle/RadioButton, and
+/// Canvas) -- TextField/TextArea's own hit is a
 /// focus grab, not really "a click" in this same sense, so they don't
 /// suppress a wrapping Container's click.
 fn containerClickBlockedByDescendant(slots: []const WidgetHost.Slot, index: WidgetHost.SnapshotIndex, container_id: u32, mx: f32, my: f32) bool {
     for (slots) |other| {
         if (other.id == container_id) continue;
         const is_clickable_kind = switch (other.widget) {
-            .button, .checkbox, .toggle, .radio_button => true,
+            .button, .checkbox, .toggle, .radio_button, .canvas => true,
             else => false,
         };
         if (!is_clickable_kind) continue;

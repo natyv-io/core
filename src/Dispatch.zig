@@ -122,6 +122,11 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32, 
                             // looked indistinguishable from "nothing
                             // happened").
                             queue.bumpGeneration(io);
+                            // The resumed guest was never sent its
+                            // canvases' sizes; this makes the next layout
+                            // report them again. After bumpGeneration, so
+                            // those events aren't discarded as stale.
+                            runtime.widgets.forgetCanvasSizes(io);
                             // A resumed instance's own region reveals are
                             // deferred (see sdks/go/region/region.go's
                             // FlushPendingReveals) until a genuinely

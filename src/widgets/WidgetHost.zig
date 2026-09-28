@@ -1429,6 +1429,25 @@ pub fn canvasVersion(self: *Self, call_io: Io, id: u32) ?u32 {
     return if (self.canvases.get(id)) |entry| entry.version else null;
 }
 
+/// Main thread, after layout: records canvas `id`'s laid-out size and
+/// returns whether the guest needs a `.canvas_resized` event for it. See
+/// `CanvasStore.noteSize`.
+pub fn noteCanvasSize(self: *Self, call_io: Io, id: u32, w: f32, h: f32) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    return self.canvases.noteSize(id, .{ w, h });
+}
+
+/// After a recycle: every canvas reports its size again, so the resumed
+/// guest learns the sizes its predecessor was told. Bumps the generation
+/// so the next frame runs a layout pass, which is where sizes are reported.
+pub fn forgetCanvasSizes(self: *Self, call_io: Io) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    self.canvases.forgetSizes();
+    self.layout_generation +%= 1;
+}
+
 pub const CanvasSnapshot = struct { drawing: CanvasStore.Drawing, version: u32 };
 
 /// An owned copy of canvas `id`'s drawing, so the renderer tessellates and
@@ -2925,4 +2944,33 @@ test "replaceCanvasDrawing bumps the redraw gate and the version, and rejects a 
     copy.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), snap.version);
     try std.testing.expect((try host.cloneCanvas(test_io, label, std.testing.allocator)) == null);
+}
+
+test "noteCanvasSize reports each new size once, and forgetCanvasSizes re-arms it and bumps the redraw gate" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    host.mutex.lockUncancelable(test_io);
+    const id = try host.insertCanvasLocked(null, .{});
+    host.mutex.unlock(test_io);
+
+    try std.testing.expect(host.noteCanvasSize(test_io, id, 100, 50));
+    try std.testing.expect(!host.noteCanvasSize(test_io, id, 100, 50));
+    try std.testing.expect(host.noteCanvasSize(test_io, id, 120, 50));
+    try std.testing.expect(!host.noteCanvasSize(test_io, 999_999, 1, 1));
+
+    const gen = host.currentGeneration(test_io);
+    host.forgetCanvasSizes(test_io);
+    try std.testing.expect(host.currentGeneration(test_io) != gen);
+    try std.testing.expect(host.noteCanvasSize(test_io, id, 120, 50));
+}
+
+test "Canvas.containsPoint: left/top edges are inside, right/bottom edges are not" {
+    const cv = Canvas.init(.{ .x = 10, .y = 20, .w = 100, .h = 50 });
+    try std.testing.expect(cv.containsPoint(10, 20));
+    try std.testing.expect(cv.containsPoint(109.5, 69.5));
+    try std.testing.expect(!cv.containsPoint(110, 40));
+    try std.testing.expect(!cv.containsPoint(50, 70));
+    try std.testing.expect(!cv.containsPoint(9.9, 40));
 }

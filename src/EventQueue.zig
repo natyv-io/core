@@ -73,7 +73,12 @@ const Self = @This();
 /// id, not a widget -- see `HidRegistry.zig`. Discrete, never coalesced: a report is a keypress, and a
 /// dropped keypress is a bug. Pushed through `pushBounded` instead, so a device that streams faster than
 /// the guest drains can't grow this queue without limit. Both also survive a recycle (see `pop`).
-pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll, file_selected, window_close_requested, hid_report, hid_disconnected };
+///
+/// Canvas: `.canvas_resized` (payload `{"w":f,"h":f}`) is fired to a canvas when its laid-out size
+/// changes, including its first layout -- see `FrameLoop.pushCanvasResizeEvents`. Coalesced like
+/// `.scroll`: a window drag-resize changes the size every frame, and a guest redrawing a chart only
+/// needs the latest one.
+pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll, file_selected, window_close_requested, hid_report, hid_disconnected, canvas_resized };
 
 /// Whether an entry of this type is still meaningful after a recycle -- see `pop`. A widget id is
 /// rebuilt fresh by `natyv_resume`, so an event addressed to one is stale. A HID handle is not: the
@@ -158,8 +163,8 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
     // hardcoded to `.change`) so the two families never cross-coalesce
     // with each other. W15: `.hover` joins the same coalesced family --
     // see its own EventType doc comment for why. Tree view: `.scroll`
-    // joins it too, same reasoning.
-    if (event_type == .change or event_type == .text_changed or event_type == .hover or event_type == .scroll) {
+    // joins it too, same reasoning, and so does `.canvas_resized`.
+    if (event_type == .change or event_type == .text_changed or event_type == .hover or event_type == .scroll or event_type == .canvas_resized) {
         for (self.items.items) |*existing| {
             if (existing.widget_id == widget_id and existing.event_type == event_type) {
                 self.allocator.free(existing.payload);
@@ -390,6 +395,24 @@ test "change and text_changed for the same widget id don't cross-coalesce with e
     queue.push(io, 1, .change, "a", 0);
     queue.push(io, 1, .text_changed, "b", 0);
     try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
+}
+
+test "canvas_resized events for the same canvas coalesce to the latest size, and never with its clicks" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .canvas_resized, "{\"w\":10,\"h\":10}", 0);
+    queue.push(io, 1, .click, "{\"x\":1,\"y\":2}", 0);
+    queue.push(io, 1, .canvas_resized, "{\"w\":20,\"h\":30}", 0);
+    queue.push(io, 2, .canvas_resized, "{\"w\":5,\"h\":5}", 0);
+    try std.testing.expectEqual(@as(usize, 3), queue.items.items.len);
+    try std.testing.expectEqualStrings("{\"w\":20,\"h\":30}", queue.items.items[0].payload);
+    try std.testing.expectEqual(EventType.click, queue.items.items[1].event_type);
 }
 
 test "hover events for the same widget coalesce to the latest payload" {

@@ -335,10 +335,13 @@ fn copyPoints(drawing: *Drawing, used: *u32, pts: []const Point) Span {
 
 /// One canvas's current drawing. `version` bumps on every replacement, so
 /// the renderer can tell its cached texture is stale without comparing
-/// lists.
+/// lists. `reported_size` is the last size sent to the guest in a
+/// `.canvas_resized` event -- null until the first one, so the first
+/// layout always reports.
 pub const Entry = struct {
     drawing: Drawing = .{},
     version: u32 = 0,
+    reported_size: ?[2]f32 = null,
 };
 
 pub const StoreError = error{ LimitExceeded, AlreadyExists, NoSuchCanvas, OutOfMemory };
@@ -399,6 +402,25 @@ pub fn replace(self: *Self, allocator: std.mem.Allocator, id: u32, drawing: Draw
     entry.drawing.deinit(allocator);
     entry.drawing = drawing;
     entry.version +%= 1;
+}
+
+/// Records `size` as canvas `id`'s laid-out size and returns whether it
+/// differs from the last one reported, i.e. whether the guest needs a
+/// `.canvas_resized` event. False for an unknown id.
+pub fn noteSize(self: *Self, id: u32, size: [2]f32) bool {
+    const entry = self.canvases.getPtr(id) orelse return false;
+    if (entry.reported_size) |old| {
+        if (old[0] == size[0] and old[1] == size[1]) return false;
+    }
+    entry.reported_size = size;
+    return true;
+}
+
+/// Makes every canvas report its size again on the next layout. Used after
+/// a recycle: the resumed guest never saw the sizes its predecessor was sent.
+pub fn forgetSizes(self: *Self) void {
+    var it = self.canvases.valueIterator();
+    while (it.next()) |entry| entry.reported_size = null;
 }
 
 // --- tests ---
@@ -729,4 +751,27 @@ test "drawing: clone is an independent copy and leaks nothing on failure" {
             cl.deinit(allocator);
         }
     }.run, .{&original});
+}
+
+test "store: noteSize reports the first size and each change, and forgetSizes re-arms it" {
+    var store: Self = .{};
+    defer store.deinit(testing.allocator);
+    try store.add(testing.allocator, 1);
+    try store.add(testing.allocator, 2);
+
+    try testing.expect(store.noteSize(1, .{ 0, 0 }));
+    try testing.expect(!store.noteSize(1, .{ 0, 0 }));
+    try testing.expect(store.noteSize(1, .{ 300, 0 }));
+    try testing.expect(store.noteSize(1, .{ 300, 200 }));
+    try testing.expect(!store.noteSize(1, .{ 300, 200 }));
+    try testing.expect(!store.noteSize(99, .{ 1, 1 }));
+
+    try testing.expect(store.noteSize(2, .{ 10, 10 }));
+    store.forgetSizes();
+    try testing.expect(store.noteSize(1, .{ 300, 200 }));
+    try testing.expect(store.noteSize(2, .{ 10, 10 }));
+
+    // A replaced drawing doesn't re-arm it: size and contents are separate.
+    try store.replace(testing.allocator, 1, .{});
+    try testing.expect(!store.noteSize(1, .{ 300, 200 }));
 }
