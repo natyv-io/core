@@ -570,6 +570,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_canvas_store_tests = b.addRunArtifact(canvas_store_tests);
 
+    const recycle_trigger_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/RecycleTrigger.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_recycle_trigger_tests = b.addRunArtifact(recycle_trigger_tests);
+
     const drawbatcher_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/DrawBatcher.zig"),
@@ -661,6 +670,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_persist_tests.step);
     test_step.dependOn(&run_canvas_store_tests.step);
+    test_step.dependOn(&run_recycle_trigger_tests.step);
     test_step.dependOn(&run_drawbatcher_tests.step);
     test_step.dependOn(&run_scrollclip_tests.step);
     test_step.dependOn(&run_scrollbar_tests.step);
