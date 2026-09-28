@@ -70,6 +70,16 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
     return host_function_count;
 }
 
+/// `LimitExceeded` is reported distinctly so a guest hitting the caps (see
+/// `PersistStore.max_entries`/`max_total_bytes`) isn't told it's out of
+/// memory.
+fn writeStoreError(plugin: ?*c.ExtismCurrentPlugin, output: *allowzero c.ExtismVal, err: PersistStore.Error) void {
+    switch (err) {
+        error.LimitExceeded => host_fn_util.writeErrorJson(plugin, output, "persist limit reached ({d} entries / {d} bytes)", .{ PersistStore.max_entries, PersistStore.max_total_bytes }),
+        error.OutOfMemory => host_fn_util.writeErrorJson(plugin, output, "out of memory", .{}),
+    }
+}
+
 const GetOrInitRequest = struct { key: []const u8, default: []const u8 };
 
 fn getOrInitHostFn(
@@ -96,8 +106,8 @@ fn getOrInitHostFn(
     defer parsed.deinit();
     const req = parsed.value;
 
-    const result = self.store.getOrInit(req.key, req.default) catch {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory", .{});
+    const result = self.store.getOrInit(req.key, req.default) catch |err| {
+        writeStoreError(plugin, &outputs[0], err);
         return;
     };
 
@@ -149,8 +159,8 @@ fn setHostFn(
     defer parsed.deinit();
     const req = parsed.value;
 
-    self.store.setValue(req.key, req.value) catch {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory", .{});
+    self.store.setValue(req.key, req.value) catch |err| {
+        writeStoreError(plugin, &outputs[0], err);
         return;
     };
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -181,8 +191,8 @@ fn freeHostFn(
     };
     defer parsed.deinit();
 
-    self.store.freeKey(parsed.value.key) catch {
-        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory", .{});
+    self.store.freeKey(parsed.value.key) catch |err| {
+        writeStoreError(plugin, &outputs[0], err);
         return;
     };
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");

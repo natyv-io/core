@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const Config = @import("Config");
+const WindowStyle = @import("WindowStyle");
+const AppFont = @import("AppFont");
 const Manifest = @import("Manifest.zig");
 const Runtime = @import("Runtime.zig");
 const build_options = @import("build_options");
@@ -14,6 +16,7 @@ const Dispatch = @import("Dispatch.zig");
 const FloatingOrder = @import("FloatingOrder.zig");
 const WindowManager = @import("WindowManager.zig");
 const FrameLoop = @import("FrameLoop.zig");
+const TrayDrain = @import("TrayDrain.zig");
 const Logging = @import("Logging.zig");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
@@ -95,6 +98,11 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
+    // Set before anything else that might trace: a `traceNote` call that
+    // runs before this silently no-ops, which is exactly the bug that hid
+    // the window-background line the first time it was added.
+    timing.trace_enabled = init.environ_map.get("NATYV_STARTUP_TRACE") != null;
+
     // `Args.Iterator.initAllocator`, not raw `argv[i]` indexing --
     // `init.minimal.args.vector` isn't an array of C-string pointers on
     // every target the way it is on POSIX: on Windows it's the single raw
@@ -140,11 +148,102 @@ pub fn main(init: std.process.Init) !void {
     const app_name_z = try allocator.dupeZ(u8, config.value.name);
     defer allocator.free(app_name_z);
 
+    // The window's own clear color (`FrameLoop.drawWindow`), resolved once
+    // here rather than per-window so a malformed value fails at startup
+    // with one clear message instead of silently painting the default.
+    //
+    // Precedence, highest first:
+    //   1. the `.ntss` reserved `window` block (WindowStyle.background,
+    //      staged into this repo by `natyv prepare` -- styling wins over
+    //      config, since a stylesheet is where a developer expects colors
+    //      to live)
+    //   2. conf.natyv.json's `ui.background_color` (reachable by an app
+    //      with no `.ntss` file at all)
+    //   3. `#18181C`, natyv's built-in dark ground -- the literal this
+    //      replaced, kept as the default so an app that sets neither looks
+    //      exactly as it did before.
+    const default_background: c.SDL_Color = .{ .r = 0x18, .g = 0x18, .b = 0x1C, .a = 255 };
+    const window_background: c.SDL_Color = if (WindowStyle.background) |rgba|
+        .{ .r = rgba[0], .g = rgba[1], .b = rgba[2], .a = rgba[3] }
+    else if (config.value.ui.background_color) |hex| blk: {
+        const rgba = Config.parseHexRgba(hex) orelse {
+            std.debug.print("[main] ui.background_color: '{s}' is not a real hex color (expected #RRGGBB or #RRGGBBAA)\n", .{hex});
+            return error.InvalidBackgroundColor;
+        };
+        break :blk .{ .r = rgba.r, .g = rgba.g, .b = rgba.b, .a = rgba.a };
+    } else default_background;
+    // Which of the three sources won, reported under NATYV_STARTUP_TRACE.
+    // "why is my background not applying" is otherwise only answerable by
+    // reading this file, and the precedence is the whole point.
+    timing.traceNote("{s:<38}: #{X:0>2}{X:0>2}{X:0>2}{X:0>2} (from {s})\n", .{
+        "window background",
+        window_background.r,
+        window_background.g,
+        window_background.b,
+        window_background.a,
+        if (WindowStyle.background != null)
+            ".ntss window block"
+        else if (config.value.ui.background_color != null)
+            "ui.background_color"
+        else
+            "built-in default",
+    });
+
+    // Startup-window size, same three-level precedence as the background
+    // above. `natyv_clay_create_window` (further below) deliberately keeps
+    // passing the guest's own requested size instead: the guest asked for
+    // those dimensions explicitly, and a stylesheet shouldn't silently
+    // resize a window it never mentioned.
+    const default_window_width: u16 = 900;
+    const default_window_height: u16 = 700;
+    // if/else-if rather than a chained `orelse`: `WindowStyle.width` is
+    // comptime-known, so when it is non-null Zig folds `a orelse b` to a
+    // plain `u16` and the next `orelse` fails to compile. That only
+    // happens with the *generated* file, never with the Absent stub --
+    // i.e. only once someone actually sets the value, which is exactly
+    // the case a build against the stub cannot catch.
+    const window_width: u16 = if (WindowStyle.width) |w| w else if (config.value.ui.width) |w| w else default_window_width;
+    const window_height: u16 = if (WindowStyle.height) |h| h else if (config.value.ui.height) |h| h else default_window_height;
+    // Reported per dimension, not once for the pair: the two sources
+    // compose per-field, so a mixed case (width from the stylesheet,
+    // height from config) is real and a single label for both would be
+    // actively wrong -- which it was, until a composition test showed it
+    // claiming ".ntss window block" for a height that came from config.
+    timing.traceNote("{s:<38}: {d}x{d} (width: {s}, height: {s})\n", .{
+        "window size",
+        window_width,
+        window_height,
+        if (WindowStyle.width != null) ".ntss" else if (config.value.ui.width != null) "ui.width" else "default",
+        if (WindowStyle.height != null) ".ntss" else if (config.value.ui.height != null) "ui.height" else "default",
+    });
+
+    const t_total = timing.traceStart();
+    const t_sdl = timing.traceStart();
+
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlInitFailed;
     }
     defer c.SDL_Quit();
+    timing.traceNote("=== startup phase breakdown ===\n", .{});
+    timing.tracePhase("SDL_Init", t_sdl);
+
+    // hidapi is initialized separately from `SDL_Init`'s subsystems. The
+    // hint must be set first: SDL's default of "1" drops every device that
+    // isn't a joystick or gamepad from enumeration (see `Hid.zig`'s header).
+    // Deferred after SDL_Quit's defer, so it runs first -- and after the
+    // registry's own `closeAll` below, which is deferred later still.
+    const hid_enabled = config.value.hid.enabled;
+    if (hid_enabled) {
+        _ = c.SDL_SetHint(c.SDL_HINT_HIDAPI_ENUMERATE_ONLY_CONTROLLERS, "0");
+        if (c.SDL_hid_init() != 0) {
+            std.debug.print("SDL_hid_init failed: {s}\n", .{c.SDL_GetError()});
+            return error.SdlInitFailed;
+        }
+    }
+    defer if (hid_enabled) {
+        _ = c.SDL_hid_exit();
+    };
 
     // A real, dedicated SDL event type Dispatch.run (the worker thread)
     // pushes after every natyv_dispatch call returns, so the main loop's
@@ -160,8 +259,19 @@ pub fn main(init: std.process.Init) !void {
     // conf.natyv.json, since every app gets it regardless (see the
     // font-rendering plan). Not consumed yet -- that's F3, which swaps
     // every SDL_RenderDebugText call site over to real glyph rendering.
-    var default_font = try Font.init();
+    const t_font = timing.traceStart();
+    var default_font = try Font.init(AppFont.data, AppFont.point_size);
+    // Byte length, not just "custom": it is the one value that proves a
+    // different file actually loaded, which is what "is my font even
+    // being picked up?" is really asking.
+    timing.traceNote("{s:<38}: {s} ({d} bytes) at {d:.1}pt\n", .{
+        "app font",
+        if (AppFont.data != null) "app-supplied" else "bundled Inter",
+        if (AppFont.data) |d| d.len else Font.bundledByteLen(),
+        AppFont.point_size orelse Font.default_point_size,
+    });
     defer default_font.deinit();
+    timing.tracePhase("Font.init", t_font);
 
     var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var db_path: ?[:0]const u8 = null;
@@ -178,8 +288,10 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
+    const t_log = timing.traceStart();
     try Logging.init(io, config.value.logging, app_name_z);
     defer Logging.deinit();
+    timing.tracePhase("Logging.init", t_log);
 
     // `.ntx` tooling Stage 7's bundling step: a binary built via
     // `zig build -Dembed-app-wasm=true` (only ever `natyv build` itself)
@@ -203,22 +315,49 @@ pub fn main(init: std.process.Init) !void {
         break :blk w;
     };
 
+    // Created before the runtime, not just before the dispatch worker:
+    // HID reader threads push into it from the moment `natyv_init` opens a
+    // device, and it has to outlive them (so it's deferred-deinit first).
+    var queue = EventQueue.init(allocator);
+    defer queue.deinit();
+
+    const t_rt = timing.traceStart();
     var runtime = try Runtime.init(allocator, db_path);
     defer runtime.deinit();
+    timing.tracePhase("Runtime.init", t_rt);
     if (config.value.network.enabled) runtime.enableNetwork(config.value.network.tcp.allowed_sockets);
     // Real OS sockets need a real `Io` to close gracefully (see
     // TcpRegistry.closeAll's own doc comment for why Runtime.deinit alone
     // can't do this) -- `io` is still alive here, right before it stops
     // being so, so this is the right place for it.
     defer if (runtime.tcp) |*tcp| tcp.registry.closeAll(io);
+    if (hid_enabled) runtime.enableHid(config.value.hid.allowed_devices, &queue);
+    // Joins every device's reader thread, which is why it can't live in
+    // `Runtime.deinit` (no `Io` there). Runs after the dispatch worker has
+    // been joined, so no host call can race it, and before `SDL_hid_exit`.
+    defer if (runtime.hid) |*hid| hid.registry.closeAll(io);
 
     const manifest: Manifest = .{ .allowed_hosts = if (config.value.network.enabled) config.value.network.http.allowed_hosts else &.{} };
     const clay_enabled = if (config.value.ui.backend) |backend| std.mem.eql(u8, backend, "clay") else false;
+    // loadPlugin traces its own compile/instantiate split internally.
+    const t_load = timing.traceStart();
     try runtime.loadPlugin(wasm, manifest, clay_enabled);
-    runtime.initGuest(io);
+    timing.tracePhase("loadPlugin TOTAL", t_load);
 
-    var queue = EventQueue.init(allocator);
-    defer queue.deinit();
+    // The guest's own natyv_init. Whatever an app does on startup lands
+    // here, including any network it opens -- see this phase's own numbers
+    // before attributing a slow launch to natyv itself.
+    const t_init = timing.traceStart();
+    runtime.initGuest(io);
+    timing.tracePhase("initGuest (natyv_init)", t_init);
+    timing.traceNote("{s:<38}: {d} bytes\n", .{ "guest wasm size", wasm.len });
+
+    // Arms the system tray's callback environment before any tray can
+    // exist. `natyv_init` above may already have queued a tray; nothing is
+    // materialized until this frame loop's own drain below, so the ordering
+    // that matters is "before the first drain", not "before natyv_init".
+    TrayDrain.init(io, &queue);
+    defer TrayDrain.deinit();
 
     const worker = try std.Thread.spawn(.{}, Dispatch.run, .{ &runtime, io, &queue, wake_event_type, config.value.memory.recycle_threshold_mb });
 
@@ -240,7 +379,12 @@ pub fn main(init: std.process.Init) !void {
     const windows = try allocator.alloc(WindowManager.WindowContext, WindowManager.max_open_windows);
     defer allocator.free(windows);
     var window_count: usize = 0;
-    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, 900, 700, default_font.font, clay_enabled, null);
+    const t_win = timing.traceStart();
+    windows[0] = try WindowManager.createWindowContext(allocator, app_name_z, @floatFromInt(window_width), @floatFromInt(window_height), default_font.font, clay_enabled, window_background, null);
+    timing.tracePhase("createWindowContext", t_win);
+    timing.traceNote("---------------------------------------\n", .{});
+    timing.tracePhase("TOTAL to first window", t_total);
+    timing.traceNote("\n", .{});
     window_count += 1;
 
     const arrow_cursor = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT);
@@ -332,6 +476,13 @@ pub fn main(init: std.process.Init) !void {
         // inspection.
         runtime.widgets.flushPendingTextDestroys(io);
 
+        // Materialize whatever the guest asked of the system tray since
+        // last frame. Kept next to the window drain below for the same
+        // reason: both turn a worker-thread request into a real,
+        // main-thread-only OS call. A no-op on almost every frame -- an app
+        // typically builds its whole tray once, inside `natyv_init`.
+        TrayDrain.drain(&runtime.tray_registry, io);
+
         // Multi-window Stage 4: settle this frame's open-window set --
         // drain any guest-requested teardown, then any guest-requested
         // creation -- before anything else this frame touches `windows[]`,
@@ -347,6 +498,25 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
+            var visibility: [WidgetHost.max_pending_window_requests]WidgetHost.PendingWindowVisibility = undefined;
+            const visibility_n = runtime.widgets.takePendingWindowVisibility(io, &visibility);
+            for (visibility[0..visibility_n]) |req| {
+                // 0 names the startup window, which has no root widget id
+                // of its own -- see PendingWindowVisibility's doc comment.
+                const idx = if (req.window_id == 0)
+                    @as(?usize, if (window_count > 0) 0 else null)
+                else
+                    findWindowIndexByRoot(windows[0..window_count], req.window_id);
+                if (idx) |i| {
+                    if (req.visible) {
+                        _ = c.SDL_ShowWindow(windows[i].window);
+                        _ = c.SDL_RaiseWindow(windows[i].window);
+                    } else {
+                        _ = c.SDL_HideWindow(windows[i].window);
+                    }
+                }
+            }
+
             var requests: [WidgetHost.max_pending_window_requests]WidgetHost.PendingWindowRequest = undefined;
             const request_n = runtime.widgets.takePendingWindowRequests(io, &requests);
             for (requests[0..request_n]) |req| {
@@ -358,7 +528,7 @@ pub fn main(init: std.process.Init) !void {
                 @memcpy(title_buf[0..req.title_len], req.title_buf[0..req.title_len]);
                 title_buf[req.title_len] = 0;
                 const title_z: [:0]const u8 = title_buf[0..req.title_len :0];
-                windows[window_count] = WindowManager.createWindowContext(allocator, title_z, req.width, req.height, default_font.font, clay_enabled, req.widget_id) catch |err| {
+                windows[window_count] = WindowManager.createWindowContext(allocator, title_z, req.width, req.height, default_font.font, clay_enabled, window_background, req.widget_id) catch |err| {
                     std.debug.print("[main] failed to create window for widget {d}: {}\n", .{ req.widget_id, err });
                     continue;
                 };
@@ -456,7 +626,15 @@ pub fn main(init: std.process.Init) !void {
         const had_real_event = have_event;
         while (have_event) {
             switch (event.type) {
-                c.SDL_EVENT_QUIT => running = false,
+                c.SDL_EVENT_QUIT => {
+                    // Traced because "who ended the process" is genuinely
+                    // ambiguous once an app can outlive its own window: a
+                    // guest-vetoed close, SDL's own quit-on-last-window-
+                    // close, and a real Cmd+Q all look identical from
+                    // outside. Gated, so it costs nothing normally.
+                    timing.traceNote("{s:<38}: SDL_EVENT_QUIT\n", .{"quit"});
+                    running = false;
+                },
                 c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                     if (findWindowIndex(windows[0..window_count], event.window.windowID)) |idx| {
                         // The original startup window closing always quits,
@@ -475,7 +653,28 @@ pub fn main(init: std.process.Init) !void {
                             const snap = widget_snapshot[0..widget_count];
                             queue.push(io, root_id, .window_close_requested, "", FloatingOrder.surfaceIdFor(snap, WidgetHost.SnapshotIndex.build(snap), root_id));
                         } else {
-                            running = false;
+                            // The startup window. It quits the app by
+                            // default, and still does unless the guest
+                            // explicitly asked otherwise via
+                            // `natyv_set_quit_on_last_window_close` -- which
+                            // is how an app with a system tray keeps running
+                            // with nothing on screen. When it has, the close
+                            // becomes an ordinary vetoable
+                            // `.window_close_requested` like every other
+                            // window's, addressed to a widget id the guest
+                            // nominated (it has no root widget id of its own
+                            // to use). The host still destroys nothing: a
+                            // guest that ignores the event just leaves the
+                            // window open, same contract as every other
+                            // window.
+                            const behavior = runtime.widgets.closeBehavior(io);
+                            timing.traceNote("{s:<38}: quit={} notify={d}\n", .{ "startup window close", behavior.quit, behavior.notify_widget_id });
+                            if (behavior.quit) {
+                                running = false;
+                            } else {
+                                const snap = widget_snapshot[0..widget_count];
+                                queue.push(io, behavior.notify_widget_id, .window_close_requested, "", FloatingOrder.surfaceIdFor(snap, WidgetHost.SnapshotIndex.build(snap), behavior.notify_widget_id));
+                            }
                         }
                     }
                 },
@@ -525,8 +724,10 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        FrameLoop.pushCanvasResizeEvents(&runtime.widgets, io, &queue, widget_snapshot[0..widget_count]);
+
         for (windows[0..window_count], 0..) |*wctx, i| {
-            FrameLoop.drawWindow(&runtime.widgets, io, &queue, wctx, per_window_slots[i][0..per_window_slot_count[i]], per_window_is_floating[i][0..per_window_slot_count[i]], per_window_topmost_modal[i], arrow_cursor, pointer_cursor);
+            FrameLoop.drawWindow(&runtime.widgets, io, &queue, wctx, per_window_slots[i][0..per_window_slot_count[i]], per_window_is_floating[i][0..per_window_slot_count[i]], per_window_topmost_modal[i], arrow_cursor, pointer_cursor, default_font.font);
         }
 
         // Recompute for the *next* iteration's wait mode -- see

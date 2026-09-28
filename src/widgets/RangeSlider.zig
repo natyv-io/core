@@ -99,6 +99,23 @@ pub fn setMax(self: *Self, v: f32) void {
     self.max = std.math.clamp(self.snap(clamped), self.min, 1);
 }
 
+/// Sets both ends at once -- `natyv_set_range`'s implementation. Clamps
+/// the pair against each other directly (not via `setMin`/`setMax`, whose
+/// clamp against the *current* other end would reject a legitimate new
+/// pair depending on call order), with `min` resolving first, same as
+/// `init`. `hi` bounds `max` into `[0, 1]` before it becomes `min`'s upper
+/// bound: a guest `max` below 0 would otherwise hand `std.math.clamp` a
+/// lower bound above its upper one, which it asserts against. Snapped
+/// independently afterward -- see `snap`'s doc comment for why that can't
+/// invert the pair.
+pub fn setRange(self: *Self, min: f32, max: f32) void {
+    const hi = std.math.clamp(max, 0, 1);
+    const clamped_min = std.math.clamp(min, 0, hi);
+    const clamped_max = std.math.clamp(max, clamped_min, 1);
+    self.min = self.snap(clamped_min);
+    self.max = self.snap(clamped_max);
+}
+
 pub fn setHandleValue(self: *Self, handle: Handle, v: f32) void {
     switch (handle) {
         .min => self.setMin(v),
@@ -225,6 +242,19 @@ test "min thumb at 0 and max thumb at 1 sit at the track's edges" {
     try std.testing.expectEqual(@as(f32, 10), min_thumb.x);
     try std.testing.expectEqual(@as(f32, 90), max_thumb.x);
     try std.testing.expectEqual(@as(f32, 110), max_thumb.x + max_thumb.w);
+}
+
+test "setRange keeps min <= max inside [0, 1] for any finite guest pair" {
+    var rs = init(.{ .x = 0, .y = 0, .w = 100, .h = 20 }, 0.2, 0.8, 0);
+    rs.setRange(0.9, -5); // max below 0 used to trip std.math.clamp's lower <= upper assert
+    try std.testing.expectEqual(@as(f32, 0), rs.min);
+    try std.testing.expectEqual(@as(f32, 0), rs.max);
+    rs.setRange(-3e38, 3e38);
+    try std.testing.expectEqual(@as(f32, 0), rs.min);
+    try std.testing.expectEqual(@as(f32, 1), rs.max);
+    rs.setRange(0.7, 0.3);
+    try std.testing.expectEqual(@as(f32, 0.3), rs.min);
+    try std.testing.expectEqual(@as(f32, 0.3), rs.max);
 }
 
 test "setMin cannot cross the current max -- clamps at max, doesn't push it" {

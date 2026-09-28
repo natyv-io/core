@@ -20,6 +20,7 @@ const json_util = @import("json_util.zig");
 const EventQueue = @import("EventQueue.zig");
 const Runtime = @import("Runtime.zig");
 const process_memory = @import("process_memory.zig");
+const RecycleTrigger = @import("RecycleTrigger.zig");
 
 /// `wake_event_type` is `main.zig`'s own `SDL_RegisterEvents(1)` result --
 /// pushed after every `natyv_dispatch` call below so the main thread's own
@@ -45,21 +46,14 @@ const process_memory = @import("process_memory.zig");
 /// itself is still a no-op for any app that hasn't declared both
 /// `natyv_checkpoint`/`natyv_resume`, so `runtime.can_recycle` is checked
 /// too, before ever touching the RSS syscall -- a threshold configured
-/// against an app that can't actually recycle should cost nothing.
-const recycle_cooldown_dispatches: u32 = 3;
-
+/// against an app that can't actually recycle should cost nothing. When to
+/// recycle, including the anti-thrashing cooldown and post-recycle floor
+/// check, is `RecycleTrigger`'s job.
 pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32, recycle_threshold_mb: ?u32) void {
-    // Sits alongside the threshold check below, not exposed as its own
-    // `conf.natyv.json` field -- a rate limit protecting against thrashing,
-    // not a policy choice a dev needs to tune. Once a recycle fires, the
-    // RSS check is skipped for this many dispatches before resuming --
-    // without it, a threshold configured close to an app's own real
-    // post-resume floor would refire a real recycle (a force-close of
-    // every open TCP connection, ~30ms measured) on every single
-    // subsequent dispatch. Trade-off, stated plainly: RSS can drift above
-    // the configured threshold during the cooldown window -- this is a
-    // soft ceiling, not a hard one.
-    var recycle_cooldown_remaining: u32 = 0;
+    var trigger: ?RecycleTrigger = if (recycle_threshold_mb) |threshold_mb|
+        RecycleTrigger.init(@as(u64, threshold_mb) * 1024 * 1024)
+    else
+        null;
     while (true) {
         const event = queue.pop(io) orelse break;
         defer queue.freeEntry(event);
@@ -100,14 +94,17 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32, 
         // *something* wakes the main thread's event wait in the first
         // place -- not intermittently, but reliably wrong on every real
         // recycle boundary regardless of what triggered it.
-        if (recycle_threshold_mb) |threshold_mb| {
-            if (runtime.can_recycle) {
-                if (recycle_cooldown_remaining > 0) {
-                    recycle_cooldown_remaining -= 1;
-                } else if (process_memory.residentSetSizeBytes(io)) |rss_bytes| {
-                    const threshold_bytes = @as(u64, threshold_mb) * 1024 * 1024;
-                    if (rss_bytes >= threshold_bytes) {
-                        if (runtime.recycle(io)) {
+        if (trigger) |*t| {
+            if (runtime.can_recycle and t.shouldMeasure()) {
+                if (process_memory.residentSetSizeBytes(io)) |rss_bytes| {
+                    const decision = t.observe(rss_bytes);
+                    if (decision == .raised_to) std.debug.print(
+                        "[runtime] recycle: RSS after a recycle is {d} MB, at or over memory.recycle_threshold_mb ({d} MB), so another recycle can't lower it; waiting for {d} MB instead. Raise the threshold above this app's post-recycle RSS.\n",
+                        .{ rss_bytes / (1024 * 1024), t.configured / (1024 * 1024), decision.raised_to / (1024 * 1024) },
+                    );
+                    if (decision == .recycle) {
+                        const succeeded = runtime.recycle(io);
+                        if (succeeded) {
                             // Any event queued before this exact point --
                             // whether already sitting in the queue, or
                             // pushed by the main thread while natyv_resume
@@ -122,6 +119,11 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32, 
                             // looked indistinguishable from "nothing
                             // happened").
                             queue.bumpGeneration(io);
+                            // The resumed guest was never sent its
+                            // canvases' sizes; this makes the next layout
+                            // report them again. After bumpGeneration, so
+                            // those events aren't discarded as stale.
+                            runtime.widgets.forgetCanvasSizes(io);
                             // A resumed instance's own region reveals are
                             // deferred (see sdks/go/region/region.go's
                             // FlushPendingReveals) until a genuinely
@@ -141,7 +143,7 @@ pub fn run(runtime: *Runtime, io: Io, queue: *EventQueue, wake_event_type: u32, 
                             // itself.
                             queue.push(io, 0, .hover, "{\"hovering\":false}", 0);
                         }
-                        recycle_cooldown_remaining = recycle_cooldown_dispatches;
+                        t.recycled(succeeded);
                     }
                 } else |err| {
                     std.debug.print("[dispatch] RSS check failed: {}\n", .{err});

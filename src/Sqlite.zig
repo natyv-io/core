@@ -28,7 +28,49 @@ pub fn open(path: [:0]const u8) Error!Self {
     if (c.sqlite3_open(path.ptr, &db) != c.SQLITE_OK) {
         return error.OpenFailed;
     }
+    if (c.sqlite3_set_authorizer(db, authorize, null) != c.SQLITE_OK) {
+        _ = c.sqlite3_close(db);
+        return error.OpenFailed;
+    }
     return .{ .db = db };
+}
+
+/// Keeps guest SQL inside the one database file the host opened. Guest SQL
+/// reaches `exec`/`queryToJson` verbatim, and without this `ATTACH` would
+/// let it open any path at host privilege -- reading other apps' SQLite
+/// files, or creating new ones anywhere -- escaping the WASM sandbox
+/// entirely. Everything inside the host-opened database (tables, indexes,
+/// views, triggers, transactions, TEMP tables) is untouched.
+///
+/// `ATTACH` is allowed only for an empty filename: plain `VACUUM` runs
+/// `ATTACH '' AS vacuum_db` internally (an anonymous temp database) and
+/// goes through this callback too, so a blanket deny would break it.
+/// `VACUUM INTO '<path>'` attaches its real path the same way, so it's
+/// denied here as well -- it would otherwise write a full copy of the
+/// database anywhere. The two deprecated directory pragmas are denied
+/// because they redirect where SQLite itself writes files.
+///
+/// Extension loading needs no rule here: it's off unless
+/// `sqlite3_enable_load_extension` is called, and nothing does. Opening up
+/// more (e.g. host-mapped named databases) waits for a real need.
+fn authorize(_: ?*anyopaque, action: c_int, arg1: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+    switch (action) {
+        c.SQLITE_ATTACH => {
+            const filename: []const u8 = if (arg1) |f| std.mem.span(@as([*:0]const u8, @ptrCast(f))) else "";
+            return if (filename.len == 0) c.SQLITE_OK else c.SQLITE_DENY;
+        },
+        c.SQLITE_DETACH => return c.SQLITE_DENY,
+        c.SQLITE_PRAGMA => {
+            const name: []const u8 = if (arg1) |n| std.mem.span(@as([*:0]const u8, @ptrCast(n))) else "";
+            if (std.ascii.eqlIgnoreCase(name, "temp_store_directory") or
+                std.ascii.eqlIgnoreCase(name, "data_store_directory"))
+            {
+                return c.SQLITE_DENY;
+            }
+            return c.SQLITE_OK;
+        },
+        else => return c.SQLITE_OK,
+    }
 }
 
 pub fn close(self: *Self) void {
@@ -139,4 +181,32 @@ test "open, exec, query, delete round trip -- no baked-in schema" {
     defer allocator.free(json3);
     try std.testing.expect(std.mem.indexOf(u8, json3, "Le Guin") == null);
     try std.testing.expect(std.mem.indexOf(u8, json3, "Some") != null);
+}
+
+test "guest SQL cannot reach files outside the opened database" {
+    const allocator = std.testing.allocator;
+
+    var db = try open(":memory:");
+    defer db.close();
+    _ = try db.exec(allocator, "CREATE TABLE t (v TEXT)", &.{});
+    _ = try db.exec(allocator, "INSERT INTO t (v) VALUES (?)", &.{"kept"});
+
+    try std.testing.expectError(error.PrepareFailed, db.exec(allocator, "ATTACH 'natyv_attach_must_fail.db' AS x", &.{}));
+    try std.testing.expectError(error.PrepareFailed, db.exec(allocator, "ATTACH ':memory:' AS x", &.{}));
+    try std.testing.expectError(error.PrepareFailed, db.exec(allocator, "DETACH x", &.{}));
+    try std.testing.expectError(error.PrepareFailed, db.exec(allocator, "PRAGMA temp_store_directory = '/tmp'", &.{}));
+    try std.testing.expectError(error.PrepareFailed, db.exec(allocator, "PRAGMA TEMP_STORE_DIRECTORY = '/tmp'", &.{}));
+    // VACUUM INTO's own ATTACH is denied at step time, not prepare time.
+    try std.testing.expectError(error.StepFailed, db.exec(allocator, "VACUUM INTO 'natyv_vacuum_must_fail.db'", &.{}));
+    try std.testing.expectError(error.StepFailed, db.exec(allocator, "SELECT load_extension('natyv_no_such_ext')", &.{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, "natyv_attach_must_fail.db", .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, "natyv_vacuum_must_fail.db", .{}));
+
+    // Plain VACUUM attaches an empty filename internally and must keep working.
+    _ = try db.exec(allocator, "VACUUM", &.{});
+    _ = try db.exec(allocator, "CREATE TEMP TABLE scratch (v TEXT)", &.{});
+    _ = try db.exec(allocator, "CREATE INDEX t_v ON t (v)", &.{});
+    const json = try db.queryToJson(allocator, "SELECT v FROM t", &.{});
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "kept") != null);
 }

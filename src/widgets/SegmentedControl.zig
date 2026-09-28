@@ -6,6 +6,7 @@
 //! label storage follows `TextField.zig`'s exact fixed-buffer convention.
 
 const std = @import("std");
+const text_cursor = @import("text_cursor.zig");
 const c = @import("../c.zig").c;
 
 const Self = @This();
@@ -33,7 +34,7 @@ sync_count: u32 = 0,
 pub fn init(rect: c.SDL_FRect, labels: []const []const u8, selected_index: usize) Self {
     var self: Self = .{ .rect = rect, .count = @min(labels.len, max_segments) };
     for (0..self.count) |i| {
-        const n = @min(labels[i].len, max_label_len);
+        const n = text_cursor.truncatedLen(labels[i], max_label_len);
         @memcpy(self.labels[i][0..n], labels[i][0..n]);
         self.labels[i][n] = 0;
         self.label_lens[i] = n;
@@ -71,7 +72,7 @@ pub fn segmentAt(self: Self, x: f32, y: f32) ?usize {
     if (self.count == 0 or !self.containsPoint(x, y)) return null;
     const seg_w = self.rect.w / @as(f32, @floatFromInt(self.count));
     if (seg_w <= 0) return null;
-    const idx: usize = @intFromFloat(@floor((x - self.rect.x) / seg_w));
+    const idx = std.math.lossyCast(usize, @floor((x - self.rect.x) / seg_w));
     return @min(idx, self.count - 1);
 }
 

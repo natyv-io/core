@@ -33,6 +33,12 @@ dragging_slider_id: ?u32 = null,
 /// for why this can't just be read back from the widget itself via
 /// `widget_snapshot` in the same frame it was chosen.
 dragging_range_handle: ?RangeSlider.Handle = null,
+/// Which TextField/TextArea (if any) is currently having its selection
+/// extended by a mouse drag -- set on a MOUSE_BUTTON_DOWN hit against a
+/// text widget, cleared unconditionally on MOUSE_BUTTON_UP, mirroring
+/// `dragging_slider_id`'s exact lifecycle. The selection itself persists
+/// after release; only this drag-in-progress flag clears.
+text_selecting_id: ?u32 = null,
 /// W15: which widget (if any) the mouse is currently continuously over, when
 /// that hover started, and which widget (if any) we've already fired
 /// `.hover true` for -- `tooltip_active_for` is tracked separately from

@@ -5,6 +5,7 @@
 //! static string literal.
 
 const std = @import("std");
+const text_cursor = @import("text_cursor.zig");
 const c = @import("../c.zig").c;
 const timing = @import("../timing.zig");
 
@@ -39,6 +40,10 @@ sync_count: u32 = 0,
 /// `measured_width`'s own doc comment on the `openChildren` side for the
 /// full reasoning). 0 until the very first real sync.
 measured_width: f32 = 0,
+/// Companion to `measured_width` -- `TTF_GetTextSize` already returns
+/// both, and the height was simply being discarded before Fit sizing
+/// needed it.
+measured_height: f32 = 0,
 /// Keyboard interaction model: true when this button has focus (via Tab
 /// navigation or a mouse click) -- driven by `WidgetHost.setFocused`
 /// through `Widget.setFocusedFlag`, mirrors `TextField.focused`. Space or
@@ -53,7 +58,7 @@ pub fn init(rect: c.SDL_FRect, initial_label: []const u8) Self {
 }
 
 pub fn setLabel(self: *Self, s: []const u8) bool {
-    const n = @min(s.len, max_label_len);
+    const n = text_cursor.truncatedLen(s, max_label_len);
     if (self.label_len == n and std.mem.eql(u8, self.label_buf[0..n], s[0..n])) return false;
     @memcpy(self.label_buf[0..n], s[0..n]);
     self.label_buf[n] = 0;
@@ -155,6 +160,7 @@ fn remeasure(self: *Self, obj: *c.TTF_Text) void {
     var h: c_int = 0;
     _ = c.TTF_GetTextSize(obj, &w, &h);
     self.measured_width = @floatFromInt(w);
+    self.measured_height = @floatFromInt(h);
 }
 
 /// Must be called before this widget is dropped from the registry --

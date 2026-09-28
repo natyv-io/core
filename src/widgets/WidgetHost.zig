@@ -135,6 +135,8 @@ const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
 const SegmentedControl = @import("SegmentedControl.zig");
 const Tabs = @import("Tabs.zig");
+const Canvas = @import("Canvas.zig");
+pub const CanvasStore = @import("../CanvasStore.zig");
 const ScrollBar = @import("../ScrollBar.zig");
 // The Extism host-function wire layer (natyv_create_*/natyv_clay_create_*
 // callbacks and the generic set/get/destroy ones) lives in its own file --
@@ -143,6 +145,11 @@ const ScrollBar = @import("../ScrollBar.zig");
 // by name for registerInto/registerClayInto below; that file needs this
 // one's registry-internal helpers).
 const HostFunctions = @import("WidgetHostFunctions.zig");
+
+/// Re-exported so FrameLoop.zig's Left/Right key handling can name a
+/// direction without importing TextField.zig itself just for this one type
+/// -- TextField/TextArea both alias the same `text_cursor.CursorDirection`.
+pub const TextCursorDirection = TextField.CursorDirection;
 
 const Self = @This();
 
@@ -233,9 +240,15 @@ pub const max_widgets = 2048;
 // primitive: same as natyv_destroy_children, but spares one named child's
 // own subtree too, so a freshly-built replacement can be revealed before
 // the previous content is torn down instead of after.
-pub const host_function_count = 30;
+// + natyv_set_window_visible/natyv_set_quit_on_last_window_close (2) --
+// app lifecycle, generic and unrelated to any WidgetKind (they act on real
+// OS windows and on whether closing the last one ends the process), same
+// "always registered" reasoning as the file dialogs above. Added for the
+// system tray, whose whole point is usually an app that keeps running with
+// no window on screen, but neither is tray-specific.
+pub const host_function_count = 32;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner, canvas };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -254,6 +267,28 @@ pub const Widget = union(WidgetKind) {
     segmented_control: SegmentedControl,
     tabs: Tabs,
     spinner: Spinner,
+    canvas: Canvas,
+
+    /// Real, font-driven size of whatever text this widget draws, or null
+    /// for a kind that draws none (or hasn't synced once yet). Same
+    /// kind-agnostic dispatch shape as `rectPtr` below.
+    ///
+    /// Only kinds whose size genuinely *is* their text are listed. A
+    /// TextArea is deliberately absent: it is a multi-line input whose
+    /// authored box is the point, and sizing it to its content would make
+    /// it grow as the user types. Slider and Tabs likewise own their
+    /// geometry for reasons unrelated to any text they happen to draw.
+    pub const MeasuredText = struct { w: f32, h: f32 };
+
+    pub fn measuredText(self: Widget) ?MeasuredText {
+        const m: MeasuredText = switch (self) {
+            .label => |l| .{ .w = l.measured_width, .h = l.measured_height },
+            .button => |b| .{ .w = b.measured_width, .h = b.measured_height },
+            else => return null,
+        };
+        if (m.w <= 0 and m.h <= 0) return null;
+        return m;
+    }
 
     /// Every variant has its own `rect: c.SDL_FRect` field -- this gets a
     /// pointer to whichever one is active, regardless of kind. L4 uses this
@@ -278,6 +313,7 @@ pub const Widget = union(WidgetKind) {
             .segmented_control => |*sc| &sc.rect,
             .tabs => |*tb| &tb.rect,
             .spinner => |*sp| &sp.rect,
+            .canvas => |*cv| &cv.rect,
         };
     }
 
@@ -327,7 +363,7 @@ pub const Widget = union(WidgetKind) {
             // W29: Spinner joins the same "owns its whole draw" set --
             // multiple independently-scaled dots isn't a single solid-color
             // rect.
-            .numeric_stepper, .segmented_control, .tabs, .spinner => null,
+            .numeric_stepper, .segmented_control, .tabs, .spinner, .canvas => null,
         };
     }
 
@@ -338,7 +374,7 @@ pub const Widget = union(WidgetKind) {
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
             .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .range_slider, .numeric_stepper, .segmented_control, .tabs => true,
-            .label, .container, .progress_bar, .divider, .badge, .spinner => false,
+            .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => false,
         };
     }
 
@@ -359,7 +395,7 @@ pub const Widget = union(WidgetKind) {
             .numeric_stepper => |*ns| ns.focused = focused,
             .segmented_control => |*sc| sc.focused = focused,
             .tabs => |*tb| tb.focused = focused,
-            .label, .container, .progress_bar, .divider, .badge, .spinner => {},
+            .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => {},
         }
     }
 
@@ -381,7 +417,7 @@ pub const Widget = union(WidgetKind) {
             .numeric_stepper => |ns| ns.focused,
             .segmented_control => |sc| sc.focused,
             .tabs => |tb| tb.focused,
-            .label, .container, .progress_bar, .divider, .badge, .spinner => false,
+            .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => false,
         };
     }
 };
@@ -720,11 +756,10 @@ mutex: Io.Mutex = .init,
 /// alone. Making `slots` itself heap-backed fixes this at the root:
 /// `WidgetHost`'s own size (and therefore `Runtime`'s) no longer depends
 /// on `max_widgets` at all, regardless of how many places embed either by
-/// value. `max_widgets` itself is unchanged as a named constant (still
-/// used as a scratch-buffer size in tests, and as an initial-growth
-/// reference) but is no longer a hard ceiling `slots` can hit -- growth is
-/// governed entirely by `insertLockedWithLayout`'s own free-slot-scan-then-
-/// append logic below.
+/// value. `max_widgets` is still the hard ceiling on `slots.items.len`,
+/// enforced by `insertLockedWithLayout`'s own append path below -- every
+/// snapshot/collect scratch buffer in the runtime is sized to it, so the
+/// heap backing only moves the storage, it doesn't lift the cap.
 slots: std.ArrayListUnmanaged(?Slot) = .empty,
 next_id: u32 = 1,
 /// id -> index into `slots`, kept in sync at every real site a slot ever
@@ -757,6 +792,13 @@ id_to_index: std.AutoHashMapUnmanaged(u32, usize) = .empty,
 /// reusing each widget's already-cached `rect` instead. See
 /// `ClayLayout.layoutIfNeeded`.
 layout_generation: u64 = 0,
+/// Every canvas widget's current drawing, keyed by widget id -- see
+/// Canvas.zig for why it isn't in the slot. Guarded by `mutex` like
+/// `slots`: the worker replaces drawings, the main thread copies one out
+/// when it needs re-rendering. Replacing a drawing deliberately doesn't
+/// bump `layout_generation` -- it can't move anything, and the renderer
+/// notices by comparing `CanvasStore.Entry.version` instead.
+canvases: CanvasStore = .{},
 /// See file doc comment -- set by Runtime.call around every guest call,
 /// unset after. Only ever read from inside a host function callback, which
 /// by construction only ever runs nested inside that same call.
@@ -853,6 +895,36 @@ pending_window_request_count: usize = 0,
 pending_window_teardowns: [max_pending_window_requests]?u32 = [_]?u32{null} ** max_pending_window_requests,
 pending_window_teardown_count: usize = 0,
 
+/// Same cross-thread hand-off shape as the two queues above:
+/// `SDL_ShowWindow`/`SDL_HideWindow` are main-thread work, and
+/// `natyv_set_window_visible` runs on the worker. A bounded array rather
+/// than a single slot for the same reason window creation needs one -- a
+/// guest can hide one window and show another inside a single dispatch.
+pending_window_visibility: [max_pending_window_requests]?PendingWindowVisibility = [_]?PendingWindowVisibility{null} ** max_pending_window_requests,
+pending_window_visibility_count: usize = 0,
+
+/// Whether closing the startup window ends the process. True is the
+/// long-standing behaviour and stays the default, so no existing app
+/// changes; a guest turns it off with `natyv_set_quit_on_last_window_close`
+/// when it means to keep running with no window on screen -- which is what
+/// a system tray is usually for.
+///
+/// Every *other* window already has a vetoable close: its own
+/// `.window_close_requested` event, which the host never acts on by itself.
+/// The startup window could not participate because it has no
+/// `root_widget_id` to address (see `WindowManager.WindowContext`), so
+/// there was nobody to notify and quitting was the only option.
+quit_on_last_window_close: bool = true,
+
+/// Who receives the startup window's `.window_close_requested` when
+/// `quit_on_last_window_close` is false. Supplied by the guest, which
+/// passes a widget id it already owns -- deliberately *not* a reserved
+/// sentinel like 0, because `Dispatch` already pushes synthetic events to
+/// id 0 on the documented assumption that no real app registers a handler
+/// for it. Honouring an id of 0 here would quietly break that assumption
+/// and deliver those synthetic pings to a guest's close handler.
+window_close_notify_id: u32 = 0,
+
 /// `allow_many` is ignored for `.save` -- `SDL_ShowSaveFileDialog` has no
 /// such parameter, only `SDL_ShowOpenFileDialog` does.
 pub const PendingFileDialogRequest = struct {
@@ -861,12 +933,36 @@ pub const PendingFileDialogRequest = struct {
     allow_many: bool,
 };
 
+/// `window_id` is a window's own `window_root` widget id, or 0 for the
+/// startup window -- which genuinely has no root widget id of its own, so 0
+/// is the only way to name it. Unambiguous here in a way it would not be as
+/// an *event* target: this only ever travels guest -> host and is never
+/// routed to a handler.
+pub const PendingWindowVisibility = struct {
+    window_id: u32,
+    visible: bool,
+};
+
 /// Multi-window Stage 4: small fixed cap on in-flight window creation/
 /// teardown requests per frame -- same "bump later if a real need shows up"
 /// precedent `max_widgets`/`WindowManager.max_open_windows` already set. A
 /// guest realistically never queues anywhere near this many window
 /// operations in the time between two frames.
 pub const max_pending_window_requests = 8;
+
+/// Every `window_root` slot becomes a real OS window, and `main.zig` holds at
+/// most `WindowManager.max_open_windows` of those, the startup window
+/// included. Past that it logs and drops the request -- which used to leave
+/// the guest holding a "successful" window id with no window behind it -- so
+/// `insertWindowRoot` refuses here instead. It also bounds teardowns: no
+/// more than this many windows can be live, so no more than this many
+/// teardowns can queue between two frames (a window destroyed before it
+/// materializes cancels its request instead, see `queueWindowTeardownLocked`),
+/// which is what keeps `pending_window_teardowns` from ever dropping one.
+pub const max_window_roots = @import("../WindowManager.zig").max_open_windows - 1;
+comptime {
+    std.debug.assert(max_window_roots <= max_pending_window_requests);
+}
 
 /// A guest's requested window title, copied into this owned fixed buffer at
 /// request time -- guest memory isn't guaranteed to outlive the host call,
@@ -906,19 +1002,60 @@ pub fn takePendingWindowRequests(self: *Self, call_io: Io, out: []PendingWindowR
     return n;
 }
 
-/// Worker-thread side of the window-teardown hand-off -- silently drops the
-/// request if the queue is already full this frame (same "tiny, practically
-/// unreachable leak preferable to a panic in a guest-facing host function"
-/// precedent `queuePendingTextDestroy` already establishes); the widget
-/// subtree itself is already gone from the registry by the time this would
-/// be called regardless (see this field's own doc comment), so a dropped
-/// entry here only delays real OS resource cleanup, not a correctness gap.
-pub fn queueWindowTeardown(self: *Self, call_io: Io, widget_id: u32) void {
-    self.mutex.lockUncancelable(call_io);
-    defer self.mutex.unlock(call_io);
+/// Worker-thread side of the window-teardown hand-off. `main.zig` drains
+/// teardowns *before* requests each frame, so a window created and
+/// destroyed between two frames would otherwise have its teardown find
+/// nothing, then its request materialize a real OS window for a widget that
+/// no longer exists -- orphaned for good. Cancelling the still-pending
+/// request instead means nothing is ever created. The full-queue drop at
+/// the end is unreachable now that `max_window_roots` bounds live windows
+/// (see its doc comment) -- kept as a guard rather than a panic in a
+/// guest-facing host function.
+fn queueWindowTeardownLocked(self: *Self, widget_id: u32) void {
+    const pending = self.pending_window_requests[0..self.pending_window_request_count];
+    for (pending, 0..) |req, i| {
+        if (req.?.widget_id != widget_id) continue;
+        std.mem.copyForwards(?PendingWindowRequest, pending[i .. pending.len - 1], pending[i + 1 ..]);
+        pending[pending.len - 1] = null;
+        self.pending_window_request_count -= 1;
+        return;
+    }
     if (self.pending_window_teardown_count >= self.pending_window_teardowns.len) return;
     self.pending_window_teardowns[self.pending_window_teardown_count] = widget_id;
     self.pending_window_teardown_count += 1;
+}
+
+/// Inserts a `window_root` slot, refusing past `max_window_roots` -- see
+/// that constant's doc comment.
+pub fn insertWindowRoot(self: *Self, call_io: Io, style: ClayStyle) error{ TooManyWindows, RegistryFull }!u32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    var live: usize = 0;
+    for (self.slots.items) |slot| {
+        if (slot) |s| {
+            if (s.clay_style.window_root) live += 1;
+        }
+    }
+    if (live >= max_window_roots) return error.TooManyWindows;
+    return self.insertLockedWithLayoutValidated(.{ .container = Container.init(std.mem.zeroes(c.SDL_FRect), false) }, null, style, null) catch |err| switch (err) {
+        error.NoSuchParent => unreachable, // parent_id is null
+        error.RegistryFull => error.RegistryFull,
+    };
+}
+
+/// Destroys a window's widget subtree and queues its OS teardown, in one
+/// locked section. Returns false (doing nothing) if `root_id` isn't a live
+/// `window_root` -- `natyv_destroy_window` reports that as an error, and
+/// `natyv_destroy_widget` falls back to an ordinary subtree destroy, so
+/// destroying a window through either call never orphans its OS window.
+pub fn destroyWindow(self: *Self, call_io: Io, root_id: u32) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const slot = self.findLocked(root_id) orelse return false;
+    if (!slot.clay_style.window_root) return false;
+    self.destroySubtreeLocked(root_id);
+    self.queueWindowTeardownLocked(root_id);
+    return true;
 }
 
 /// Main-thread side -- same drain-in-full shape as `takePendingWindowRequests`.
@@ -929,6 +1066,49 @@ pub fn takePendingWindowTeardowns(self: *Self, call_io: Io, out: []u32) usize {
     for (0..n) |i| out[i] = self.pending_window_teardowns[i].?;
     self.pending_window_teardown_count = 0;
     return n;
+}
+
+/// Worker-thread side of `pending_window_visibility`. Overflow drops the
+/// request rather than blocking -- same bounded-queue behaviour
+/// `queueWindowTeardown` already has, and a guest hiding more than
+/// `max_pending_window_requests` windows between two frames is not a real
+/// scenario.
+pub fn queueWindowVisibility(self: *Self, call_io: Io, window_id: u32, visible: bool) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.pending_window_visibility_count >= self.pending_window_visibility.len) return;
+    self.pending_window_visibility[self.pending_window_visibility_count] = .{ .window_id = window_id, .visible = visible };
+    self.pending_window_visibility_count += 1;
+}
+
+/// Main-thread side -- same drain-in-full shape as `takePendingWindowTeardowns`.
+pub fn takePendingWindowVisibility(self: *Self, call_io: Io, out: []PendingWindowVisibility) usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const n = @min(self.pending_window_visibility_count, out.len);
+    for (0..n) |i| out[i] = self.pending_window_visibility[i].?;
+    self.pending_window_visibility_count = 0;
+    return n;
+}
+
+/// Sets whether the startup window closing ends the process, and who to
+/// notify when it does not. See the fields' own doc comments.
+pub fn setQuitOnLastWindowClose(self: *Self, call_io: Io, quit: bool, notify_widget_id: u32) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    self.quit_on_last_window_close = quit;
+    self.window_close_notify_id = notify_widget_id;
+}
+
+pub const CloseBehavior = struct { quit: bool, notify_widget_id: u32 };
+
+/// Main-thread side: what should happen when the startup window's close
+/// button is pressed. Read fresh each time rather than cached, since a
+/// guest can flip it at any point in its life.
+pub fn closeBehavior(self: *Self, call_io: Io) CloseBehavior {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    return .{ .quit = self.quit_on_last_window_close, .notify_widget_id = self.window_close_notify_id };
 }
 
 /// Registers every widget kind's create-function unconditionally -- widgets
@@ -1031,6 +1211,13 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
     n += 1;
     funcs_out[n] = c.extism_function_new("natyv_get_range", &in_types[0], 1, &out_types[0], 1, HostFunctions.getRangeHostFn, self, null);
     n += 1;
+    // App lifecycle: neither acts on a widget, but both belong to the same
+    // family as natyv_clay_create_window/natyv_destroy_window, which
+    // already live here.
+    funcs_out[n] = c.extism_function_new("natyv_set_window_visible", &in_types[0], 1, &out_types[0], 1, HostFunctions.setWindowVisibleHostFn, self, null);
+    n += 1;
+    funcs_out[n] = c.extism_function_new("natyv_set_quit_on_last_window_close", &in_types[0], 1, &out_types[0], 1, HostFunctions.setQuitOnLastWindowCloseHostFn, self, null);
+    n += 1;
     return n;
 }
 
@@ -1046,7 +1233,8 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
 // real second OS window that categorically doesn't exist outside the Clay
 // backend, so it's registered here alongside its create counterpart, not in
 // registerInto's always-on block.
-pub const clay_host_function_count = 22;
+// Drawing primitives: +2 for natyv_clay_create_canvas/natyv_canvas_set.
+pub const clay_host_function_count = 24;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way `sqlite`/`network` gate their
@@ -1086,6 +1274,8 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[19] = c.extism_function_new("natyv_clay_create_spinner", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySpinnerHostFn, self, null);
     funcs_out[20] = c.extism_function_new("natyv_clay_create_window", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayWindowHostFn, self, null);
     funcs_out[21] = c.extism_function_new("natyv_destroy_window", &in_types[0], 1, &out_types[0], 1, HostFunctions.destroyWindowHostFn, self, null);
+    funcs_out[22] = c.extism_function_new("natyv_clay_create_canvas", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayCanvasHostFn, self, null);
+    funcs_out[23] = c.extism_function_new("natyv_canvas_set", &in_types[0], 1, &out_types[0], 1, HostFunctions.canvasSetHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -1093,6 +1283,27 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
 /// file's own doc comment for why it's a separate file at all.
 pub fn io(self: *Self) Io {
     return self.current_io orelse unreachable; // see file doc comment: invariant enforced by Runtime.call
+}
+
+/// Hands out an id from the same monotonic space every widget uses, without
+/// creating a widget for it. For host-side objects that are not widgets but
+/// still have to be addressable by the guest and still deliver events
+/// through the ordinary `EventQueue` -> `Dispatch` path, which is keyed on
+/// `widget_id` -- system tray entries are the first (`TrayRegistry`).
+///
+/// Sharing this counter is the point. `Dispatch` never validates an id
+/// against this registry, so a separate counter would hand a tray entry the
+/// same number as a real widget and silently route one's events to the
+/// other's handler. Drawing from here makes that collision structurally
+/// impossible instead of merely unlikely, at the cost of some ids never
+/// belonging to a slot -- which nothing here assumes, since ids are already
+/// monotonic and never reused after a destroy.
+pub fn reserveId(self: *Self, call_io: Io) u32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const id = self.next_id;
+    self.next_id += 1;
+    return id;
 }
 
 /// `pub` -- see `io`'s doc comment above.
@@ -1115,10 +1326,14 @@ fn insertLockedWithLayout(self: *Self, widget: Widget, parent_id: ?u32, clay_sty
         }
     }
     // No existing (destroyed-and-freed) slot to reuse -- grow the registry
-    // by one instead of failing. `slots` has no fixed ceiling of its own
-    // (see its own doc comment); this only returns null on a genuine
-    // allocation failure, matching the existing `id_to_index.put` failure
-    // convention just above.
+    // by one, up to `max_widgets`. `slots` itself is growable (see its own
+    // doc comment), but every snapshot/collect buffer in the runtime is
+    // sized to `max_widgets`, so growing past it would let a guest drive
+    // those buffers out of bounds -- a silent OOB write in ReleaseSmall.
+    // Refusing here surfaces as `error.RegistryFull` to the guest; null is
+    // otherwise only returned on a genuine allocation failure, matching the
+    // existing `id_to_index.put` failure convention just above.
+    if (self.slots.items.len >= max_widgets) return null;
     const idx = self.slots.items.len;
     self.slots.append(self.allocator, null) catch return null;
     const id = self.next_id;
@@ -1178,6 +1393,72 @@ pub fn insertLockedWithLayoutValidated(self: *Self, widget: Widget, parent_id: ?
     return id;
 }
 
+pub const InsertCanvasError = InsertClayError || CanvasStore.StoreError;
+
+/// Inserts a canvas widget and registers its empty drawing under the same
+/// lock hold, so a canvas slot never exists without a store entry. If the
+/// store refuses (the canvas cap, or out of memory) the slot is rolled
+/// back.
+pub fn insertCanvasLocked(self: *Self, parent_id: ?u32, clay_style: ClayStyle) InsertCanvasError!u32 {
+    const id = try self.insertLockedWithLayoutValidated(.{ .canvas = Canvas.init(std.mem.zeroes(c.SDL_FRect)) }, parent_id, clay_style, null);
+    self.canvases.add(self.allocator, id) catch |err| {
+        self.destroyIdsLocked(&.{id});
+        return err;
+    };
+    return id;
+}
+
+/// Swaps an already-built drawing into canvas `id`, taking ownership of it
+/// on success. On `error.NoSuchCanvas` (no widget, or not a canvas) the
+/// caller still owns `drawing`. Bumps `layout_generation`, the redraw
+/// gate, so the window actually redraws; the renderer then sees the new
+/// `version` and re-renders the canvas's texture.
+pub fn replaceCanvasDrawing(self: *Self, call_io: Io, id: u32, drawing: CanvasStore.Drawing) error{NoSuchCanvas}!void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    try self.canvases.replace(self.allocator, id, drawing);
+    self.layout_generation +%= 1;
+}
+
+/// The current drawing version of canvas `id`, or null if it no longer
+/// exists. Cheap: the renderer asks every frame to see whether its cached
+/// texture is stale.
+pub fn canvasVersion(self: *Self, call_io: Io, id: u32) ?u32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    return if (self.canvases.get(id)) |entry| entry.version else null;
+}
+
+/// Main thread, after layout: records canvas `id`'s laid-out size and
+/// returns whether the guest needs a `.canvas_resized` event for it. See
+/// `CanvasStore.noteSize`.
+pub fn noteCanvasSize(self: *Self, call_io: Io, id: u32, w: f32, h: f32) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    return self.canvases.noteSize(id, .{ w, h });
+}
+
+/// After a recycle: every canvas reports its size again, so the resumed
+/// guest learns the sizes its predecessor was told. Bumps the generation
+/// so the next frame runs a layout pass, which is where sizes are reported.
+pub fn forgetCanvasSizes(self: *Self, call_io: Io) void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    self.canvases.forgetSizes();
+    self.layout_generation +%= 1;
+}
+
+pub const CanvasSnapshot = struct { drawing: CanvasStore.Drawing, version: u32 };
+
+/// An owned copy of canvas `id`'s drawing, so the renderer tessellates and
+/// draws without holding the registry lock. Null if the canvas is gone.
+pub fn cloneCanvas(self: *Self, call_io: Io, id: u32, allocator: std.mem.Allocator) error{OutOfMemory}!?CanvasSnapshot {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const entry = self.canvases.get(id) orelse return null;
+    return .{ .drawing = try entry.drawing.clone(allocator), .version = entry.version };
+}
+
 /// Locked read of `layout_generation` -- L4's render-loop pass calls this
 /// once per frame to decide whether a real Clay recompute is needed at all.
 pub fn currentGeneration(self: *Self, call_io: Io) u64 {
@@ -1226,6 +1507,7 @@ pub fn deinit(self: *Self) void {
     self.id_to_index.deinit(self.allocator);
     self.slots.deinit(self.allocator);
     self.pending_text_destroys.deinit(self.allocator);
+    self.canvases.deinit(self.allocator);
 }
 
 /// F3: creates/updates every button/textfield/label's cached `TTF_Text`
@@ -1255,32 +1537,49 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
         if (slot.*) |*s| {
             if (std.mem.indexOfScalar(u32, allowed_ids, s.id) == null) continue;
             switch (s.widget) {
-                .button => |*b| {
-                    // Real button auto-width (2026-09-02): a `width: fit`
-                    // button's own real size depends on `b.measured_width`,
-                    // which only changes right here, on a real resync
-                    // (`sync_count` bump) -- but text syncing has always
-                    // been orthogonal to `layout_generation` (Clay has no
-                    // idea text exists at all, see ClayLayout.zig's own
-                    // header comment), so without this, a *second* real
-                    // relayout picking up the corrected width would simply
-                    // never happen: the first-ever layout pass for a new
-                    // Fit-width button runs *before* its first text sync
-                    // (see main.zig's own frame ordering), so it always
-                    // measures 0 and nothing would ever ask Clay to try
-                    // again. Scoped to Fit-width buttons specifically --
-                    // a Fixed/Grow button's own width never depends on
-                    // measured_width, so its own text changes have nothing
-                    // new to relayout for.
-                    const before = b.sync_count;
-                    b.syncText(engine, font);
-                    if (b.sync_count != before and s.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT) {
+                // A Fit-sized widget whose size comes from its own text
+                // has a real ordering problem: the first layout pass for a
+                // newly created widget runs *before* its first text sync
+                // (see main.zig's frame ordering), so it measures 0, and
+                // text syncing is otherwise orthogonal to
+                // `layout_generation` -- Clay has no idea text exists at
+                // all, see ClayLayout.zig's header comment. Without a bump
+                // here, the corrected size is measured but nothing ever
+                // asks Clay to lay out again, and the widget stays at 0
+                // forever.
+                //
+                // Generalized from the Button-width-only version: it now
+                // covers height too, and Label as well as Button. Height
+                // matters for a second reason beyond first-sync ordering --
+                // a Label's wrap width tracks its rect, so a resize changes
+                // the line count and therefore the measured height with no
+                // text change at all.
+                //
+                // Compares the measurement itself rather than a sync
+                // counter, so a resync that produced an identical size
+                // costs no relayout. Scoped to axes actually sized Fit: a
+                // Fixed or Grow axis never depends on the measurement, so
+                // its text changes have nothing to relayout for.
+                .button, .label => {
+                    const before = s.widget.measuredText();
+                    switch (s.widget) {
+                        .button => |*b| b.syncText(engine, font),
+                        .label => |*l| l.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
+                        else => unreachable,
+                    }
+                    const after = s.widget.measuredText();
+                    const w_changed = (before == null) != (after == null) or
+                        (before != null and after != null and before.?.w != after.?.w);
+                    const h_changed = (before == null) != (after == null) or
+                        (before != null and after != null and before.?.h != after.?.h);
+                    const fit_w = s.clay_style.sizing.width.type == c.CLAY__SIZING_TYPE_FIT;
+                    const fit_h = s.clay_style.sizing.height.type == c.CLAY__SIZING_TYPE_FIT;
+                    if ((w_changed and fit_w) or (h_changed and fit_h)) {
                         self.layout_generation +%= 1;
                     }
                 },
                 .textfield => |*t| t.syncText(engine, font),
                 .textarea => |*ta| ta.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
-                .label => |*l| l.syncText(engine, font, effectiveTextPadding(s.clay_style.padding)),
                 .checkbox => |*cb| cb.syncText(engine, font),
                 .toggle => |*tg| tg.syncText(engine, font),
                 .radio_button => |*r| r.syncText(engine, font),
@@ -1288,7 +1587,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .numeric_stepper => |*ns| ns.syncText(engine, font),
                 .segmented_control => |*sc| sc.syncText(engine, font),
                 .tabs => |*tb| tb.syncText(engine, font),
-                .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
+                .container, .progress_bar, .slider, .range_slider, .divider, .spinner, .canvas => {},
             }
         }
     }
@@ -1316,7 +1615,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .numeric_stepper => |*ns| ns.destroyText(),
                 .segmented_control => |*sc| sc.destroyText(),
                 .tabs => |*tb| tb.destroyText(),
-                .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
+                .container, .progress_bar, .slider, .range_slider, .divider, .spinner, .canvas => {},
             }
         }
     }
@@ -1348,6 +1647,7 @@ pub fn destroyExpiredWidgets(self: *Self, call_io: Io, now_ms: i64) void {
         if (maybe_slot) |s| {
             if (s.expires_at_ms) |exp| {
                 if (now_ms >= exp) {
+                    if (expired_count >= expired_roots.len) break;
                     expired_roots[expired_count] = s.id;
                     expired_count += 1;
                 }
@@ -1384,11 +1684,12 @@ pub fn hasPendingExpiry(self: *Self, call_io: Io) bool {
 /// shared by `destroySubtreeLocked` (root + descendants) and
 /// `destroyDescendantsLocked` (descendants only, root kept alive), so
 /// both stay in sync with exactly one real traversal implementation.
-fn collectDescendantsLocked(self: *Self, root_id: u32, out: *[max_widgets]u32) usize {
+fn collectDescendantsLocked(self: *Self, root_id: u32, out: []u32) usize {
     var count: usize = 0;
     for (self.slots.items) |maybe_slot| {
         if (maybe_slot) |s| {
             if (s.id != root_id and self.isDescendantLocked(s.id, root_id)) {
+                if (count >= out.len) break;
                 out[count] = s.id;
                 count += 1;
             }
@@ -1425,6 +1726,7 @@ fn destroyIdsLocked(self: *Self, ids: []const u32) void {
                     // claim about a function whose only real caller had
                     // never actually exercised the worker-thread path.
                     self.queueWidgetTextDestroysLocked(&s.widget);
+                    if (s.widget == .canvas) self.canvases.remove(self.allocator, s.id);
                     if (s.clay_managed) self.layout_generation +%= 1;
                     _ = self.id_to_index.remove(s.id);
                     slot.* = null;
@@ -1445,7 +1747,10 @@ fn destroyIdsLocked(self: *Self, ids: []const u32) void {
 /// descendant behind.
 fn destroySubtreeLocked(self: *Self, root_id: u32) void {
     var to_destroy: [max_widgets]u32 = undefined;
-    var count = self.collectDescendantsLocked(root_id, &to_destroy);
+    // Last entry reserved for `root_id` itself -- with the registry capped
+    // at `max_widgets` live widgets, the root plus its descendants always
+    // fit exactly.
+    var count = self.collectDescendantsLocked(root_id, to_destroy[0 .. to_destroy.len - 1]);
     to_destroy[count] = root_id;
     count += 1;
     self.destroyIdsLocked(to_destroy[0..count]);
@@ -1484,6 +1789,7 @@ fn destroyDescendantsExceptLocked(self: *Self, root_id: u32, except_id: u32) voi
                 self.isDescendantLocked(s.id, root_id) and
                 !self.isDescendantLocked(s.id, except_id))
             {
+                if (count >= to_destroy.len) break;
                 to_destroy[count] = s.id;
                 count += 1;
             }
@@ -1629,7 +1935,7 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .segmented_control => |*sc| for (0..sc.count) |i| self.queuePendingTextDestroy(&sc.text_objs[i]),
         // W19: same "up to max_tabs text objects" shape as SegmentedControl.
         .tabs => |*tb| for (0..tb.count) |i| self.queuePendingTextDestroy(&tb.text_objs[i]),
-        .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
+        .container, .progress_bar, .slider, .range_slider, .divider, .spinner, .canvas => {},
     }
 }
 
@@ -1723,12 +2029,18 @@ pub fn snapshot(self: *Self, call_io: Io, out: []Slot) usize {
 /// literal newline into a focused textarea (`appendTextTo(io, id, "\n",
 /// ...)`), not a separate mechanism -- a newline is just another string to
 /// append, from this function's point of view.
-pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8) ?usize {
+/// Renamed from `appendTextTo` -- now inserts at the widget's own cursor
+/// (deleting its selection first, if any) rather than always appending to
+/// the end. When there's no selection and `cursor == len` (the default,
+/// untouched-by-the-user state), behavior is identical to the old
+/// append-to-end, so every existing caller that never moves the cursor is
+/// unaffected.
+pub fn insertTextAt(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
     if (self.findLocked(id)) |slot| {
         if (slot.widget == .textfield) {
-            slot.widget.textfield.appendText(s);
+            slot.widget.textfield.insertAt(s);
             // FIT-sized Clay nodes size themselves from content -- a text
             // change can change a Clay-managed widget's geometry, so it
             // needs to force a recompute. A legacy (non-Clay) textfield's
@@ -1738,7 +2050,7 @@ pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8)
             @memcpy(out[0..text.len], text);
             return text.len;
         } else if (slot.widget == .textarea) {
-            slot.widget.textarea.appendText(s);
+            slot.widget.textarea.insertAt(s);
             if (slot.clay_managed) self.layout_generation +%= 1;
             const text = slot.widget.textarea.text();
             @memcpy(out[0..text.len], text);
@@ -1748,8 +2060,11 @@ pub fn appendTextTo(self: *Self, call_io: Io, id: u32, s: []const u8, out: []u8)
     return null;
 }
 
-/// W6: see `appendTextTo`'s doc comment -- same shape. W10: `.textarea`
-/// joins `.textfield` here too, same reasoning.
+/// W6: see `insertTextAt`'s doc comment -- same shape. W10: `.textarea`
+/// joins `.textfield` here too, same reasoning. The widget-level
+/// `backspace()` itself became cursor-aware (deletes the selection if any,
+/// else one codepoint before the cursor) without needing a name change
+/// here -- it's still accurate to what the Backspace key does.
 pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
     self.mutex.lockUncancelable(call_io);
     defer self.mutex.unlock(call_io);
@@ -1766,6 +2081,207 @@ pub fn backspaceOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
             const text = slot.widget.textarea.text();
             @memcpy(out[0..text.len], text);
             return text.len;
+        }
+    }
+    return null;
+}
+
+/// The Delete/Fn+Delete key -- mirrors `backspaceOn` exactly, in the other
+/// direction.
+pub fn deleteForwardOn(self: *Self, call_io: Io, id: u32, out: []u8) ?usize {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        if (slot.widget == .textfield) {
+            slot.widget.textfield.deleteForward();
+            if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textfield.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
+        } else if (slot.widget == .textarea) {
+            slot.widget.textarea.deleteForward();
+            if (slot.clay_managed) self.layout_generation +%= 1;
+            const text = slot.widget.textarea.text();
+            @memcpy(out[0..text.len], text);
+            return text.len;
+        }
+    }
+    return null;
+}
+
+/// Arrow-key cursor movement for a focused TextField/TextArea. `direction`
+/// mirrors each widget's own `CursorDirection`; `extend` is Shift held.
+/// Returns whether anything actually changed -- callers use this to decide
+/// whether to bump `layout_generation` (cursor/selection changes affect
+/// drawn state -- the caret, the highlight -- without changing text
+/// content or Clay geometry, so this is a separate decision from the
+/// `slot.clay_managed`-gated bump `insertTextAt`/`backspaceOn` do).
+pub fn moveCursorOn(self: *Self, call_io: Io, id: u32, direction: TextCursorDirection, extend: bool) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        const changed = switch (slot.widget) {
+            .textfield => |*t| t.moveCursor(direction, extend),
+            .textarea => |*ta| ta.moveCursor(direction, extend),
+            else => false,
+        };
+        if (changed) self.layout_generation +%= 1;
+        return changed;
+    }
+    return false;
+}
+
+/// The click/click-drag hit test: positions a focused TextField/TextArea's
+/// cursor against its own synced `TTF_Text` object. `local_x`/`local_y`
+/// must already be in the text object's own local space (screen position
+/// minus the widget's draw origin -- see FrameLoop.zig's call sites, which
+/// mirror each widget's own real draw-position formula, since TextField
+/// centers vertically and TextArea anchors top-left). `.set_both` is a
+/// plain click (collapses to a caret at the clicked offset); `.extend` is
+/// drag continuation (moves the cursor, leaves the anchor from the
+/// original down-click in place). Falls back to the nearest end (0 or
+/// `len`, whichever half of the rect was clicked) when `text_obj` hasn't
+/// been synced yet -- e.g. a click on the very first frame after creation,
+/// before any render pass has run.
+pub const CursorPositionMode = enum { set_both, extend };
+
+pub fn positionCursorAt(self: *Self, call_io: Io, id: u32, local_x: f32, local_y: f32, mode: CursorPositionMode) bool {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        if (slot.widget == .textfield) {
+            return positionCursorAtTextField(&slot.widget.textfield, local_x, local_y, mode, self);
+        } else if (slot.widget == .textarea) {
+            return positionCursorAtTextArea(&slot.widget.textarea, local_x, local_y, mode, self);
+        }
+    }
+    return false;
+}
+
+/// `clay_managed` is deliberately not consulted here (unlike
+/// `insertTextAt`/`backspaceOn`'s gated bump) -- cursor/selection changes
+/// are purely visual (the caret, the highlight), never affecting Clay
+/// geometry, the same category `setFocused`'s own unconditional bump
+/// already covers for the focus ring.
+fn positionCursorAtTextField(t: *TextField, local_x: f32, local_y: f32, mode: CursorPositionMode, self: *Self) bool {
+    const offset: usize = blk: {
+        // `t.len > 0` guards against a zero-length `text_obj` -- see
+        // TextField.syncText's own doc comment for the real crash this
+        // fixes: TTF_CreateText mishandling a zero-length string. `len ==
+        // 0` implies `text_obj == null` now (syncText destroys it), but
+        // checking both here is cheap and matches drawDecorations's own
+        // belt-and-suspenders posture, not just relying on that invariant.
+        if (t.len > 0 and t.text_obj != null) {
+            const obj = t.text_obj.?;
+            var sub: c.TTF_SubString = undefined;
+            if (c.TTF_GetTextSubStringForPoint(obj, std.math.lossyCast(c_int, local_x), std.math.lossyCast(c_int, local_y), &sub)) {
+                break :blk @intCast(@max(0, sub.offset));
+            }
+        }
+        break :blk if (local_x <= t.rect.w / 2) 0 else t.len;
+    };
+    const old_cursor = t.cursor;
+    const old_anchor = t.selection_anchor;
+    switch (mode) {
+        .set_both => {
+            t.cursor = offset;
+            t.selection_anchor = offset;
+        },
+        .extend => t.cursor = offset,
+    }
+    const changed = t.cursor != old_cursor or t.selection_anchor != old_anchor;
+    if (changed) self.layout_generation +%= 1;
+    return changed;
+}
+
+fn positionCursorAtTextArea(ta: *TextArea, local_x: f32, local_y: f32, mode: CursorPositionMode, self: *Self) bool {
+    const offset: usize = blk: {
+        // See positionCursorAtTextField's identical guard -- TextArea's own
+        // syncText already had this zero-length protection before this
+        // change, but checking `len > 0` here too matches the same
+        // belt-and-suspenders posture, not just trusting that invariant.
+        if (ta.len > 0 and ta.text_obj != null) {
+            const obj = ta.text_obj.?;
+            var sub: c.TTF_SubString = undefined;
+            if (c.TTF_GetTextSubStringForPoint(obj, std.math.lossyCast(c_int, local_x), std.math.lossyCast(c_int, local_y), &sub)) {
+                break :blk @intCast(@max(0, sub.offset));
+            }
+        }
+        break :blk if (local_y <= ta.rect.h / 2) 0 else ta.len;
+    };
+    const old_cursor = ta.cursor;
+    const old_anchor = ta.selection_anchor;
+    switch (mode) {
+        .set_both => {
+            ta.cursor = offset;
+            ta.selection_anchor = offset;
+        },
+        .extend => ta.cursor = offset,
+    }
+    const changed = ta.cursor != old_cursor or ta.selection_anchor != old_anchor;
+    if (changed) self.layout_generation +%= 1;
+    return changed;
+}
+
+/// Clipboard copy: the selected range if one is active, else the whole
+/// field -- a harmless, convenient fallback for "nothing selected."
+pub fn clipboardCopy(self: *Self, call_io: Io, id: u32, out: []u8) ?[]const u8 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        switch (slot.widget) {
+            .textfield => |*t| {
+                const text = if (t.selectionRange()) |r| t.text()[r.start..r.end] else t.text();
+                @memcpy(out[0..text.len], text);
+                return out[0..text.len];
+            },
+            .textarea => |*ta| {
+                const text = if (ta.selectionRange()) |r| ta.text()[r.start..r.end] else ta.text();
+                @memcpy(out[0..text.len], text);
+                return out[0..text.len];
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// Clipboard cut: only meaningful, and only mutates, when a selection is
+/// active -- deliberately a no-op (not "cut everything") otherwise, since
+/// Copy defaulting to "everything" is a harmless read; Cut doing the same
+/// would make a mis-typed Cmd+X quietly destructive. Returns both the cut
+/// text (for the OS clipboard) and the field's own remaining text (for the
+/// caller's `text_changed` notification) from one lock/mutate pass, rather
+/// than making the caller take a second lock just to re-read post-cut
+/// content.
+pub fn clipboardCut(self: *Self, call_io: Io, id: u32, cut_out: []u8, remaining_out: []u8) ?struct { cut: []const u8, remaining: []const u8 } {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    if (self.findLocked(id)) |slot| {
+        switch (slot.widget) {
+            .textfield => |*t| {
+                const range = t.selectionRange() orelse return null;
+                const cut_text = t.text()[range.start..range.end];
+                @memcpy(cut_out[0..cut_text.len], cut_text);
+                const cut_len = cut_text.len;
+                t.deleteSelection();
+                if (slot.clay_managed) self.layout_generation +%= 1;
+                const remaining = t.text();
+                @memcpy(remaining_out[0..remaining.len], remaining);
+                return .{ .cut = cut_out[0..cut_len], .remaining = remaining_out[0..remaining.len] };
+            },
+            .textarea => |*ta| {
+                const range = ta.selectionRange() orelse return null;
+                const cut_text = ta.text()[range.start..range.end];
+                @memcpy(cut_out[0..cut_text.len], cut_text);
+                const cut_len = cut_text.len;
+                ta.deleteSelection();
+                if (slot.clay_managed) self.layout_generation +%= 1;
+                const remaining = ta.text();
+                @memcpy(remaining_out[0..remaining.len], remaining);
+                return .{ .cut = cut_out[0..cut_len], .remaining = remaining_out[0..remaining.len] };
+            },
+            else => return null,
         }
     }
     return null;
@@ -2231,12 +2747,116 @@ test "setText only bumps layout_generation on a real content change" {
     try std.testing.expect(host.layout_generation != gen1);
 }
 
+test "registry refuses inserts past max_widgets" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    const root = host.insertWithLayout(test_io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}).?;
+    for (0..max_widgets - 1) |_| {
+        try std.testing.expect(host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, root, .{}) != null);
+    }
+    try std.testing.expect(host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, root, .{}) == null);
+    try std.testing.expectEqual(@as(usize, max_widgets), host.slots.items.len);
+}
+
+test "destroying a parent at the max_widgets cap stays in bounds and frees every slot" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    // Previously 2049 widgets (root + max_widgets children) overran
+    // destroySubtreeLocked's `to_destroy` -- a Debug panic, a silent OOB
+    // write in ReleaseSmall.
+    const root = host.insertWithLayout(test_io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}).?;
+    for (0..max_widgets) |_| {
+        _ = host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, root, .{});
+    }
+
+    host.mutex.lockUncancelable(test_io);
+    host.destroySubtreeLocked(root);
+    host.mutex.unlock(test_io);
+
+    try std.testing.expect(host.findLocked(root) == null);
+    for (host.slots.items) |slot| try std.testing.expect(slot == null);
+    try std.testing.expectEqual(@as(u32, 0), host.id_to_index.count());
+}
+
 test "setText on an unknown widget id returns false" {
     var host = Self{ .allocator = std.testing.allocator };
     defer host.deinit();
     const test_io = std.testing.io;
 
     try std.testing.expect(!host.setText(test_io, 999, "x"));
+}
+
+// `WidgetHostFunctions.zig` is only reached through registerInto's function
+// table, which no test calls, so its own `test` blocks never ran.
+test {
+    _ = HostFunctions;
+}
+
+fn testWindowRequest(widget_id: u32) PendingWindowRequest {
+    return .{ .widget_id = widget_id, .title_buf = undefined, .title_len = 0, .width = 100, .height = 100 };
+}
+
+test "insertWindowRoot refuses past max_window_roots, and destroying one frees a spot" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    var ids: [max_window_roots]u32 = undefined;
+    for (&ids) |*id| id.* = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    try std.testing.expectError(error.TooManyWindows, host.insertWindowRoot(test_io, .{ .window_root = true }));
+
+    // Ordinary widgets don't count against the window cap.
+    try std.testing.expect(host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, ids[0], .{}) != null);
+
+    try std.testing.expect(host.destroyWindow(test_io, ids[0]));
+    _ = try host.insertWindowRoot(test_io, .{ .window_root = true });
+}
+
+test "destroyWindow only accepts a live window_root" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    const plain = host.insertWithLayout(test_io, .{ .container = Container.init(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, false) }, null, .{}).?;
+    try std.testing.expect(!host.destroyWindow(test_io, plain));
+    try std.testing.expect(!host.destroyWindow(test_io, 999));
+    try std.testing.expect(host.findLocked(plain) != null);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_window_teardown_count);
+}
+
+test "destroying a window before its request drains cancels the request instead of orphaning it" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    const a = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    const b = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    const w = try host.insertWindowRoot(test_io, .{ .window_root = true });
+    try std.testing.expect(host.queueWindowRequest(test_io, testWindowRequest(a)));
+    try std.testing.expect(host.queueWindowRequest(test_io, testWindowRequest(b)));
+    try std.testing.expect(host.queueWindowRequest(test_io, testWindowRequest(w)));
+
+    // main.zig drains teardowns before requests, so a queued teardown for b
+    // would find no window yet and b's request would then create one for a
+    // widget that no longer exists.
+    try std.testing.expect(host.destroyWindow(test_io, b));
+    try std.testing.expectEqual(@as(usize, 0), host.pending_window_teardown_count);
+
+    var reqs: [max_pending_window_requests]PendingWindowRequest = undefined;
+    const n = host.takePendingWindowRequests(test_io, &reqs);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(a, reqs[0].widget_id);
+    try std.testing.expectEqual(w, reqs[1].widget_id);
+
+    // Once the request has drained, the OS window exists and needs a real teardown.
+    try std.testing.expect(host.destroyWindow(test_io, a));
+    var teardowns: [max_pending_window_requests]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), host.takePendingWindowTeardowns(test_io, &teardowns));
+    try std.testing.expectEqual(a, teardowns[0]);
 }
 
 /// Real widget-kind dispatch + change-detection lives here (mirrors
@@ -2266,10 +2886,91 @@ pub fn setText(self: *Self, call_io: Io, id: u32, text_value: []const u8) bool {
         // labels (W19: same for Tabs) are set once at creation with no v1
         // API to change them afterward -- not an error, just doesn't apply,
         // same precedent as Container/ProgressBar/Slider/Divider here.
-        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => false,
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner, .canvas => false,
     };
     self.mutex.unlock(call_io);
 
     if (changed and slot.clay_managed) self.layout_generation +%= 1;
     return true;
+}
+
+test "insertCanvasLocked: the canvas cap rolls back the slot, and destroying a canvas frees its drawing and a cap spot" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    host.mutex.lockUncancelable(test_io);
+    var ids: [CanvasStore.max_canvases]u32 = undefined;
+    for (&ids) |*id| id.* = try host.insertCanvasLocked(null, .{});
+    const slots_before = host.id_to_index.count();
+    try std.testing.expectError(error.LimitExceeded, host.insertCanvasLocked(null, .{}));
+    try std.testing.expectEqual(slots_before, host.id_to_index.count());
+    try std.testing.expectError(error.NoSuchParent, host.insertCanvasLocked(999_999, .{}));
+    host.mutex.unlock(test_io);
+
+    var diag: CanvasStore.Diagnostic = .{};
+    const drawing = try CanvasStore.build(std.testing.allocator, &.{.{ .circle = .{ .cx = 1, .cy = 1, .r = 1, .fill = .{ .r = 0, .g = 0, .b = 0 } } }}, &diag);
+    try host.replaceCanvasDrawing(test_io, ids[0], drawing);
+
+    try std.testing.expect(host.destroyWidgetSubtree(test_io, ids[0]));
+    try std.testing.expect(host.canvasVersion(test_io, ids[0]) == null);
+    host.mutex.lockUncancelable(test_io);
+    defer host.mutex.unlock(test_io);
+    _ = try host.insertCanvasLocked(null, .{});
+}
+
+test "replaceCanvasDrawing bumps the redraw gate and the version, and rejects a non-canvas id" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    host.mutex.lockUncancelable(test_io);
+    const id = try host.insertCanvasLocked(null, .{});
+    host.mutex.unlock(test_io);
+    const label = host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, null, .{}).?;
+
+    var diag: CanvasStore.Diagnostic = .{};
+    var drawing = try CanvasStore.build(std.testing.allocator, &.{}, &diag);
+    try std.testing.expectError(error.NoSuchCanvas, host.replaceCanvasDrawing(test_io, label, drawing));
+    drawing.deinit(std.testing.allocator);
+
+    const gen = host.currentGeneration(test_io);
+    try host.replaceCanvasDrawing(test_io, id, try CanvasStore.build(std.testing.allocator, &.{}, &diag));
+    try std.testing.expect(host.currentGeneration(test_io) != gen);
+    try std.testing.expectEqual(@as(?u32, 1), host.canvasVersion(test_io, id));
+
+    const snap = (try host.cloneCanvas(test_io, id, std.testing.allocator)).?;
+    var copy = snap.drawing;
+    copy.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), snap.version);
+    try std.testing.expect((try host.cloneCanvas(test_io, label, std.testing.allocator)) == null);
+}
+
+test "noteCanvasSize reports each new size once, and forgetCanvasSizes re-arms it and bumps the redraw gate" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    host.mutex.lockUncancelable(test_io);
+    const id = try host.insertCanvasLocked(null, .{});
+    host.mutex.unlock(test_io);
+
+    try std.testing.expect(host.noteCanvasSize(test_io, id, 100, 50));
+    try std.testing.expect(!host.noteCanvasSize(test_io, id, 100, 50));
+    try std.testing.expect(host.noteCanvasSize(test_io, id, 120, 50));
+    try std.testing.expect(!host.noteCanvasSize(test_io, 999_999, 1, 1));
+
+    const gen = host.currentGeneration(test_io);
+    host.forgetCanvasSizes(test_io);
+    try std.testing.expect(host.currentGeneration(test_io) != gen);
+    try std.testing.expect(host.noteCanvasSize(test_io, id, 120, 50));
+}
+
+test "Canvas.containsPoint: left/top edges are inside, right/bottom edges are not" {
+    const cv = Canvas.init(.{ .x = 10, .y = 20, .w = 100, .h = 50 });
+    try std.testing.expect(cv.containsPoint(10, 20));
+    try std.testing.expect(cv.containsPoint(109.5, 69.5));
+    try std.testing.expect(!cv.containsPoint(110, 40));
+    try std.testing.expect(!cv.containsPoint(50, 70));
+    try std.testing.expect(!cv.containsPoint(9.9, 40));
 }

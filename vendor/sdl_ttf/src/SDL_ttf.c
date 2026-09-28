@@ -1188,6 +1188,11 @@ static bool Render_Line_##NAME(TTF_Font *font, SDL_Surface *textbuf, int xstart,
             int remainder;                                                                                              \
             Uint8 *saved_buffer = image->buffer;                                                                        \
             int saved_width = image->width;                                                                             \
+            /* Backported from upstream: a glyph with no bitmap (e.g. a space) has a                                    \
+               NULL buffer, and offsetting it is UB that UBSan traps in Debug. */                                       \
+            if (image->buffer == NULL) {                                                                                \
+                continue;                                                                                               \
+            }                                                                                                           \
             image->buffer += alignment;                                                                                 \
             /* Position updated after glyph rendering */                                                                \
             x = xstart + FT_FLOOR(x) + image->left;                                                                     \

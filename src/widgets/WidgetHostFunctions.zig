@@ -24,6 +24,7 @@
 //! here (`zig build`/`zig build test` both pass with this exact cycle).
 
 const std = @import("std");
+const text_cursor = @import("text_cursor.zig");
 const c = @import("../c.zig").c;
 const host_fn_util = @import("../host_fn_util.zig");
 const timing = @import("../timing.zig");
@@ -48,6 +49,7 @@ const Tabs = @import("Tabs.zig");
 
 const WidgetHost = @import("WidgetHost.zig");
 const Self = WidgetHost;
+const CanvasStore = WidgetHost.CanvasStore;
 const Widget = WidgetHost.Widget;
 const ClayStyle = WidgetHost.ClayStyle;
 
@@ -189,6 +191,7 @@ const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: 
 const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClayRangeSliderRequest = struct { layout: ClayLayoutRequest = .{}, min: f32 = 0, max: f32 = 1, step: f32 = 0 };
 const ClaySpinnerRequest = struct { layout: ClayLayoutRequest = .{} };
+const ClayCanvasRequest = struct { layout: ClayLayoutRequest = .{} };
 const ClayNumericStepperRequest = struct { layout: ClayLayoutRequest = .{}, value: i32 = 0, min: i32 = 0, max: i32 = 100, step: i32 = 1, wrap: bool = false };
 const ClaySegmentedControlRequest = struct { layout: ClayLayoutRequest = .{}, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 const ClayTabsRequest = struct { layout: ClayLayoutRequest = .{}, labels: []const []const u8 = &.{}, selected_index: usize = 0 };
@@ -320,10 +323,76 @@ fn parseRequest(comptime T: type, self: *Self, plugin: ?*c.ExtismCurrentPlugin, 
     };
     defer self.allocator.free(input_bytes);
 
-    return std.json.parseFromSlice(T, self.allocator, input_bytes, .{ .allocate = .alloc_always }) catch |err| {
+    const parsed = std.json.parseFromSlice(T, self.allocator, input_bytes, .{ .allocate = .alloc_always }) catch |err| {
         host_fn_util.writeErrorJson(plugin, out_val, "bad request: {}", .{err});
         return null;
     };
+    if (!allFinite(parsed.value)) {
+        parsed.deinit();
+        host_fn_util.writeErrorJson(plugin, out_val, "bad request: numbers must be finite", .{});
+        return null;
+    }
+    return parsed;
+}
+
+/// `std.json` parses an out-of-range literal like `1e999` as `inf` (it only
+/// rejects a bare `NaN`), and `inf` -- or the NaN that `inf * 0` makes of it
+/// downstream -- is illegal behavior once it reaches `@intFromFloat`. So
+/// every request is walked once here and any non-finite float rejects the
+/// whole call, the same way a malformed request does.
+pub fn allFinite(value: anytype) bool {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .float => return std.math.isFinite(value),
+        .@"struct" => |s| {
+            inline for (s.fields) |f| {
+                if (!allFinite(@field(value, f.name))) return false;
+            }
+            return true;
+        },
+        .optional => return if (value) |v| allFinite(v) else true,
+        .array => {
+            for (value) |v| if (!allFinite(v)) return false;
+            return true;
+        },
+        .pointer => |p| {
+            if (p.size != .slice or comptime !containsFloat(p.child)) return true;
+            for (value) |v| if (!allFinite(v)) return false;
+            return true;
+        },
+        else => return true,
+    }
+}
+
+fn containsFloat(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .float => true,
+        .@"struct" => |s| blk: {
+            for (s.fields) |f| if (containsFloat(f.type)) break :blk true;
+            break :blk false;
+        },
+        .optional => |o| containsFloat(o.child),
+        .array => |a| containsFloat(a.child),
+        .pointer => |p| p.size == .slice and containsFloat(p.child),
+        else => false,
+    };
+}
+
+test "allFinite rejects inf anywhere in a request, including nested and optional fields" {
+    try std.testing.expect(allFinite(ClayContainerRequest{}));
+    try std.testing.expect(allFinite(SetStyleRequest{ .widget_id = 1, .corner_radius = .{ 1, 2, 3, 4 } }));
+
+    const inf = std.math.inf(f32);
+    try std.testing.expect(!allFinite(SetValueRequest{ .widget_id = 1, .value = inf }));
+    try std.testing.expect(!allFinite(ClayContainerRequest{ .layout = .{ .sizing = .{ .width = .{ .min = inf } } } }));
+    try std.testing.expect(!allFinite(SetStyleRequest{ .widget_id = 1, .corner_radius = .{ 0, 0, -inf, 0 } }));
+    try std.testing.expect(!allFinite(SetStyleRequest{ .widget_id = 1, .gradient = .{ .start_pos = .{ 0, 0 }, .start_color = .{ .r = 0, .g = 0, .b = 0 }, .end_pos = .{ 1, 1 }, .end_color = .{ .r = inf, .g = 0, .b = 0 } } }));
+    try std.testing.expect(!allFinite(ClayWindowRequest{ .width = std.math.nan(f32) }));
+
+    // The real wire path: `1e999` is how a guest actually produces inf.
+    const parsed = try std.json.parseFromSlice(SetValueRequest, std.testing.allocator, "{\"widget_id\":1,\"value\":1e999}", .{});
+    defer parsed.deinit();
+    try std.testing.expect(!allFinite(parsed.value));
 }
 
 pub fn createButtonHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
@@ -775,6 +844,92 @@ pub fn createClaySpinnerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]cons
     insertClayWidget(self, plugin, &outputs[0], .{ .spinner = spinner }, parsed.value.layout, null);
 }
 
+/// Not routed through `insertClayWidget`: a canvas also needs its entry in
+/// `WidgetHost.canvases`, added under the same lock hold as the slot (see
+/// `insertCanvasLocked`), and has one more way to fail -- the canvas cap.
+pub fn createClayCanvasHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayCanvasRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const layout = parsed.value.layout;
+    const style = toClayStyle(layout);
+    const call_io = self.io();
+    self.mutex.lockUncancelable(call_io);
+    const result = self.insertCanvasLocked(layout.parent_id, style);
+    self.mutex.unlock(call_io);
+
+    const widget_id = result catch |err| {
+        switch (err) {
+            error.NoSuchParent => host_fn_util.writeErrorJson(plugin, &outputs[0], "no such parent widget {d}", .{layout.parent_id.?}),
+            error.RegistryFull => host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{}),
+            error.LimitExceeded => host_fn_util.writeErrorJson(plugin, &outputs[0], "canvas limit reached ({d})", .{CanvasStore.max_canvases}),
+            error.OutOfMemory => host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory", .{}),
+            // Widget ids are never reused while a slot holds them, and the
+            // store entry goes with the slot, so this can't happen -- but
+            // it's reported rather than asserted.
+            error.AlreadyExists, error.NoSuchCanvas => host_fn_util.writeErrorJson(plugin, &outputs[0], "canvas already exists", .{}),
+        }
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+/// `natyv_canvas_set`: replaces a canvas's whole drawing (wire format in
+/// `CanvasStore.zig`'s header). Parsing and validation -- up to 4 MiB and
+/// 8,192 commands -- run outside the registry lock; the lock is held only
+/// for the swap. Not `parseRequest`: the size is checked before the input
+/// is even copied out of guest memory, and a rejection names the offending
+/// command.
+pub fn canvasSetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const handle: u64 = @intCast(inputs[0].v.i64);
+    if (c.extism_current_plugin_memory_length(plugin, handle) > CanvasStore.max_request_bytes) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "bad request: request too large", .{});
+        return;
+    }
+    const input_bytes = host_fn_util.readGuestBytes(self.allocator, plugin, &inputs[0]) catch {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory reading input", .{});
+        return;
+    };
+    defer self.allocator.free(input_bytes);
+
+    var diag: CanvasStore.Diagnostic = .{};
+    const parsed = CanvasStore.parseSetRequest(self.allocator, input_bytes, &diag) catch |err| {
+        writeCanvasError(plugin, &outputs[0], err, diag);
+        return;
+    };
+    defer parsed.deinit();
+    var drawing = CanvasStore.build(self.allocator, parsed.value.commands, &diag) catch |err| {
+        writeCanvasError(plugin, &outputs[0], err, diag);
+        return;
+    };
+    self.replaceCanvasDrawing(self.io(), parsed.value.widget_id, drawing) catch {
+        drawing.deinit(self.allocator);
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such canvas {d}", .{parsed.value.widget_id});
+        return;
+    };
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// `diag.reason` is always a static string (see `CanvasStore.Diagnostic`),
+/// so it's safe through `writeErrorJson`, which doesn't escape.
+fn writeCanvasError(plugin: ?*c.ExtismCurrentPlugin, out_val: *allowzero c.ExtismVal, err: CanvasStore.BuildError, diag: CanvasStore.Diagnostic) void {
+    switch (err) {
+        error.OutOfMemory => host_fn_util.writeErrorJson(plugin, out_val, "out of memory", .{}),
+        error.Invalid => if (diag.command) |index| {
+            host_fn_util.writeErrorJson(plugin, out_val, "bad request: command {d}: {s}", .{ index, diag.reason });
+        } else {
+            host_fn_util.writeErrorJson(plugin, out_val, "bad request: {s}", .{diag.reason});
+        },
+    }
+}
+
 pub fn createClayNumericStepperHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -914,7 +1069,7 @@ pub fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
         .badge => |bd| bd.label(),
-        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => "",
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner, .canvas => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1206,8 +1361,8 @@ pub fn setValueHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
         // Slider above -- round-trips through f32 (the wire's only
         // numeric type), fine for the small integer ranges either of
         // these widgets deals in.
-        .numeric_stepper => |*ns| ns.setValue(@intFromFloat(req.value)),
-        .segmented_control => |*sc| sc.select(@intFromFloat(@max(0, req.value))),
+        .numeric_stepper => |*ns| ns.setValue(std.math.lossyCast(i32, req.value)),
+        .segmented_control => |*sc| sc.select(std.math.lossyCast(usize, req.value)),
         else => {},
     }
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
@@ -1265,20 +1420,7 @@ pub fn setRangeHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extis
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     };
-    if (slot.widget == .range_slider) {
-        // Clamp the pair against each other directly (not via setMin/setMax,
-        // whose own clamping is exactly the ordering hazard this function's
-        // doc comment explains) -- min against [0, max_request], max against
-        // [that resolved min, 1], mirroring RangeSlider.init's own "min
-        // resolves first" ordering. Snapped independently afterward (see
-        // RangeSlider.snap's own doc comment for why snapping each side
-        // separately here is still safe -- @round is monotonic, so it can't
-        // invert an already-valid min <= max pair).
-        const clamped_min = std.math.clamp(req.min, 0, req.max);
-        const clamped_max = std.math.clamp(req.max, clamped_min, 1);
-        slot.widget.range_slider.min = slot.widget.range_slider.snap(clamped_min);
-        slot.widget.range_slider.max = slot.widget.range_slider.snap(clamped_max);
-    }
+    if (slot.widget == .range_slider) slot.widget.range_slider.setRange(req.min, req.max);
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }
 
@@ -1323,7 +1465,9 @@ pub fn destroyWidgetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     defer parsed.deinit();
     const req = parsed.value;
 
-    if (!self.destroyWidgetSubtree(self.io(), req.widget_id)) {
+    // A window root goes through the window path so its OS window is torn
+    // down too, not orphaned -- see `WidgetHost.destroyWindow`.
+    if (!self.destroyWindow(self.io(), req.widget_id) and !self.destroyWidgetSubtree(self.io(), req.widget_id)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "no such widget {d}", .{req.widget_id});
         return;
     }
@@ -1393,7 +1537,7 @@ pub fn createClayWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const
     const req = parsed.value;
 
     var title_buf: [64]u8 = undefined;
-    const title_len = @min(req.title.len, title_buf.len);
+    const title_len = text_cursor.truncatedLen(req.title, title_buf.len);
     @memcpy(title_buf[0..title_len], req.title[0..title_len]);
 
     const style: ClayStyle = .{
@@ -1403,16 +1547,11 @@ pub fn createClayWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const
             .height = .{ .type = c.CLAY__SIZING_TYPE_FIXED, .size = .{ .minMax = .{ .min = req.height, .max = req.height } } },
         },
     };
-    const container = Container.init(std.mem.zeroes(c.SDL_FRect), false);
 
     const call_io = self.io();
-    self.mutex.lockUncancelable(call_io);
-    const result = self.insertLockedWithLayoutValidated(.{ .container = container }, null, style, null);
-    self.mutex.unlock(call_io);
-
-    const widget_id = result catch |err| {
+    const widget_id = self.insertWindowRoot(call_io, style) catch |err| {
         switch (err) {
-            error.NoSuchParent => unreachable, // parent_id is always null above
+            error.TooManyWindows => host_fn_util.writeErrorJson(plugin, &outputs[0], "too many windows (max {d})", .{WidgetHost.max_window_roots}),
             error.RegistryFull => host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{}),
         }
         return;
@@ -1459,18 +1598,56 @@ pub fn destroyWindowHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.
     defer parsed.deinit();
     const req = parsed.value;
 
-    const call_io = self.io();
-    self.mutex.lockUncancelable(call_io);
-    const slot = self.findLocked(req.widget_id);
-    const is_window = if (slot) |s| s.clay_style.window_root else false;
-    self.mutex.unlock(call_io);
-
-    if (!is_window) {
+    if (!self.destroyWindow(self.io(), req.widget_id)) {
         host_fn_util.writeErrorJson(plugin, &outputs[0], "widget {d} is not a window", .{req.widget_id});
         return;
     }
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
 
-    self.destroyWindowSubtree(call_io, req.widget_id);
-    self.queueWindowTeardown(call_io, req.widget_id);
+// -- App lifecycle --
+//
+// Neither of these touches a widget. They live here because they are the
+// same family as `natyv_clay_create_window`/`natyv_destroy_window`, which
+// already do. Both were added for the system tray -- an app with a tray
+// usually wants to keep running with its window hidden rather than quit --
+// but neither is tray-specific, and an app with no tray can use both.
+
+const SetWindowVisibleRequest = struct { window_id: u32, visible: bool };
+
+/// `window_id` is a window's own `window_root` widget id, or 0 for the
+/// startup window, which has no root widget id of its own. Queued rather
+/// than applied: `SDL_ShowWindow`/`SDL_HideWindow` are main-thread calls and
+/// this runs on the worker, same hand-off every other real OS-window
+/// operation here already makes.
+pub fn setWindowVisibleHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetWindowVisibleRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+
+    self.queueWindowVisibility(self.io(), parsed.value.window_id, parsed.value.visible);
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+const SetQuitOnLastWindowCloseRequest = struct { quit: bool, notify_widget_id: u32 = 0 };
+
+/// Turning `quit` off without a real `notify_widget_id` would make the
+/// startup window's close button do nothing at all, with no way for the app
+/// to react and no way for the user to quit -- so that combination is
+/// rejected rather than accepted into an unclosable state.
+pub fn setQuitOnLastWindowCloseHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(SetQuitOnLastWindowCloseRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+
+    if (!parsed.value.quit and parsed.value.notify_widget_id == 0) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "natyv_set_quit_on_last_window_close: quit=false needs a real notify_widget_id, or the window's close button would do nothing", .{});
+        return;
+    }
+    self.setQuitOnLastWindowClose(self.io(), parsed.value.quit, parsed.value.notify_widget_id);
     host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
 }

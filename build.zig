@@ -197,8 +197,25 @@ pub fn build(b: *std.Build) void {
     // on instead of each carrying a copy. `src/main.zig` reaches it via
     // the named import `Config` below (was a plain relative
     // `@import("Config.zig")` before the natyv-io repo split).
-    const shared_dep = b.dependency("shared", .{ .target = target, .optimize = optimize });
-    const config_mod = shared_dep.module("Config");
+    //
+    // `-Dshared-src=` overrides that pinned dependency with a local
+    // natyv-io/shared checkout, the same escape-hatch shape
+    // `-Dextism-prefix` already has. Without it, any change spanning both
+    // repos (a new conf.natyv.json field consumed here, say) can't be
+    // built at all until shared is committed, pushed, and re-pinned --
+    // which makes iterating on one impossible. Safe as a plain module
+    // rather than a full dependency because `Config.zig` imports nothing
+    // but `std`; if it ever grows a dependency of its own this has to
+    // become a real `b.dependency` against the local path instead.
+    const shared_src = b.option([]const u8, "shared-src", "Path to a local natyv-io/shared checkout, overriding the pinned dependency (local development only -- a release always builds against the pinned one)");
+    const config_mod = if (shared_src) |dir|
+        b.createModule(.{
+            .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ dir, "src", "Config.zig" }) },
+            .target = target,
+            .optimize = optimize,
+        })
+    else
+        b.dependency("shared", .{ .target = target, .optimize = optimize }).module("Config");
 
     // `natyv build`'s own bundling step (`-Dembed-app-wasm=true`): when
     // true, `src/main.zig` uses `EmbeddedWasmPresent.zig`'s
@@ -229,6 +246,44 @@ pub fn build(b: *std.Build) void {
     const has_textures = b.option(bool, "has-textures", "Use src/assets/TextureAssetsGenerated.zig (written by `natyv prepare`) instead of the empty TextureAssetsAbsent.zig stub (set by `natyv build`, never by hand)") orelse false;
     const texture_assets_mod = b.createModule(.{
         .root_source_file = b.path(if (has_textures) "src/assets/TextureAssetsGenerated.zig" else "src/assets/TextureAssetsAbsent.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // `.ntss`'s reserved `window` block: identical file-swap choreography
+    // to `-Dhas-textures` above, and staged by the same `natyv prepare`
+    // pass. Window-level styling can't travel through the generated Go
+    // style tokens the way widget styling does -- those only ever reach
+    // the guest, and the window background is what SDL clears the renderer
+    // to before any widget draws at all.
+    const window_style = b.option(bool, "window-style", "Use src/assets/WindowStyleGenerated.zig (written by `natyv prepare`) instead of the empty WindowStyleAbsent.zig stub (set by `natyv build`, never by hand)") orelse false;
+    const window_style_mod = b.createModule(.{
+        .root_source_file = b.path(if (window_style) "src/assets/WindowStyleGenerated.zig" else "src/assets/WindowStyleAbsent.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // App-wide custom font: same file-swap choreography again. `natyv
+    // prepare` stages the real font bytes into src/assets/fonts/ and
+    // writes AppFontGenerated.zig whenever an app configured a font or a
+    // point size, via the `.ntss` `font` block or conf.natyv.json.
+    const app_font = b.option(bool, "app-font", "Use src/assets/AppFontGenerated.zig (written by `natyv prepare`) instead of the empty AppFontAbsent.zig stub (set by `natyv build`, never by hand)") orelse false;
+    const app_font_mod = b.createModule(.{
+        .root_source_file = b.path(if (app_font) "src/assets/AppFontGenerated.zig" else "src/assets/AppFontAbsent.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // System tray icon: the same file-swap choreography once more. `natyv
+    // prepare` stages `conf.natyv.json`'s own `icon` PNG -- the one the
+    // packaging step already turns into .icns/.ico/an AppImage icon -- into
+    // src/assets/tray/ and writes TrayIconGenerated.zig. Reusing that field
+    // rather than adding a tray-specific one is deliberate: an app that
+    // ships a tray already ships an app icon, and SDL takes a plain decoded
+    // surface either way.
+    const tray_icon = b.option(bool, "tray-icon", "Use src/assets/TrayIconGenerated.zig (written by `natyv prepare`) instead of the empty TrayIconAbsent.zig stub (set by `natyv build`, never by hand)") orelse false;
+    const tray_icon_mod = b.createModule(.{
+        .root_source_file = b.path(if (tray_icon) "src/assets/TrayIconGenerated.zig" else "src/assets/TrayIconAbsent.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -326,6 +381,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("EmbeddedWasm", embedded_wasm_mod);
     exe.root_module.addImport("Bindings", bindings_mod);
     exe.root_module.addImport("TextureAssets", texture_assets_mod);
+    exe.root_module.addImport("WindowStyle", window_style_mod);
+    exe.root_module.addImport("AppFont", app_font_mod);
+    exe.root_module.addImport("TrayIcon", tray_icon_mod);
 
     // Windows icon embedding (`Config.icon`): natyv-io/cli's
     // `WindowsIcon.zig` generates a real `.ico` + a small `.rc`
@@ -380,6 +438,38 @@ pub fn build(b: *std.Build) void {
     });
     linkNatyvDeps(b, windowmanager_tests.root_module, extism_prefix, sqlite_enabled);
     const run_windowmanager_tests = b.addRunArtifact(windowmanager_tests);
+
+    const tray_registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/TrayRegistry.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkNatyvDeps(b, tray_registry_tests.root_module, extism_prefix, sqlite_enabled);
+    const run_tray_registry_tests = b.addRunArtifact(tray_registry_tests);
+
+    const hid_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Hid.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkNatyvDeps(b, hid_tests.root_module, extism_prefix, sqlite_enabled);
+    hid_tests.root_module.addImport("Config", config_mod);
+    const run_hid_tests = b.addRunArtifact(hid_tests);
+
+    const hid_registry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/HidRegistry.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkNatyvDeps(b, hid_registry_tests.root_module, extism_prefix, sqlite_enabled);
+    hid_registry_tests.root_module.addImport("Config", config_mod);
+    const run_hid_registry_tests = b.addRunArtifact(hid_registry_tests);
 
     const runtime_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -471,6 +561,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_persist_tests = b.addRunArtifact(persist_tests);
 
+    const canvas_store_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/CanvasStore.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_canvas_store_tests = b.addRunArtifact(canvas_store_tests);
+
+    const recycle_trigger_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/RecycleTrigger.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_recycle_trigger_tests = b.addRunArtifact(recycle_trigger_tests);
+
     const drawbatcher_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/DrawBatcher.zig"),
@@ -554,10 +662,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_tests.step);
     test_step.dependOn(&run_private_ranges_tests.step);
     test_step.dependOn(&run_tcp_registry_tests.step);
+    test_step.dependOn(&run_tray_registry_tests.step);
+    test_step.dependOn(&run_hid_tests.step);
+    test_step.dependOn(&run_hid_registry_tests.step);
     test_step.dependOn(&run_mbedtls_smoke_tests.step);
     test_step.dependOn(&run_tcp_tests.step);
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_persist_tests.step);
+    test_step.dependOn(&run_canvas_store_tests.step);
+    test_step.dependOn(&run_recycle_trigger_tests.step);
     test_step.dependOn(&run_drawbatcher_tests.step);
     test_step.dependOn(&run_scrollclip_tests.step);
     test_step.dependOn(&run_scrollbar_tests.step);

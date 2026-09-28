@@ -18,6 +18,12 @@ const c = @import("../c.zig").c;
 /// expose weight selection later without shipping more font files.
 const default_font_ttf = @embedFile("../assets/Inter.ttf");
 
+/// Length of the bundled Inter bytes, for the startup trace's "which font
+/// actually loaded" line -- `default_font_ttf` itself stays private.
+pub fn bundledByteLen() usize {
+    return default_font_ttf.len;
+}
+
 pub const MeasuredSize = struct {
     w: i32,
     h: i32,
@@ -39,12 +45,30 @@ const Self = @This();
 /// the way sqlite/network/widgets are -- see the font-rendering plan).
 font: *c.TTF_Font,
 
-pub fn init() !Self {
+/// `app_font`/`app_point_size` are the app's own configured font and size
+/// (`natyv prepare` stages these from the `.ntss` `font` block or
+/// conf.natyv.json -- see `src/assets/AppFontAbsent.zig`). Null for either
+/// keeps natyv's bundled Inter / 16.0, so an app that configures neither
+/// renders exactly as it did before this existed.
+///
+/// App-wide, by construction: natyv threads a single `*TTF_Font` through
+/// its entire render path, so one font at one size is what the runtime can
+/// currently express. Per-widget font and size selection needs that
+/// pointer unthreaded from every widget's `syncText` plus a per-font Clay
+/// text-measurement callback, and is deliberately a separate, later arc.
+pub fn init(app_font: ?[]const u8, app_point_size: ?f32) !Self {
     if (!c.TTF_Init()) return error.TTFInitFailed;
     errdefer c.TTF_Quit();
 
-    const stream = c.SDL_IOFromConstMem(default_font_ttf.ptr, default_font_ttf.len) orelse return error.IOStreamFailed;
-    const font = c.TTF_OpenFontIO(stream, true, default_point_size) orelse return error.OpenFontFailed;
+    const bytes = app_font orelse default_font_ttf;
+    const size = app_point_size orelse default_point_size;
+
+    // `true` hands the stream's ownership to SDL_ttf either way -- the
+    // bytes themselves are static program data in both cases (@embedFile
+    // of Inter, or @embedFile of the staged app font), never allocated, so
+    // nothing here owns a heap buffer to free.
+    const stream = c.SDL_IOFromConstMem(bytes.ptr, bytes.len) orelse return error.IOStreamFailed;
+    const font = c.TTF_OpenFontIO(stream, true, size) orelse return error.OpenFontFailed;
 
     return .{ .font = font };
 }

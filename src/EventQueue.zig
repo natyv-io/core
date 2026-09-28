@@ -11,6 +11,7 @@
 //! predicted before either W3 or the slider it's for were built.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const Self = @This();
@@ -66,7 +67,26 @@ const Self = @This();
 /// own doc comment), and what makes an "unsaved changes?" veto flow possible at near-zero extra cost.
 /// Discrete, not coalesced -- same reasoning `.dismiss` already established: a guest deciding whether
 /// to actually close needs every request, not just whichever happened to still be queued.
-pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll, file_selected, window_close_requested };
+///
+/// HID: `.hid_report` (payload `{"data":"<base64>"}`, plus `"dropped":N` when reports were lost since
+/// the last one delivered) and `.hid_disconnected` (payload `{}`) are addressed to an open HID handle's
+/// id, not a widget -- see `HidRegistry.zig`. Discrete, never coalesced: a report is a keypress, and a
+/// dropped keypress is a bug. Pushed through `pushBounded` instead, so a device that streams faster than
+/// the guest drains can't grow this queue without limit. Both also survive a recycle (see `pop`).
+///
+/// Canvas: `.canvas_resized` (payload `{"w":f,"h":f}`) is fired to a canvas when its laid-out size
+/// changes, including its first layout -- see `FrameLoop.pushCanvasResizeEvents`. Coalesced like
+/// `.scroll`: a window drag-resize changes the size every frame, and a guest redrawing a chart only
+/// needs the latest one.
+pub const EventType = enum { click, change, dismiss, text_changed, blur, key_nav, hover, scroll, file_selected, window_close_requested, hid_report, hid_disconnected, canvas_resized };
+
+/// Whether an entry of this type is still meaningful after a recycle -- see `pop`. A widget id is
+/// rebuilt fresh by `natyv_resume`, so an event addressed to one is stale. A HID handle is not: the
+/// device stays open across a recycle and the resumed guest reclaims the same id (see
+/// `HidRegistry.claimByPath`), so a report that arrived mid-resume still has a real recipient.
+fn survivesRecycle(event_type: EventType) bool {
+    return event_type == .hid_report or event_type == .hid_disconnected;
+}
 
 pub const Entry = struct {
     widget_id: u32,
@@ -97,6 +117,20 @@ shutdown: bool = false,
 /// with an older value at push time, and `pop` silently discards rather
 /// than returns it.
 generation: u32 = 0,
+
+/// Per-event queue tracing. Silent under `zig build test`: these fire on
+/// every single push, so in a unit test they are pure noise -- and Zig's
+/// build runner echoes any step that produced *any* stderr as
+/// `failed command: ...` even when that step passed (build_runner.zig's
+/// "No matter the result, we want to display error/warning messages"
+/// block, gated on `result_stderr.len > 0`). That message is
+/// indistinguishable from a real build failure and cost a real debugging
+/// session. Genuine failures below (a dropped push on alloc failure) stay
+/// unconditional -- those are errors, not traces.
+fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
+    std.debug.print(fmt, args);
+}
 
 pub fn init(allocator: std.mem.Allocator) Self {
     return .{ .allocator = allocator };
@@ -129,15 +163,15 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
     // hardcoded to `.change`) so the two families never cross-coalesce
     // with each other. W15: `.hover` joins the same coalesced family --
     // see its own EventType doc comment for why. Tree view: `.scroll`
-    // joins it too, same reasoning.
-    if (event_type == .change or event_type == .text_changed or event_type == .hover or event_type == .scroll) {
+    // joins it too, same reasoning, and so does `.canvas_resized`.
+    if (event_type == .change or event_type == .text_changed or event_type == .hover or event_type == .scroll or event_type == .canvas_resized) {
         for (self.items.items) |*existing| {
             if (existing.widget_id == widget_id and existing.event_type == event_type) {
                 self.allocator.free(existing.payload);
                 existing.payload = owned;
                 self.seq_counter += 1;
                 existing.seq = self.seq_counter;
-                std.debug.print("[queue]  coalesced    widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), existing.seq, self.items.items.len });
+                trace("[queue]  coalesced    widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), existing.seq, self.items.items.len });
                 self.cond.signal(io);
                 return;
             }
@@ -152,8 +186,44 @@ pub fn push(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload:
         self.allocator.free(owned);
         return;
     };
-    std.debug.print("[queue]  pushed       widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), seq, self.items.items.len });
+    trace("[queue]  pushed       widget={d} type={s} seq={d} (qlen={d})\n", .{ widget_id, @tagName(event_type), seq, self.items.items.len });
     self.cond.signal(io);
+}
+
+/// `push` for a discrete event from a source that can outrun the guest -- appends only while fewer
+/// than `max_queued` entries of `event_type` for `widget_id` are waiting, and returns whether it did.
+/// A refusal is the caller's to count and report (see `HidRegistry`'s reader), never silent: the
+/// alternative of blocking the producer just moves the loss somewhere it can't be counted.
+pub fn pushBounded(self: *Self, io: Io, widget_id: u32, event_type: EventType, payload: []const u8, surface_id: u32, max_queued: usize) bool {
+    {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var queued: usize = 0;
+        for (self.items.items) |existing| {
+            if (existing.widget_id == widget_id and existing.event_type == event_type) queued += 1;
+        }
+        if (queued >= max_queued) return false;
+    }
+    // Only this producer pushes events for `widget_id`, so the count can't grow between the check
+    // above and `push` below -- `pop` can only shrink it.
+    self.push(io, widget_id, event_type, payload, surface_id);
+    return true;
+}
+
+/// Drops every queued entry addressed to `widget_id`. For a HID handle being closed: its reader
+/// thread has already been joined, so nothing can arrive after this, and a guest that called
+/// `hid_close` shouldn't then receive reports for the handle it just closed.
+pub fn removeAllFor(self: *Self, io: Io, widget_id: u32) void {
+    self.mutex.lockUncancelable(io);
+    defer self.mutex.unlock(io);
+    var i: usize = 0;
+    while (i < self.items.items.len) {
+        if (self.items.items[i].widget_id == widget_id) {
+            self.allocator.free(self.items.orderedRemove(i).payload);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 pub fn pop(self: *Self, io: Io) ?Entry {
@@ -165,7 +235,7 @@ pub fn pop(self: *Self, io: Io) ?Entry {
             self.cond.waitUncancelable(io, &self.mutex);
         }
         const entry = self.items.orderedRemove(0);
-        if (entry.generation != self.generation) {
+        if (entry.generation != self.generation and !survivesRecycle(entry.event_type)) {
             // Stale -- queued before the most recent recycle. See
             // bumpGeneration's own doc comment for why silently discarding
             // this (instead of returning it for dispatch against an id
@@ -327,6 +397,24 @@ test "change and text_changed for the same widget id don't cross-coalesce with e
     try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
 }
 
+test "canvas_resized events for the same canvas coalesce to the latest size, and never with its clicks" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .canvas_resized, "{\"w\":10,\"h\":10}", 0);
+    queue.push(io, 1, .click, "{\"x\":1,\"y\":2}", 0);
+    queue.push(io, 1, .canvas_resized, "{\"w\":20,\"h\":30}", 0);
+    queue.push(io, 2, .canvas_resized, "{\"w\":5,\"h\":5}", 0);
+    try std.testing.expectEqual(@as(usize, 3), queue.items.items.len);
+    try std.testing.expectEqualStrings("{\"w\":20,\"h\":30}", queue.items.items[0].payload);
+    try std.testing.expectEqual(EventType.click, queue.items.items[1].event_type);
+}
+
 test "hover events for the same widget coalesce to the latest payload" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -413,4 +501,78 @@ test "push carries surface_id through to the popped entry" {
     const popped = queue.pop(io).?;
     defer queue.freeEntry(popped);
     try std.testing.expectEqual(@as(u32, 7), popped.surface_id);
+}
+
+test "pushBounded appends up to the cap per id and type, then refuses" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    try std.testing.expect(queue.pushBounded(io, 1, .hid_report, "a", 0, 2));
+    try std.testing.expect(queue.pushBounded(io, 1, .hid_report, "b", 0, 2));
+    try std.testing.expect(!queue.pushBounded(io, 1, .hid_report, "c", 0, 2));
+    // Another id, and another type for the same id, each have their own count.
+    try std.testing.expect(queue.pushBounded(io, 2, .hid_report, "d", 0, 2));
+    try std.testing.expect(queue.pushBounded(io, 1, .hid_disconnected, "{}", 0, 2));
+    try std.testing.expectEqual(@as(usize, 4), queue.items.items.len);
+
+    // Draining one makes room again, and nothing was coalesced along the way.
+    const popped = queue.pop(io).?;
+    defer queue.freeEntry(popped);
+    try std.testing.expectEqualStrings("a", popped.payload);
+    try std.testing.expect(queue.pushBounded(io, 1, .hid_report, "e", 0, 2));
+}
+
+test "removeAllFor drops only the named id's entries, keeping the rest in order" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .hid_report, "a", 0);
+    queue.push(io, 2, .click, "b", 0);
+    queue.push(io, 1, .hid_report, "c", 0);
+    queue.push(io, 1, .hid_disconnected, "{}", 0);
+    queue.push(io, 3, .click, "d", 0);
+    queue.removeAllFor(io, 1);
+
+    try std.testing.expectEqual(@as(usize, 2), queue.items.items.len);
+    try std.testing.expectEqualStrings("b", queue.items.items[0].payload);
+    try std.testing.expectEqualStrings("d", queue.items.items[1].payload);
+}
+
+test "HID events survive a recycle's generation bump; widget events don't" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var queue = Self.init(allocator);
+    defer queue.deinit();
+
+    queue.push(io, 1, .click, "stale", 0);
+    queue.push(io, 2, .hid_report, "report", 0);
+    queue.push(io, 2, .hid_disconnected, "{}", 0);
+    queue.bumpGeneration(io);
+    // Keeps `pop` from blocking forever if a regression discards the HID
+    // entries too -- it then returns this instead and the check below fails.
+    queue.push(io, 3, .click, "fresh", 0);
+
+    const first = queue.pop(io).?;
+    defer queue.freeEntry(first);
+    try std.testing.expectEqual(EventType.hid_report, first.event_type);
+    const second = queue.pop(io).?;
+    defer queue.freeEntry(second);
+    try std.testing.expectEqual(EventType.hid_disconnected, second.event_type);
+    const third = queue.pop(io).?;
+    defer queue.freeEntry(third);
+    try std.testing.expectEqualStrings("fresh", third.payload);
+    try std.testing.expectEqual(@as(usize, 0), queue.items.items.len);
 }

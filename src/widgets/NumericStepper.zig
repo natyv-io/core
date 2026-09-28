@@ -41,24 +41,41 @@ text_generation: u32 = 0,
 text_obj_generation: u32 = 0,
 sync_count: u32 = 0,
 
+/// `min`/`max` come straight from the guest, so a reversed pair is swapped
+/// here rather than trusted -- `resolve` needs `min <= max` (see its doc
+/// comment).
 pub fn init(rect: c.SDL_FRect, initial_value: i32, min: i32, max: i32, step: i32, wrap: bool) Self {
-    var self: Self = .{ .rect = rect, .value = initial_value, .min = min, .max = max, .step = step, .wrap = wrap };
+    var self: Self = .{ .rect = rect, .value = initial_value, .min = @min(min, max), .max = @max(min, max), .step = step, .wrap = wrap };
     self.setValue(initial_value);
     return self;
 }
 
 /// Pure clamp/wrap logic, independently testable without touching
 /// `self.value` -- same "pure geometry, unit-tested directly" split
-/// `Slider.valueFromX` already established. `wrap` requires `max >= min`
-/// (always true for any real stepper); Zig's `@mod` is floored (sign
-/// follows the divisor), so `v - min` mod a positive `range` always lands
-/// in `[0, range)` regardless of which direction `v` under/overshot by.
+/// `Slider.valueFromX` already established. Relies on `min <= max`, which
+/// `init` guarantees: `std.math.clamp` asserts it, and it keeps `range`
+/// positive. Wrap math runs in `i64` because `max - min + 1` and `v - min`
+/// overflow `i32` at the extremes; Zig's `@mod` is floored (sign follows the
+/// divisor), so `v - min` mod a positive `range` always lands in
+/// `[0, range)` regardless of which direction `v` under/overshot by, and the
+/// result is back inside `[min, max]` for the final cast.
 pub fn resolve(self: Self, v: i32) i32 {
     if (self.wrap) {
-        const range = self.max - self.min + 1;
-        return self.min + @mod(v - self.min, range);
+        const range = @as(i64, self.max) - self.min + 1;
+        return @intCast(self.min + @mod(@as(i64, v) - self.min, range));
     }
     return std.math.clamp(v, self.min, self.max);
+}
+
+/// The value one press of minus/plus asks for, before `resolve` -- saturating
+/// because `step` is guest-supplied and `value + step` would otherwise
+/// overflow on the user's click.
+pub fn minusStep(self: Self) i32 {
+    return self.value -| self.step;
+}
+
+pub fn plusStep(self: Self) i32 {
+    return self.value +| self.step;
 }
 
 pub fn setValue(self: *Self, v: i32) void {
@@ -159,6 +176,32 @@ pub fn destroyText(self: *Self) void {
 
 fn testStepper(value: i32, min: i32, max: i32, wrap: bool) Self {
     return init(.{ .x = 10, .y = 20, .w = 100, .h = 24 }, value, min, max, 1, wrap);
+}
+
+test "guest-supplied extremes: reversed bounds, full i32 range, and huge steps stay defined" {
+    const max = std.math.maxInt(i32);
+    const min = std.math.minInt(i32);
+
+    // Reversed bounds are swapped, so neither clamp nor wrap sees min > max.
+    var reversed = init(.{ .x = 0, .y = 0, .w = 100, .h = 20 }, 5, 10, 0, 1, true);
+    try std.testing.expectEqual(@as(i32, 0), reversed.min);
+    try std.testing.expectEqual(@as(i32, 10), reversed.max);
+    reversed.setValue(11);
+    try std.testing.expectEqual(@as(i32, 0), reversed.value);
+    const reversed_clamp = init(.{ .x = 0, .y = 0, .w = 100, .h = 20 }, 50, 10, 0, 1, false);
+    try std.testing.expectEqual(@as(i32, 10), reversed_clamp.value);
+
+    // Full range with wrap: max - min + 1 and v - min both overflow i32.
+    var full = init(.{ .x = 0, .y = 0, .w = 100, .h = 20 }, max, min, max, max, true);
+    try std.testing.expectEqual(max, full.value);
+    full.setValue(min);
+    try std.testing.expectEqual(min, full.value);
+
+    // A huge step saturates instead of overflowing on the user's click.
+    const big_step = init(.{ .x = 0, .y = 0, .w = 100, .h = 20 }, max - 1, 0, max, max, false);
+    try std.testing.expectEqual(max, big_step.plusStep());
+    const neg = init(.{ .x = 0, .y = 0, .w = 100, .h = 20 }, min + 1, min, 0, max, false);
+    try std.testing.expectEqual(min, neg.minusStep());
 }
 
 test "regionAt: left zone is minus, right zone is plus, middle is none" {

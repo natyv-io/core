@@ -26,7 +26,10 @@ const Manifest = @import("Manifest.zig");
 const Config = @import("Config");
 const SqliteCapability = @import("capabilities/Sqlite.zig");
 const TcpCapability = @import("capabilities/Tcp.zig");
+const HidCapability = @import("capabilities/Hid.zig");
 const PersistCapability = @import("capabilities/Persist.zig");
+const TrayCapability = @import("capabilities/Tray.zig");
+const TrayRegistry = @import("TrayRegistry.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const json_util = @import("json_util.zig");
 // L1: Clay's own arena/BeginLayout/EndLayout lifecycle isn't wired into the
@@ -64,7 +67,7 @@ const Bindings = @import("Bindings");
 
 const Self = @This();
 
-const max_host_functions = SqliteCapability.host_function_count + TcpCapability.host_function_count + PersistCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
+const max_host_functions = SqliteCapability.host_function_count + TcpCapability.host_function_count + HidCapability.host_function_count + PersistCapability.host_function_count + TrayCapability.host_function_count + WidgetHost.host_function_count + WidgetHost.clay_host_function_count + Bindings.host_function_count;
 
 allocator: std.mem.Allocator,
 /// `null` when conf.natyv.json's `sqlite.enabled` is false -- no connection
@@ -79,6 +82,10 @@ sqlite: ?SqliteCapability,
 /// `init`'s ~60 existing call sites across `RuntimeTest.zig` would
 /// otherwise need updating for a capability none of them actually test.
 tcp: ?TcpCapability = null,
+/// `null` until `enableHid` is called -- same gating and same reason for a
+/// separate method as `tcp`. Its open devices, unlike `tcp`'s connections,
+/// survive a recycle: see `recycle`.
+hid: ?HidCapability = null,
 /// Host-owned persisted state backing the Go SDK's `natyv.Persisted[T]` --
 /// always on, like `widgets`, not gated behind a config flag the way
 /// `sqlite`/`tcp` are: this is core SDK machinery every app can reach for,
@@ -86,6 +93,18 @@ tcp: ?TcpCapability = null,
 /// comment for the full design.
 persist: PersistCapability,
 widgets: WidgetHost,
+/// System tray state, plus the FIFO of tray operations `main.zig` drains on
+/// the main thread each frame -- every `SDL_Tray*` call is main-thread-only.
+/// Owned here (not by `main.zig`) so `tray`'s host functions can hold a
+/// stable pointer to it; `main.zig` reaches it as `runtime.tray_registry`.
+tray_registry: TrayRegistry = .{},
+/// Always on, same reasoning as `persist`: a tray reaches no further than a
+/// window does, so it is not a gated capability. `registry`/`widgets` are
+/// fixed up in `loadPlugin` rather than set here, because `init` returns by
+/// value and a pointer taken during construction would not survive the move
+/// -- the same two-phase requirement `loadPlugin`'s own doc comment already
+/// spells out for every capability.
+tray: TrayCapability,
 plugin: ?*c.ExtismPlugin = null,
 /// The pre-compiled artifact `loadPlugin` builds via `extism_compiled_plugin_new`
 /// -- kept alive for the process's whole lifetime so `recycle` can cheaply
@@ -121,6 +140,9 @@ pub fn init(allocator: std.mem.Allocator, db_path: ?[:0]const u8) Error!Self {
         .sqlite = sqlite,
         .persist = PersistCapability.init(allocator),
         .widgets = .{ .allocator = allocator },
+        // Pointers deliberately left dangling-by-construction here and
+        // repaired in `loadPlugin` -- see the field's own doc comment.
+        .tray = TrayCapability.init(allocator, undefined, undefined),
     };
 }
 
@@ -135,6 +157,16 @@ pub fn init(allocator: std.mem.Allocator, db_path: ?[:0]const u8) Error!Self {
 /// parameter.
 pub fn enableNetwork(self: *Self, allowed_sockets: []const Config.AllowedSocket) void {
     self.tcp = TcpCapability.init(self.allocator, allowed_sockets);
+}
+
+/// Sets up the `hid` capability -- called by `main.zig` when
+/// `conf.natyv.json`'s `hid.enabled` is true, between `Runtime.init` and
+/// `loadPlugin`, like `enableNetwork`. `queue` is where device reader
+/// threads push `.hid_report`/`.hid_disconnected`, so it must outlive every
+/// open device: `main.zig` creates it before `Runtime.init` and closes the
+/// devices (`hid.registry.closeAll`) before either is torn down.
+pub fn enableHid(self: *Self, allowed_devices: []const Config.AllowedDevice, queue: *EventQueue) void {
+    self.hid = HidCapability.init(self.allocator, allowed_devices, queue);
 }
 
 pub fn deinit(self: *Self) void {
@@ -171,7 +203,15 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
         if (self.sqlite) |*sqlite| n += sqlite.registerInto(funcs[n..]);
     }
     if (self.tcp) |*tcp| n += tcp.registerInto(funcs[n..]);
+    if (self.hid) |*hid| {
+        hid.widgets = &self.widgets;
+        n += hid.registerInto(funcs[n..]);
+    }
     n += self.persist.registerInto(funcs[n..]);
+    // `self` is finally at its permanent address here, so this is the first
+    // point at which the tray capability can hold real pointers into it.
+    self.tray = TrayCapability.init(self.allocator, &self.tray_registry, &self.widgets);
+    n += self.tray.registerInto(funcs[n..]);
     n += self.widgets.registerInto(funcs[n..]);
     if (clay_enabled) n += self.widgets.registerClayInto(funcs[n..]);
     // `[]?*anyopaque`, not `[]?*const c.ExtismFunction` -- see
@@ -185,6 +225,8 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
     };
     defer self.allocator.free(manifest_json);
 
+    const t_compile = timing.traceStart();
+
     var errmsg: [*c]u8 = null;
     self.compiled = c.extism_compiled_plugin_new(manifest_json.ptr, manifest_json.len, &funcs[0], n, true, &errmsg);
     if (self.compiled == null) {
@@ -192,7 +234,15 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
         return error.PluginLoadFailed;
     }
     c.extism_plugin_new_error_free(errmsg);
+    // Cranelift JIT-compiles the whole module here, so this scales with
+    // guest wasm size -- measured 13-22ms across real apps, not the
+    // dominant startup cost it is sometimes assumed to be.
+    timing.tracePhase("  compile (extism_compiled_plugin_new)", t_compile);
 
+    // Instantiation also runs the guest's `_initialize`, i.e. every
+    // TinyGo package-level init -- a cost distinct from both the compile
+    // above and the natyv_init call later, and measured small (~3ms).
+    const t_instantiate = timing.traceStart();
     errmsg = null;
     self.plugin = c.extism_plugin_new_from_compiled(self.compiled, &errmsg);
     if (self.plugin == null) {
@@ -200,6 +250,7 @@ pub fn loadPlugin(self: *Self, wasm: []const u8, manifest: Manifest, clay_enable
         return error.PluginLoadFailed;
     }
     c.extism_plugin_new_error_free(errmsg);
+    timing.tracePhase("  instantiate (+ guest _initialize)", t_instantiate);
 
     self.can_recycle = c.extism_plugin_function_exists(self.plugin, "natyv_checkpoint") and
         c.extism_plugin_function_exists(self.plugin, "natyv_resume");
@@ -299,10 +350,17 @@ pub fn recycle(self: *Self, io: Io) bool {
     }
     c.extism_plugin_new_error_free(errmsg);
 
+    // Every open HID device has to be reclaimed by the resumed guest
+    // (`hid_open` on its path, which hands back the same handle) or it's
+    // closed below -- the checkpoint is the guest's, so only the guest
+    // knows which devices it still wants.
+    if (self.hid) |*hid| hid.registry.markAllUnclaimed();
     const resume_result = self.callOn(io, new_plugin, "natyv_resume", checkpoint);
     if (resume_result == null) {
         std.debug.print("[runtime] recycle: natyv_resume failed on new instance, discarding it\n", .{});
         c.extism_plugin_free(new_plugin);
+        // The old instance carries on and still owns everything it had.
+        if (self.hid) |*hid| hid.registry.markAllClaimed();
         return false;
     }
 
@@ -313,6 +371,7 @@ pub fn recycle(self: *Self, io: Io) bool {
     self.plugin = new_plugin;
     if (old_plugin) |p| c.extism_plugin_free(p);
     if (self.tcp) |*tcp| tcp.registry.closeAll(io);
+    if (self.hid) |*hid| hid.registry.closeUnclaimed(io);
 
     std.debug.print("[runtime] recycle: swapped to a fresh guest instance, t={d}ms\n", .{c.SDL_GetTicks()});
     return true;
