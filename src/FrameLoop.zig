@@ -37,6 +37,7 @@ const FloatingOrder = @import("FloatingOrder.zig");
 const WindowManager = @import("WindowManager.zig");
 const ShapeCache = @import("capabilities/ShapeCache.zig");
 const ImageCache = @import("capabilities/ImageCache.zig");
+const CanvasRender = @import("capabilities/CanvasRender.zig");
 const TextureAssets = @import("TextureAssets");
 
 const max_widgets_on_screen = WidgetHost.max_widgets;
@@ -220,7 +221,7 @@ fn activateWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, id: u32,
         // own visible state-flip does -- just the plain `.click` event
         // below, so a guest can make a whole card/row clickable.
         .container => {},
-        .textfield, .textarea, .label, .progress_bar, .slider, .range_slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs, .spinner => return,
+        .textfield, .textarea, .label, .progress_bar, .slider, .range_slider, .divider, .badge, .numeric_stepper, .segmented_control, .tabs, .spinner, .canvas => return,
     }
     queue.push(io, id, .click, "", surface_id);
 }
@@ -428,7 +429,7 @@ fn widgetContainsPoint(widget: WidgetHost.Widget, mx: f32, my: f32) bool {
         .numeric_stepper => |ns| ns.containsPoint(mx, my),
         .segmented_control => |sc| sc.containsPoint(mx, my),
         .tabs => |tb| tb.containsPoint(mx, my),
-        .label, .container, .progress_bar, .divider, .badge, .spinner => false,
+        .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => false,
     };
 }
 
@@ -533,7 +534,7 @@ fn tryHitWidget(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, slots: []c
             activateWidget(widgets, io, queue, slot.id, .container, FloatingOrder.surfaceIdFor(slots, index, slot.id));
             return slot.id;
         },
-        .label, .progress_bar, .divider, .badge, .spinner => {},
+        .label, .progress_bar, .divider, .badge, .spinner, .canvas => {},
     }
     return null;
 }
@@ -687,7 +688,29 @@ fn intersectClipRects(a: c.SDL_Rect, b: c.SDL_Rect) c.SDL_Rect {
 /// rather than replacing it, and always restores the prior clip
 /// afterward -- both call sites below already scope their own outer
 /// clip the same way.
-fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding, shape_cache: *ShapeCache.Cache, font: *c.TTF_Font) void {
+/// Where a canvas's drawing comes from, in the shape `CanvasRender.draw`
+/// expects: a locked version check every frame, and an owned copy when it
+/// has to re-render.
+const CanvasSource = struct {
+    widgets: *WidgetHost,
+    io: std.Io,
+
+    pub fn version(self: CanvasSource, id: u32) ?u32 {
+        return self.widgets.canvasVersion(self.io, id);
+    }
+
+    pub fn clone(self: CanvasSource, id: u32, allocator: std.mem.Allocator) error{OutOfMemory}!?WidgetHost.CanvasSnapshot {
+        return self.widgets.cloneCanvas(self.io, id, allocator);
+    }
+};
+
+/// What drawing a canvas needs beyond the widget itself.
+const CanvasDraw = struct {
+    cache: *CanvasRender.Cache,
+    source: CanvasSource,
+};
+
+fn drawWidgetDecorations(id: u32, widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, raw_padding: c.Clay_Padding, shape_cache: *ShapeCache.Cache, canvas: CanvasDraw, font: *c.TTF_Font) void {
     const padding = WidgetHost.effectiveTextPadding(raw_padding);
 
     const had_prior_clip = c.SDL_RenderClipEnabled(renderer);
@@ -723,10 +746,15 @@ fn drawWidgetDecorations(widget: WidgetHost.Widget, renderer: ?*c.SDL_Renderer, 
         .segmented_control => |sc| sc.drawDecorations(renderer),
         .tabs => |tb| tb.drawDecorations(renderer),
         .spinner => |sp| sp.drawDecorations(renderer),
+        // A canvas clipped out entirely (scrolled away) isn't drawn, so the
+        // frame-end sweep frees its texture.
+        .canvas => |cv| if (effective_clip.w > 0 and effective_clip.h > 0) {
+            CanvasRender.draw(canvas.cache, renderer, canvas.source.widgets.allocator, font, id, cv.rect, canvas.source);
+        },
     }
 }
 
-fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, image_cache: *ImageCache.Cache, font: *c.TTF_Font) void {
+fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.SDL_Renderer, shape_cache: *ShapeCache.Cache, image_cache: *ImageCache.Cache, canvas: CanvasDraw, font: *c.TTF_Font) void {
     const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, &sdl_clip);
     if (slot.widget.fillRect()) |fr| {
@@ -740,7 +768,7 @@ fn drawFloatingWidget(slot: WidgetHost.Slot, clip: ?c.SDL_FRect, renderer: ?*c.S
         var w = slot.widget;
         drawStyledFill(renderer, shape_cache, image_cache, slot.clay_style, w.rectPtr().*, transparent);
     }
-    drawWidgetDecorations(slot.widget, renderer, slot.clay_style.padding, shape_cache, font);
+    drawWidgetDecorations(slot.id, slot.widget, renderer, slot.clay_style.padding, shape_cache, canvas, font);
     if (clip != null) _ = c.SDL_SetRenderClipRect(renderer, null);
 }
 
@@ -1160,7 +1188,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
                 hovered_widget_id_this_frame = slot.id;
             },
             .spinner => needs_continuous_redraw = true,
-            .label, .container, .progress_bar, .divider, .badge => {},
+            .label, .container, .progress_bar, .divider, .badge, .canvas => {},
         }
     }
     if (hovering_any != wctx.interaction.cursor_is_pointer) {
@@ -1295,6 +1323,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
     if (!needs_redraw) return;
     wctx.last_drawn_generation = current_generation;
     wctx.draw_count += 1;
+    const canvas: CanvasDraw = .{ .cache = &wctx.canvas_cache, .source = .{ .widgets = widgets, .io = io } };
 
     _ = c.SDL_SetRenderDrawColor(wctx.renderer, wctx.background.r, wctx.background.g, wctx.background.b, wctx.background.a);
     _ = c.SDL_RenderClear(wctx.renderer);
@@ -1366,7 +1395,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
         const sdl_clip: c.SDL_Rect = if (clip) |cr| toClipRect(cr) else undefined;
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, &sdl_clip);
-        drawWidgetDecorations(slot.widget, wctx.renderer, slot.clay_style.padding, &wctx.shape_cache, font);
+        drawWidgetDecorations(slot.id, slot.widget, wctx.renderer, slot.clay_style.padding, &wctx.shape_cache, canvas, font);
         if (clip != null) _ = c.SDL_SetRenderClipRect(wctx.renderer, null);
     }
 
@@ -1391,7 +1420,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         if (topmost_modal) |modal_id| {
             if (FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
         }
-        drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache, font);
+        drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache, canvas, font);
     }
     // A floating (but non-modal) scrollable widget's own scrollbar -- e.g.
     // a scrollable Dropdown/Menu panel -- belongs here: above ordinary
@@ -1419,7 +1448,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
             if (!floating) continue;
             if (!WidgetHost.isEffectivelyVisible(slots, index, slot)) continue;
             if (!FloatingOrder.isDescendantOfOrSelf(slots, index, slot.id, modal_id)) continue;
-            drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache, font);
+            drawFloatingWidget(slot, clip, wctx.renderer, &wctx.shape_cache, &wctx.image_cache, canvas, font);
         }
         // A scrollable widget inside the modal itself (e.g. a long
         // message list in a Dialog) -- correctly on top of everything,
@@ -1433,5 +1462,7 @@ pub fn drawWindow(widgets: *WidgetHost, io: std.Io, queue: *EventQueue, wctx: *W
         }
     }
 
+    // Frees the textures of canvases this frame didn't draw.
+    wctx.canvas_cache.sweep();
     _ = c.SDL_RenderPresent(wctx.renderer);
 }

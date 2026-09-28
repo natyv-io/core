@@ -166,7 +166,12 @@ Full plan: `~/.claude/plans/natyv-drawing-primitives.md`.
 - **Canvas widget with a retained display list** that the guest replaces whole in one host call. No per-frame guest draw callback: guest code runs on the worker thread, and the list must survive recycle host-side.
 - **Vocabulary:** line, polyline, rect, circle, polygon (ear-clipped, non-convex OK), arc/wedge, and text (app font and size only).
 - **Rendering:** render at 2x into a target texture, downsample, cache 1x. Re-render only on list or size change. Takes a pixel-density factor, which is 1.0 until a HiDPI pass lands.
-- **Storage:** display lists live in `CanvasStore.zig` (built; wire format in its header), never inline in the `Widget` union, since that would inflate every slot.
+  - Only on-screen canvases hold a texture; off-screen ones free it and re-render from the list when they come back (no disk cache). A total texture budget of about 256 MB is a backstop: past it, canvases render at a reduced resolution. Very large canvases render their 2x pass in tiles.
+  - Built in `capabilities/CanvasRender.zig` (per-window cache in `WindowContext.canvas_cache`, swept at the end of `drawWindow`). Tessellation is `CanvasTessellate.zig` (pure, tested through CanvasStore's test root).
+  - Colour is premultiplied end to end: draw with BLEND onto a target cleared to (0,0,0,0), copy tiles with NONE, composite with `SDL_BLENDMODE_BLEND_PREMULTIPLIED`. Straight alpha darkens every AA edge.
+  - Text is drawn inside the 2x pass from a copy of the app font at 2x size (`TTF_CopyFont`), so a render is one pass per tile in command order. Text `y` is the top of the line box.
+- **Host functions:** `natyv_clay_create_canvas` (slot and store entry added under one lock hold, slot rolled back if the store refuses) and `natyv_canvas_set` (parse and build outside the lock, swap under it, bump `layout_generation` -- the redraw gate).
+- **Storage:** display lists live in `CanvasStore.zig` (wire format in its header), never inline in the `Widget` union, since that would inflate every slot. `destroyIdsLocked` removes a canvas's drawing with its slot.
   - Bounded: commands, points, text bytes, canvas count and size are all capped and rejected past the cap.
   - Every guest float must be finite and range-checked before int conversion.
 - **Events:** click with canvas-relative `{x,y}`, plus `canvas_resized {w,h}`. Hover and pointer-move are deferred.

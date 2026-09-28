@@ -135,6 +135,8 @@ const Badge = @import("Badge.zig");
 const NumericStepper = @import("NumericStepper.zig");
 const SegmentedControl = @import("SegmentedControl.zig");
 const Tabs = @import("Tabs.zig");
+const Canvas = @import("Canvas.zig");
+pub const CanvasStore = @import("../CanvasStore.zig");
 const ScrollBar = @import("../ScrollBar.zig");
 // The Extism host-function wire layer (natyv_create_*/natyv_clay_create_*
 // callbacks and the generic set/get/destroy ones) lives in its own file --
@@ -246,7 +248,7 @@ pub const max_widgets = 2048;
 // no window on screen, but neither is tray-specific.
 pub const host_function_count = 32;
 
-pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner };
+pub const WidgetKind = enum { button, textfield, textarea, label, container, checkbox, toggle, radio_button, progress_bar, slider, range_slider, divider, badge, numeric_stepper, segmented_control, tabs, spinner, canvas };
 pub const Widget = union(WidgetKind) {
     button: Button,
     textfield: TextField,
@@ -265,6 +267,7 @@ pub const Widget = union(WidgetKind) {
     segmented_control: SegmentedControl,
     tabs: Tabs,
     spinner: Spinner,
+    canvas: Canvas,
 
     /// Real, font-driven size of whatever text this widget draws, or null
     /// for a kind that draws none (or hasn't synced once yet). Same
@@ -310,6 +313,7 @@ pub const Widget = union(WidgetKind) {
             .segmented_control => |*sc| &sc.rect,
             .tabs => |*tb| &tb.rect,
             .spinner => |*sp| &sp.rect,
+            .canvas => |*cv| &cv.rect,
         };
     }
 
@@ -359,7 +363,7 @@ pub const Widget = union(WidgetKind) {
             // W29: Spinner joins the same "owns its whole draw" set --
             // multiple independently-scaled dots isn't a single solid-color
             // rect.
-            .numeric_stepper, .segmented_control, .tabs, .spinner => null,
+            .numeric_stepper, .segmented_control, .tabs, .spinner, .canvas => null,
         };
     }
 
@@ -370,7 +374,7 @@ pub const Widget = union(WidgetKind) {
     pub fn isFocusable(self: Widget) bool {
         return switch (self) {
             .button, .textfield, .textarea, .checkbox, .toggle, .radio_button, .slider, .range_slider, .numeric_stepper, .segmented_control, .tabs => true,
-            .label, .container, .progress_bar, .divider, .badge, .spinner => false,
+            .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => false,
         };
     }
 
@@ -391,7 +395,7 @@ pub const Widget = union(WidgetKind) {
             .numeric_stepper => |*ns| ns.focused = focused,
             .segmented_control => |*sc| sc.focused = focused,
             .tabs => |*tb| tb.focused = focused,
-            .label, .container, .progress_bar, .divider, .badge, .spinner => {},
+            .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => {},
         }
     }
 
@@ -413,7 +417,7 @@ pub const Widget = union(WidgetKind) {
             .numeric_stepper => |ns| ns.focused,
             .segmented_control => |sc| sc.focused,
             .tabs => |tb| tb.focused,
-            .label, .container, .progress_bar, .divider, .badge, .spinner => false,
+            .label, .container, .progress_bar, .divider, .badge, .spinner, .canvas => false,
         };
     }
 };
@@ -788,6 +792,13 @@ id_to_index: std.AutoHashMapUnmanaged(u32, usize) = .empty,
 /// reusing each widget's already-cached `rect` instead. See
 /// `ClayLayout.layoutIfNeeded`.
 layout_generation: u64 = 0,
+/// Every canvas widget's current drawing, keyed by widget id -- see
+/// Canvas.zig for why it isn't in the slot. Guarded by `mutex` like
+/// `slots`: the worker replaces drawings, the main thread copies one out
+/// when it needs re-rendering. Replacing a drawing deliberately doesn't
+/// bump `layout_generation` -- it can't move anything, and the renderer
+/// notices by comparing `CanvasStore.Entry.version` instead.
+canvases: CanvasStore = .{},
 /// See file doc comment -- set by Runtime.call around every guest call,
 /// unset after. Only ever read from inside a host function callback, which
 /// by construction only ever runs nested inside that same call.
@@ -1222,7 +1233,8 @@ pub fn registerInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usize {
 // real second OS window that categorically doesn't exist outside the Clay
 // backend, so it's registered here alongside its create counterpart, not in
 // registerInto's always-on block.
-pub const clay_host_function_count = 22;
+// Drawing primitives: +2 for natyv_clay_create_canvas/natyv_canvas_set.
+pub const clay_host_function_count = 24;
 
 /// Registered only when conf.natyv.json's `ui.backend == "clay"` --
 /// Runtime.loadPlugin gates this the same way `sqlite`/`network` gate their
@@ -1262,6 +1274,8 @@ pub fn registerClayInto(self: *Self, funcs_out: []?*const c.ExtismFunction) usiz
     funcs_out[19] = c.extism_function_new("natyv_clay_create_spinner", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClaySpinnerHostFn, self, null);
     funcs_out[20] = c.extism_function_new("natyv_clay_create_window", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayWindowHostFn, self, null);
     funcs_out[21] = c.extism_function_new("natyv_destroy_window", &in_types[0], 1, &out_types[0], 1, HostFunctions.destroyWindowHostFn, self, null);
+    funcs_out[22] = c.extism_function_new("natyv_clay_create_canvas", &in_types[0], 1, &out_types[0], 1, HostFunctions.createClayCanvasHostFn, self, null);
+    funcs_out[23] = c.extism_function_new("natyv_canvas_set", &in_types[0], 1, &out_types[0], 1, HostFunctions.canvasSetHostFn, self, null);
     return clay_host_function_count;
 }
 
@@ -1379,6 +1393,53 @@ pub fn insertLockedWithLayoutValidated(self: *Self, widget: Widget, parent_id: ?
     return id;
 }
 
+pub const InsertCanvasError = InsertClayError || CanvasStore.StoreError;
+
+/// Inserts a canvas widget and registers its empty drawing under the same
+/// lock hold, so a canvas slot never exists without a store entry. If the
+/// store refuses (the canvas cap, or out of memory) the slot is rolled
+/// back.
+pub fn insertCanvasLocked(self: *Self, parent_id: ?u32, clay_style: ClayStyle) InsertCanvasError!u32 {
+    const id = try self.insertLockedWithLayoutValidated(.{ .canvas = Canvas.init(std.mem.zeroes(c.SDL_FRect)) }, parent_id, clay_style, null);
+    self.canvases.add(self.allocator, id) catch |err| {
+        self.destroyIdsLocked(&.{id});
+        return err;
+    };
+    return id;
+}
+
+/// Swaps an already-built drawing into canvas `id`, taking ownership of it
+/// on success. On `error.NoSuchCanvas` (no widget, or not a canvas) the
+/// caller still owns `drawing`. Bumps `layout_generation`, the redraw
+/// gate, so the window actually redraws; the renderer then sees the new
+/// `version` and re-renders the canvas's texture.
+pub fn replaceCanvasDrawing(self: *Self, call_io: Io, id: u32, drawing: CanvasStore.Drawing) error{NoSuchCanvas}!void {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    try self.canvases.replace(self.allocator, id, drawing);
+    self.layout_generation +%= 1;
+}
+
+/// The current drawing version of canvas `id`, or null if it no longer
+/// exists. Cheap: the renderer asks every frame to see whether its cached
+/// texture is stale.
+pub fn canvasVersion(self: *Self, call_io: Io, id: u32) ?u32 {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    return if (self.canvases.get(id)) |entry| entry.version else null;
+}
+
+pub const CanvasSnapshot = struct { drawing: CanvasStore.Drawing, version: u32 };
+
+/// An owned copy of canvas `id`'s drawing, so the renderer tessellates and
+/// draws without holding the registry lock. Null if the canvas is gone.
+pub fn cloneCanvas(self: *Self, call_io: Io, id: u32, allocator: std.mem.Allocator) error{OutOfMemory}!?CanvasSnapshot {
+    self.mutex.lockUncancelable(call_io);
+    defer self.mutex.unlock(call_io);
+    const entry = self.canvases.get(id) orelse return null;
+    return .{ .drawing = try entry.drawing.clone(allocator), .version = entry.version };
+}
+
 /// Locked read of `layout_generation` -- L4's render-loop pass calls this
 /// once per frame to decide whether a real Clay recompute is needed at all.
 pub fn currentGeneration(self: *Self, call_io: Io) u64 {
@@ -1427,6 +1488,7 @@ pub fn deinit(self: *Self) void {
     self.id_to_index.deinit(self.allocator);
     self.slots.deinit(self.allocator);
     self.pending_text_destroys.deinit(self.allocator);
+    self.canvases.deinit(self.allocator);
 }
 
 /// F3: creates/updates every button/textfield/label's cached `TTF_Text`
@@ -1506,7 +1568,7 @@ pub fn syncTextObjects(self: *Self, call_io: Io, engine: *c.TTF_TextEngine, font
                 .numeric_stepper => |*ns| ns.syncText(engine, font),
                 .segmented_control => |*sc| sc.syncText(engine, font),
                 .tabs => |*tb| tb.syncText(engine, font),
-                .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
+                .container, .progress_bar, .slider, .range_slider, .divider, .spinner, .canvas => {},
             }
         }
     }
@@ -1534,7 +1596,7 @@ pub fn destroyAllTextObjects(self: *Self, call_io: Io) void {
                 .numeric_stepper => |*ns| ns.destroyText(),
                 .segmented_control => |*sc| sc.destroyText(),
                 .tabs => |*tb| tb.destroyText(),
-                .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
+                .container, .progress_bar, .slider, .range_slider, .divider, .spinner, .canvas => {},
             }
         }
     }
@@ -1645,6 +1707,7 @@ fn destroyIdsLocked(self: *Self, ids: []const u32) void {
                     // claim about a function whose only real caller had
                     // never actually exercised the worker-thread path.
                     self.queueWidgetTextDestroysLocked(&s.widget);
+                    if (s.widget == .canvas) self.canvases.remove(self.allocator, s.id);
                     if (s.clay_managed) self.layout_generation +%= 1;
                     _ = self.id_to_index.remove(s.id);
                     slot.* = null;
@@ -1853,7 +1916,7 @@ pub fn queueWidgetTextDestroysLocked(self: *Self, widget: *Widget) void {
         .segmented_control => |*sc| for (0..sc.count) |i| self.queuePendingTextDestroy(&sc.text_objs[i]),
         // W19: same "up to max_tabs text objects" shape as SegmentedControl.
         .tabs => |*tb| for (0..tb.count) |i| self.queuePendingTextDestroy(&tb.text_objs[i]),
-        .container, .progress_bar, .slider, .range_slider, .divider, .spinner => {},
+        .container, .progress_bar, .slider, .range_slider, .divider, .spinner, .canvas => {},
     }
 }
 
@@ -2804,10 +2867,62 @@ pub fn setText(self: *Self, call_io: Io, id: u32, text_value: []const u8) bool {
         // labels (W19: same for Tabs) are set once at creation with no v1
         // API to change them afterward -- not an error, just doesn't apply,
         // same precedent as Container/ProgressBar/Slider/Divider here.
-        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => false,
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner, .canvas => false,
     };
     self.mutex.unlock(call_io);
 
     if (changed and slot.clay_managed) self.layout_generation +%= 1;
     return true;
+}
+
+test "insertCanvasLocked: the canvas cap rolls back the slot, and destroying a canvas frees its drawing and a cap spot" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    host.mutex.lockUncancelable(test_io);
+    var ids: [CanvasStore.max_canvases]u32 = undefined;
+    for (&ids) |*id| id.* = try host.insertCanvasLocked(null, .{});
+    const slots_before = host.id_to_index.count();
+    try std.testing.expectError(error.LimitExceeded, host.insertCanvasLocked(null, .{}));
+    try std.testing.expectEqual(slots_before, host.id_to_index.count());
+    try std.testing.expectError(error.NoSuchParent, host.insertCanvasLocked(999_999, .{}));
+    host.mutex.unlock(test_io);
+
+    var diag: CanvasStore.Diagnostic = .{};
+    const drawing = try CanvasStore.build(std.testing.allocator, &.{.{ .circle = .{ .cx = 1, .cy = 1, .r = 1, .fill = .{ .r = 0, .g = 0, .b = 0 } } }}, &diag);
+    try host.replaceCanvasDrawing(test_io, ids[0], drawing);
+
+    try std.testing.expect(host.destroyWidgetSubtree(test_io, ids[0]));
+    try std.testing.expect(host.canvasVersion(test_io, ids[0]) == null);
+    host.mutex.lockUncancelable(test_io);
+    defer host.mutex.unlock(test_io);
+    _ = try host.insertCanvasLocked(null, .{});
+}
+
+test "replaceCanvasDrawing bumps the redraw gate and the version, and rejects a non-canvas id" {
+    var host = Self{ .allocator = std.testing.allocator };
+    defer host.deinit();
+    const test_io = std.testing.io;
+
+    host.mutex.lockUncancelable(test_io);
+    const id = try host.insertCanvasLocked(null, .{});
+    host.mutex.unlock(test_io);
+    const label = host.insertWithLayout(test_io, .{ .label = .{ .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } } }, null, .{}).?;
+
+    var diag: CanvasStore.Diagnostic = .{};
+    var drawing = try CanvasStore.build(std.testing.allocator, &.{}, &diag);
+    try std.testing.expectError(error.NoSuchCanvas, host.replaceCanvasDrawing(test_io, label, drawing));
+    drawing.deinit(std.testing.allocator);
+
+    const gen = host.currentGeneration(test_io);
+    try host.replaceCanvasDrawing(test_io, id, try CanvasStore.build(std.testing.allocator, &.{}, &diag));
+    try std.testing.expect(host.currentGeneration(test_io) != gen);
+    try std.testing.expectEqual(@as(?u32, 1), host.canvasVersion(test_io, id));
+
+    const snap = (try host.cloneCanvas(test_io, id, std.testing.allocator)).?;
+    var copy = snap.drawing;
+    copy.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), snap.version);
+    try std.testing.expect((try host.cloneCanvas(test_io, label, std.testing.allocator)) == null);
 }

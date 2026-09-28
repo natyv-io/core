@@ -30,6 +30,7 @@ const DrawBatcher = @import("DrawBatcher.zig");
 const WidgetHost = @import("widgets/WidgetHost.zig");
 const ShapeCache = @import("capabilities/ShapeCache.zig");
 const ImageCache = @import("capabilities/ImageCache.zig");
+const CanvasRender = @import("capabilities/CanvasRender.zig");
 
 /// Small fixed cap, same "bump later if a real need shows up" precedent
 /// `WidgetHost.max_widgets` itself already set.
@@ -53,6 +54,9 @@ pub const WindowContext = struct {
     /// reasoning as `shape_cache`, kept as a separate cache since it's keyed
     /// by asset id rather than shape geometry.
     image_cache: ImageCache.Cache = .{},
+    /// Canvas widgets' rendered textures -- see CanvasRender.zig. Same
+    /// renderer-scoped reasoning as `shape_cache`.
+    canvas_cache: CanvasRender.Cache = .{},
     /// What SDL clears this window's renderer to before any widget draws
     /// (`FrameLoop.drawWindow`). Comes from `ui.background_color` in
     /// conf.natyv.json, defaulting to natyv's built-in dark ground.
@@ -257,6 +261,7 @@ pub fn destroyWindowContext(self: *WindowContext, allocator: std.mem.Allocator) 
     if (self.clay_layout) |*cl| cl.deinit(allocator);
     self.shape_cache.deinit();
     self.image_cache.deinit();
+    self.canvas_cache.deinit();
     c.TTF_DestroyRendererTextEngine(self.text_engine);
     c.SDL_DestroyRenderer(self.renderer);
     c.SDL_DestroyWindow(self.window);

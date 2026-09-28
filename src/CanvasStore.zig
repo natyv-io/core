@@ -35,6 +35,7 @@
 //! previous drawing -- nothing is ever truncated or clamped into validity.
 
 const std = @import("std");
+const CanvasTessellate = @import("CanvasTessellate.zig");
 
 const Self = @This();
 
@@ -111,6 +112,17 @@ pub const Drawing = struct {
         self.* = .{};
     }
 
+    /// An owned copy, so the renderer can take a drawing out from under
+    /// the registry lock and tessellate it without holding the lock.
+    pub fn clone(self: *const Drawing, allocator: std.mem.Allocator) error{OutOfMemory}!Drawing {
+        const commands = try allocator.dupe(Command, self.commands);
+        errdefer allocator.free(commands);
+        const pts = try allocator.dupe(Point, self.points);
+        errdefer allocator.free(pts);
+        const text = try allocator.dupe(u8, self.text);
+        return .{ .commands = commands, .points = pts, .text = text };
+    }
+
     pub fn pointsOf(self: *const Drawing, span: Span) []const Point {
         return self.points[span.start..][0..span.len];
     }
@@ -145,8 +157,8 @@ pub fn parseSetRequest(allocator: std.mem.Allocator, bytes: []const u8, diag: *D
 }
 
 /// Validates `requests` and copies them into a compact, owned `Drawing`.
-/// On `error.Invalid`, `diag` says which command and why; nothing is
-/// allocated.
+/// On `error.Invalid`, `diag` says which command and why, and nothing is
+/// left allocated.
 pub fn build(allocator: std.mem.Allocator, requests: []const CommandRequest, diag: *Diagnostic) BuildError!Drawing {
     if (requests.len > max_commands) return fail(diag, null, "too many commands");
 
@@ -191,6 +203,19 @@ pub fn build(allocator: std.mem.Allocator, requests: []const CommandRequest, dia
         };
     }
     std.debug.assert(points_used == drawing.points.len and text_used == drawing.text.len);
+
+    // Checked on the stored form, since that's what gets tessellated. A
+    // drawing within every count limit can still ask for millions of
+    // triangles (thousands of huge circles), and rendering runs on the main
+    // thread.
+    var vertices: usize = 0;
+    for (drawing.commands, 0..) |cmd, i| {
+        vertices += CanvasTessellate.vertexEstimate(cmd);
+        if (vertices > CanvasTessellate.max_vertices) {
+            drawing.deinit(allocator);
+            return fail(diag, i, "drawing too complex");
+        }
+    }
     return drawing;
 }
 
@@ -318,34 +343,31 @@ pub const Entry = struct {
 
 pub const StoreError = error{ LimitExceeded, AlreadyExists, NoSuchCanvas, OutOfMemory };
 
-allocator: std.mem.Allocator,
+/// Unmanaged -- every call that allocates takes the allocator, so this
+/// can sit in `WidgetHost` as a plain `.{}` field.
 canvases: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
 
-pub fn init(allocator: std.mem.Allocator) Self {
-    return .{ .allocator = allocator };
-}
-
-pub fn deinit(self: *Self) void {
+pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     var it = self.canvases.valueIterator();
-    while (it.next()) |entry| entry.drawing.deinit(self.allocator);
-    self.canvases.deinit(self.allocator);
+    while (it.next()) |entry| entry.drawing.deinit(allocator);
+    self.canvases.deinit(allocator);
 }
 
 /// Registers a new, empty canvas. Called when the canvas widget is
 /// created, so the canvas cap is enforced at creation rather than on the
 /// first draw.
-pub fn add(self: *Self, id: u32) StoreError!void {
+pub fn add(self: *Self, allocator: std.mem.Allocator, id: u32) StoreError!void {
     if (self.canvases.contains(id)) return error.AlreadyExists;
     if (self.canvases.count() >= max_canvases) return error.LimitExceeded;
-    try self.canvases.put(self.allocator, id, .{});
+    try self.canvases.put(allocator, id, .{});
 }
 
 /// Drops a canvas and its drawing. Removing an unknown id is a no-op, so
 /// widget teardown doesn't need to know whether a canvas was ever added.
-pub fn remove(self: *Self, id: u32) void {
+pub fn remove(self: *Self, allocator: std.mem.Allocator, id: u32) void {
     if (self.canvases.fetchRemove(id)) |kv| {
         var drawing = kv.value.drawing;
-        drawing.deinit(self.allocator);
+        drawing.deinit(allocator);
     }
 }
 
@@ -359,10 +381,22 @@ pub const SetError = StoreError || BuildError;
 /// Validates `requests` and, only if the whole list is valid, replaces the
 /// canvas's drawing with it. Any failure leaves the previous drawing in
 /// place.
-pub fn set(self: *Self, id: u32, requests: []const CommandRequest, diag: *Diagnostic) SetError!void {
+pub fn set(self: *Self, allocator: std.mem.Allocator, id: u32, requests: []const CommandRequest, diag: *Diagnostic) SetError!void {
+    if (!self.canvases.contains(id)) return error.NoSuchCanvas;
+    var drawing = try build(allocator, requests, diag);
+    self.replace(allocator, id, drawing) catch |err| {
+        drawing.deinit(allocator);
+        return err;
+    };
+}
+
+/// Swaps in an already-built drawing, taking ownership of it on success.
+/// On `error.NoSuchCanvas` the caller still owns `drawing`. Split from
+/// `set` so the host function can do the expensive `build` outside the
+/// registry lock and hold the lock only for this swap.
+pub fn replace(self: *Self, allocator: std.mem.Allocator, id: u32, drawing: Drawing) error{NoSuchCanvas}!void {
     const entry = self.canvases.getPtr(id) orelse return error.NoSuchCanvas;
-    const drawing = try build(self.allocator, requests, diag);
-    entry.drawing.deinit(self.allocator);
+    entry.drawing.deinit(allocator);
     entry.drawing = drawing;
     entry.version +%= 1;
 }
@@ -571,6 +605,25 @@ test "limits: commands, points and total text" {
     try testing.expectEqualStrings("too much text in drawing", diag.reason);
 }
 
+test "limits: a drawing that would tessellate into too many triangles is rejected" {
+    const c: ColorRequest = .{ .r = 0, .g = 0, .b = 0 };
+    var diag: Diagnostic = .{};
+    // Each huge circle segments at the cap, so a few thousand of them pass
+    // every count limit but not the vertex bound.
+    const huge: CommandRequest = .{ .circle = .{ .cx = 0, .cy = 0, .r = max_coord, .fill = c, .stroke = c } };
+    const commands = try testing.allocator.alloc(CommandRequest, max_commands);
+    defer testing.allocator.free(commands);
+    @memset(commands, huge);
+    try testing.expectError(error.Invalid, build(testing.allocator, commands, &diag));
+    try testing.expectEqualStrings("drawing too complex", diag.reason);
+
+    // A dense scatter plot of small dots is fine.
+    const dot: CommandRequest = .{ .circle = .{ .cx = 0, .cy = 0, .r = 4, .fill = c } };
+    @memset(commands, dot);
+    var drawing = try build(testing.allocator, commands, &diag);
+    drawing.deinit(testing.allocator);
+}
+
 test "build: failing allocations leak nothing" {
     const c: ColorRequest = .{ .r = 0, .g = 0, .b = 0 };
     const requests = [_]CommandRequest{
@@ -587,35 +640,35 @@ test "build: failing allocations leak nothing" {
 }
 
 test "store: add, set, get, remove" {
-    var self = Self.init(testing.allocator);
-    defer self.deinit();
+    var self: Self = .{};
+    defer self.deinit(testing.allocator);
     const c: ColorRequest = .{ .r = 0, .g = 0, .b = 0 };
     var diag: Diagnostic = .{};
 
-    try testing.expectError(error.NoSuchCanvas, self.set(9, &.{}, &diag));
-    try self.add(9);
-    try testing.expectError(error.AlreadyExists, self.add(9));
+    try testing.expectError(error.NoSuchCanvas, self.set(testing.allocator, 9, &.{}, &diag));
+    try self.add(testing.allocator, 9);
+    try testing.expectError(error.AlreadyExists, self.add(testing.allocator, 9));
     try testing.expectEqual(@as(u32, 0), self.get(9).?.version);
     try testing.expectEqual(@as(usize, 0), self.get(9).?.drawing.commands.len);
 
-    try self.set(9, &.{.{ .circle = .{ .cx = 1, .cy = 2, .r = 3, .fill = c } }}, &diag);
+    try self.set(testing.allocator, 9, &.{.{ .circle = .{ .cx = 1, .cy = 2, .r = 3, .fill = c } }}, &diag);
     try testing.expectEqual(@as(u32, 1), self.get(9).?.version);
     try testing.expectEqual(@as(f32, 3), self.get(9).?.drawing.commands[0].circle.r);
 
-    self.remove(9);
+    self.remove(testing.allocator, 9);
     try testing.expect(self.get(9) == null);
-    self.remove(9);
+    self.remove(testing.allocator, 9);
 }
 
 test "store: a rejected set keeps the previous drawing and version" {
-    var self = Self.init(testing.allocator);
-    defer self.deinit();
+    var self: Self = .{};
+    defer self.deinit(testing.allocator);
     const c: ColorRequest = .{ .r = 0, .g = 0, .b = 0 };
     var diag: Diagnostic = .{};
 
-    try self.add(1);
-    try self.set(1, &.{.{ .text = .{ .x = 0, .y = 0, .text = "kept", .color = c } }}, &diag);
-    try testing.expectError(error.Invalid, self.set(1, &.{
+    try self.add(testing.allocator, 1);
+    try self.set(testing.allocator, 1, &.{.{ .text = .{ .x = 0, .y = 0, .text = "kept", .color = c } }}, &diag);
+    try testing.expectError(error.Invalid, self.set(testing.allocator, 1, &.{
         .{ .circle = .{ .cx = 0, .cy = 0, .r = 1, .fill = c } },
         .{ .circle = .{ .cx = 0, .cy = 0, .r = -1, .fill = c } },
     }, &diag));
@@ -627,11 +680,53 @@ test "store: a rejected set keeps the previous drawing and version" {
 }
 
 test "store: the canvas cap is enforced at add and frees up on remove" {
-    var self = Self.init(testing.allocator);
-    defer self.deinit();
+    var self: Self = .{};
+    defer self.deinit(testing.allocator);
 
-    for (0..max_canvases) |i| try self.add(@intCast(i));
-    try testing.expectError(error.LimitExceeded, self.add(max_canvases));
-    self.remove(0);
-    try self.add(max_canvases);
+    for (0..max_canvases) |i| try self.add(testing.allocator, @intCast(i));
+    try testing.expectError(error.LimitExceeded, self.add(testing.allocator, max_canvases));
+    self.remove(testing.allocator, 0);
+    try self.add(testing.allocator, max_canvases);
+}
+
+test "store: replace swaps a prebuilt drawing, and leaves it with the caller on an unknown id" {
+    var self: Self = .{};
+    defer self.deinit(testing.allocator);
+    const c: ColorRequest = .{ .r = 0, .g = 0, .b = 0 };
+    var diag: Diagnostic = .{};
+
+    var drawing = try build(testing.allocator, &.{.{ .circle = .{ .cx = 0, .cy = 0, .r = 2, .fill = c } }}, &diag);
+    try testing.expectError(error.NoSuchCanvas, self.replace(testing.allocator, 4, drawing));
+    try self.add(testing.allocator, 4);
+    try self.replace(testing.allocator, 4, drawing);
+    try testing.expectEqual(@as(u32, 1), self.get(4).?.version);
+    try testing.expectEqual(@as(f32, 2), self.get(4).?.drawing.commands[0].circle.r);
+
+    drawing = try build(testing.allocator, &.{}, &diag);
+    try self.replace(testing.allocator, 4, drawing);
+    try testing.expectEqual(@as(u32, 2), self.get(4).?.version);
+    try testing.expectEqual(@as(usize, 0), self.get(4).?.drawing.commands.len);
+}
+
+test "drawing: clone is an independent copy and leaks nothing on failure" {
+    const c: ColorRequest = .{ .r = 0, .g = 0, .b = 0 };
+    var diag: Diagnostic = .{};
+    var original = try build(testing.allocator, &.{
+        .{ .polygon = .{ .points = &.{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 } }, .fill = c } },
+        .{ .text = .{ .x = 0, .y = 0, .text = "hi", .color = c } },
+    }, &diag);
+    defer original.deinit(testing.allocator);
+
+    var copy = try original.clone(testing.allocator);
+    copy.points[0] = .{ 5, 5 };
+    try testing.expectEqual(@as(f32, 0), original.points[0][0]);
+    try testing.expectEqualStrings("hi", copy.textOf(copy.commands[1].text.text));
+    copy.deinit(testing.allocator);
+
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, d: *const Drawing) !void {
+            var cl = try d.clone(allocator);
+            cl.deinit(allocator);
+        }
+    }.run, .{&original});
 }

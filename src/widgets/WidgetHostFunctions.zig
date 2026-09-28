@@ -49,6 +49,7 @@ const Tabs = @import("Tabs.zig");
 
 const WidgetHost = @import("WidgetHost.zig");
 const Self = WidgetHost;
+const CanvasStore = WidgetHost.CanvasStore;
 const Widget = WidgetHost.Widget;
 const ClayStyle = WidgetHost.ClayStyle;
 
@@ -190,6 +191,7 @@ const ClayProgressBarRequest = struct { layout: ClayLayoutRequest = .{}, value: 
 const ClaySliderRequest = struct { layout: ClayLayoutRequest = .{}, value: f32 = 0 };
 const ClayRangeSliderRequest = struct { layout: ClayLayoutRequest = .{}, min: f32 = 0, max: f32 = 1, step: f32 = 0 };
 const ClaySpinnerRequest = struct { layout: ClayLayoutRequest = .{} };
+const ClayCanvasRequest = struct { layout: ClayLayoutRequest = .{} };
 const ClayNumericStepperRequest = struct { layout: ClayLayoutRequest = .{}, value: i32 = 0, min: i32 = 0, max: i32 = 100, step: i32 = 1, wrap: bool = false };
 const ClaySegmentedControlRequest = struct { layout: ClayLayoutRequest = .{}, segments: []const []const u8 = &.{}, selected_index: usize = 0 };
 const ClayTabsRequest = struct { layout: ClayLayoutRequest = .{}, labels: []const []const u8 = &.{}, selected_index: usize = 0 };
@@ -842,6 +844,92 @@ pub fn createClaySpinnerHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]cons
     insertClayWidget(self, plugin, &outputs[0], .{ .spinner = spinner }, parsed.value.layout, null);
 }
 
+/// Not routed through `insertClayWidget`: a canvas also needs its entry in
+/// `WidgetHost.canvases`, added under the same lock hold as the slot (see
+/// `insertCanvasLocked`), and has one more way to fail -- the canvas cap.
+pub fn createClayCanvasHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const parsed = parseRequest(ClayCanvasRequest, self, plugin, &inputs[0], &outputs[0]) orelse return;
+    defer parsed.deinit();
+    const layout = parsed.value.layout;
+    const style = toClayStyle(layout);
+    const call_io = self.io();
+    self.mutex.lockUncancelable(call_io);
+    const result = self.insertCanvasLocked(layout.parent_id, style);
+    self.mutex.unlock(call_io);
+
+    const widget_id = result catch |err| {
+        switch (err) {
+            error.NoSuchParent => host_fn_util.writeErrorJson(plugin, &outputs[0], "no such parent widget {d}", .{layout.parent_id.?}),
+            error.RegistryFull => host_fn_util.writeErrorJson(plugin, &outputs[0], "widget registry full", .{}),
+            error.LimitExceeded => host_fn_util.writeErrorJson(plugin, &outputs[0], "canvas limit reached ({d})", .{CanvasStore.max_canvases}),
+            error.OutOfMemory => host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory", .{}),
+            // Widget ids are never reused while a slot holds them, and the
+            // store entry goes with the slot, so this can't happen -- but
+            // it's reported rather than asserted.
+            error.AlreadyExists, error.NoSuchCanvas => host_fn_util.writeErrorJson(plugin, &outputs[0], "canvas already exists", .{}),
+        }
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"widget_id\":{d}}}", .{widget_id}) catch "{}";
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], json);
+}
+
+/// `natyv_canvas_set`: replaces a canvas's whole drawing (wire format in
+/// `CanvasStore.zig`'s header). Parsing and validation -- up to 4 MiB and
+/// 8,192 commands -- run outside the registry lock; the lock is held only
+/// for the swap. Not `parseRequest`: the size is checked before the input
+/// is even copied out of guest memory, and a rejection names the offending
+/// command.
+pub fn canvasSetHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
+    _ = n_inputs;
+    _ = n_outputs;
+    const self: *Self = @ptrCast(@alignCast(user_data.?));
+    const handle: u64 = @intCast(inputs[0].v.i64);
+    if (c.extism_current_plugin_memory_length(plugin, handle) > CanvasStore.max_request_bytes) {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "bad request: request too large", .{});
+        return;
+    }
+    const input_bytes = host_fn_util.readGuestBytes(self.allocator, plugin, &inputs[0]) catch {
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory reading input", .{});
+        return;
+    };
+    defer self.allocator.free(input_bytes);
+
+    var diag: CanvasStore.Diagnostic = .{};
+    const parsed = CanvasStore.parseSetRequest(self.allocator, input_bytes, &diag) catch |err| {
+        writeCanvasError(plugin, &outputs[0], err, diag);
+        return;
+    };
+    defer parsed.deinit();
+    var drawing = CanvasStore.build(self.allocator, parsed.value.commands, &diag) catch |err| {
+        writeCanvasError(plugin, &outputs[0], err, diag);
+        return;
+    };
+    self.replaceCanvasDrawing(self.io(), parsed.value.widget_id, drawing) catch {
+        drawing.deinit(self.allocator);
+        host_fn_util.writeErrorJson(plugin, &outputs[0], "no such canvas {d}", .{parsed.value.widget_id});
+        return;
+    };
+    host_fn_util.writeGuestBytes(plugin, &outputs[0], "{}");
+}
+
+/// `diag.reason` is always a static string (see `CanvasStore.Diagnostic`),
+/// so it's safe through `writeErrorJson`, which doesn't escape.
+fn writeCanvasError(plugin: ?*c.ExtismCurrentPlugin, out_val: *allowzero c.ExtismVal, err: CanvasStore.BuildError, diag: CanvasStore.Diagnostic) void {
+    switch (err) {
+        error.OutOfMemory => host_fn_util.writeErrorJson(plugin, out_val, "out of memory", .{}),
+        error.Invalid => if (diag.command) |index| {
+            host_fn_util.writeErrorJson(plugin, out_val, "bad request: command {d}: {s}", .{ index, diag.reason });
+        } else {
+            host_fn_util.writeErrorJson(plugin, out_val, "bad request: {s}", .{diag.reason});
+        },
+    }
+}
+
 pub fn createClayNumericStepperHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.ExtismVal, n_inputs: c.ExtismSize, outputs: [*c]c.ExtismVal, n_outputs: c.ExtismSize, user_data: ?*anyopaque) callconv(.c) void {
     _ = n_inputs;
     _ = n_outputs;
@@ -981,7 +1069,7 @@ pub fn getTextHostFn(plugin: ?*c.ExtismCurrentPlugin, inputs: [*c]const c.Extism
         .toggle => |tg| tg.label(),
         .radio_button => |r| r.label(),
         .badge => |bd| bd.label(),
-        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner => "",
+        .container, .progress_bar, .slider, .range_slider, .divider, .numeric_stepper, .segmented_control, .tabs, .spinner, .canvas => "",
     };
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
