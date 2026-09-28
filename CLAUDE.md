@@ -181,7 +181,10 @@ Full plan: `~/.claude/plans/natyv-drawing-primitives.md`.
 - **Go SDK:** `widgets.Canvas` in `sdks/go/widgets/canvas.go` (`CreateCanvas`, `Draw(func(*Drawing))`, `OnClick(x, y)`, `OnResize(w, h)`, `WrapCanvas`). The builder, encoding and payload parsing live in `widgets/internal/drawing`, which has native `go test` coverage; `canvas.go` only forwards and calls the host.
   - The SDK duplicates none of the host's limits. Go zero values mean "host default": a zero `StrokeWidth` and `""` align are omitted, and an empty drawing or point list encodes as `[]`, never `null`.
   - A canvas click has its own handler table (`canvasClickHandlers`), since every other kind's click takes no args.
-- **`.ntx`:** `<Canvas>` ships with it, which needs shared Codegen changes plus re-pins.
+- **`.ntx`:** `<Canvas ref={&c} onResize={...} onClick={...} />`, no children. Defaults to grow width and 240 px height (like Table), since there's nothing for Fit to measure.
+  - `"Canvas"` must be in `Codegen.zig`'s `builtin_widget_kinds`, not just have an emit branch: that list is what lets a `<%...%>` block recognise the tag.
+  - Handlers and ref go through the generic `on[A-Z]` / `Wrap<Tag>` paths, so recycle rebinds need no Canvas-specific code.
+  - ntx-lsp pins shared too and runs its Codegen, so it needs a re-pin for `<Canvas>` not to show as an error. The editor grammars have no tag lists.
 
 ## Project structure conventions
 
