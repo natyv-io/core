@@ -14,7 +14,7 @@ fn extismPrefixOverride(b: *std.Build) ?[]const u8 {
 
 // Maps a real build target to the matching per-target Extism dependency
 // name declared in build.zig.zon (one real entry per target Extism's own
-// v1.30.0 GitHub release publishes a prebuilt static lib for). Musl
+// v1.41.0 GitHub release publishes a prebuilt static lib for). Musl
 // variants are deliberately not supported yet (demand-driven).
 fn extismDependencyName(target: std.Target) []const u8 {
     return switch (target.os.tag) {

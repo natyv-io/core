@@ -22,28 +22,28 @@
             .hash = "sdl-1.0.3+3.4.16-i4QD0Z-wqQAn6zJk8TXx5gnUU1NJ5xA2ijjA83Eeg4fX",
         },
         .extism_aarch64_macos = .{
-            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-aarch64-apple-darwin-v1.30.0.tar.gz",
-            .hash = "N-V-__8AAFoRKQbJyBexdHaVn_1CaGv54NZyZxQjpKk4DhKu",
+            .url = "https://github.com/extism/extism/releases/download/v1.41.0/libextism-aarch64-apple-darwin-v1.41.0.tar.gz",
+            .hash = "N-V-__8AABq0mAeie6QfKldMwsuu4f-JIQwBSA-HtqYGIwAA",
             .lazy = true,
         },
         .extism_x86_64_macos = .{
-            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-apple-darwin-v1.30.0.tar.gz",
-            .hash = "N-V-__8AABJ4igZfENpmL70NeY2h63RO2bPPychyHBYgc_VW",
+            .url = "https://github.com/extism/extism/releases/download/v1.41.0/libextism-x86_64-apple-darwin-v1.41.0.tar.gz",
+            .hash = "N-V-__8AAKJYEwjvsdv9fH3UtlWySx4BkdgNMjeKC8U4ZLUb",
             .lazy = true,
         },
         .extism_x86_64_linux_gnu = .{
-            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-unknown-linux-gnu-v1.30.0.tar.gz",
-            .hash = "N-V-__8AANRaSwmstPv9ox7zLy4Kjj3c4IYRDZCB14tkbS_X",
+            .url = "https://github.com/extism/extism/releases/download/v1.41.0/libextism-x86_64-unknown-linux-gnu-v1.41.0.tar.gz",
+            .hash = "N-V-__8AAGq7UQu-Dlfh5tdBXMZuX3nP1Y8SgFNz1kT55Bhd",
             .lazy = true,
         },
         .extism_aarch64_linux_gnu = .{
-            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-aarch64-unknown-linux-gnu-v1.30.0.tar.gz",
-            .hash = "N-V-__8AAJBFqgj-JoK1LxhwRPOvAw0-5iFkaWF4zSk7GYGx",
+            .url = "https://github.com/extism/extism/releases/download/v1.41.0/libextism-aarch64-unknown-linux-gnu-v1.41.0.tar.gz",
+            .hash = "N-V-__8AAKzNlwpd06nA399PB75sXvAlgmc228XjbEMYktlb",
             .lazy = true,
         },
         .extism_x86_64_windows_gnu = .{
-            .url = "https://github.com/extism/extism/releases/download/v1.30.0/libextism-x86_64-pc-windows-gnu-v1.30.0.tar.gz",
-            .hash = "N-V-__8AAMYC9AfopfBtCj992qD9wRNwojVmC4JNjZuGUTfz",
+            .url = "https://github.com/extism/extism/releases/download/v1.41.0/libextism-x86_64-pc-windows-gnu-v1.41.0.tar.gz",
+            .hash = "N-V-__8AABqTYgrj0LHOGVbAQduddqBuYS0rC7Dq1GC7tlsD",
             .lazy = true,
         },
         .llvm_mingw = .{
